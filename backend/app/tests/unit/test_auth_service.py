@@ -145,6 +145,40 @@ class TestLogin:
         assert result["user"]["email"] == "test@hospital.test"
         mock_user_repo.record_login.assert_called_once()
 
+    async def test_login_user_payload_includes_permissions_and_display_name(
+        self: Any, auth_service: Any, mock_user_repo: Any, mock_refresh_token_repo: Any
+    ) -> None:
+        """The SPA builds its RBAC nav from ``user.permissions`` and displays ``user.name``."""
+        user = _make_user()
+        mock_user_repo.get_by_email_cross_tenant.return_value = user
+        mock_refresh_token_repo.create.return_value = MagicMock(id=uuid.uuid4())
+
+        result = await auth_service.login(
+            email="test@hospital.test",
+            password="TestPass@123",
+        )
+
+        profile = result["user"]
+        assert profile["name"] == "Test User"
+        assert profile["permissions"] == ["user.read"]
+
+    async def test_login_user_permissions_are_empty_without_roles(
+        self: Any, auth_service: Any, mock_user_repo: Any, mock_refresh_token_repo: Any
+    ) -> None:
+        """A role-less user gets no permissions and no fabricated access."""
+        user = _make_user()
+        user.user_roles = []
+        mock_user_repo.get_by_email_cross_tenant.return_value = user
+        mock_refresh_token_repo.create.return_value = MagicMock(id=uuid.uuid4())
+
+        result = await auth_service.login(
+            email="test@hospital.test",
+            password="TestPass@123",
+        )
+
+        assert result["user"]["permissions"] == []
+        mock_user_repo.record_login.assert_called_once()
+
     async def test_login_invalid_credentials(
         self: Any, auth_service: Any, mock_user_repo: Any
     ) -> None:

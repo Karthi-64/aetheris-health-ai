@@ -1,6 +1,6 @@
 import { useEffect, type ReactNode } from 'react'
 import { Loader2 } from 'lucide-react'
-import { useAuthStore } from '@/store/auth-store'
+import { toAuthUser, useAuthStore } from '@/store/auth-store'
 import { api } from '@/lib/api'
 import { tokenStore } from '@/services/tokenStore'
 
@@ -58,7 +58,7 @@ export function SessionRestorer({ children }: { children: ReactNode }) {
           try {
             const { data: meData } = await api.get('/users/me')
             if (!cancelled && meData?.data) {
-              setAuth(meData.data, newAccessToken, newRefreshToken)
+              setAuth(toAuthUser(meData.data), newAccessToken, newRefreshToken)
             } else {
               // Fallback: we have tokens but no user profile. Clear and let
               // the route guard redirect to login.

@@ -397,7 +397,7 @@ async def admin_reset_password(
 )
 async def get_user_roles(
     user_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("user.read")),
     user_service: UserService = Depends(get_user_service),
 ) -> dict[str, Any]:
     """List roles assigned to a user."""

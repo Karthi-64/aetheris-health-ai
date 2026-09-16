@@ -2,18 +2,20 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { RequirePermission } from './RequirePermission'
-import { useAuthStore, type User } from '@/store/auth-store'
+import { useAuthStore } from '@/store/auth-store'
 import { MOCK_PERMISSIONS_BY_ROLE } from '@/lib/rbac'
 
 function login(role: keyof typeof MOCK_PERMISSIONS_BY_ROLE) {
-  const user: User = {
-    id: '1',
-    name: 'Test User',
-    email: 'test@aetheris.health',
-    role,
-    permissions: MOCK_PERMISSIONS_BY_ROLE[role],
-  }
-  useAuthStore.getState().setAuth(user, 'access-token')
+  useAuthStore.getState().setAuth(
+    {
+      id: '1',
+      name: 'Test User',
+      email: 'test@aetheris.health',
+      role,
+      permissions: [...MOCK_PERMISSIONS_BY_ROLE[role]],
+    },
+    'access-token',
+  )
 }
 
 function renderBilling() {

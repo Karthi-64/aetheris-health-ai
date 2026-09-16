@@ -812,11 +812,16 @@ class AuthService:
                 "email": user.email,
                 "first_name": user.first_name,
                 "last_name": user.last_name,
+                "name": f"{user.first_name} {user.last_name}".strip(),
                 "phone": user.phone,
                 "roles": roles,
                 "status": user.status.value,
                 "mfa_enabled": user.mfa_enabled,
                 "password_change_required": force_password_change,
+                # The SPA derives every navigation/route gate from this list
+                # (frontend RBAC is a UX affordance; the backend remains the
+                # security boundary). Mirrors the codes embedded in the token.
+                "permissions": permissions,
             },
         }
 

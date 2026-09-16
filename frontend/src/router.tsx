@@ -22,6 +22,7 @@ const DoctorsPage = lazy(() => import('@/pages/doctors/DoctorsPage'))
 const AppointmentsPage = lazy(() => import('@/pages/appointments/AppointmentsPage'))
 const BillingPage = lazy(() => import('@/pages/billing/BillingPage'))
 const ReportsPage = lazy(() => import('@/pages/reports/ReportsPage'))
+const UsersPage = lazy(() => import('@/pages/users/UsersPage'))
 const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'))
 
 export const router = createBrowserRouter([
@@ -96,9 +97,17 @@ export const router = createBrowserRouter([
             ),
           },
           {
+            path: '/users',
+            element: (
+              <RequirePermission permission="user.read">
+                <UsersPage />
+              </RequirePermission>
+            ),
+          },
+          {
             path: '/settings',
             element: (
-              <RequirePermission permission="settings.manage">
+              <RequirePermission permission="settings.read">
                 <SettingsPage />
               </RequirePermission>
             ),

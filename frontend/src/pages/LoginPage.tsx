@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { toast } from 'sonner'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { Logo } from '@/components/brand/Logo'
-import { useAuthStore } from '@/store/auth-store'
+import { toAuthUser, useAuthStore } from '@/store/auth-store'
 import { api } from '@/lib/api'
 import { MOCK_PERMISSIONS_BY_ROLE } from '@/lib/rbac'
 import { cn } from '@/lib/utils'
@@ -56,18 +56,23 @@ export default function LoginPage() {
             name: 'Dr. A. Chen',
             email: values.email,
             role,
-            permissions: MOCK_PERMISSIONS_BY_ROLE[role],
+            permissions: [...MOCK_PERMISSIONS_BY_ROLE[role]],
           },
           'demo-access-token',
         )
       } else {
         // Real login: server returns access_token + refresh_token + user
-        // in the standard envelope. Both tokens are stored in memory.
+        // in the standard envelope. Both tokens are stored in memory. The
+        // user's `permissions` array drives every nav/route gate client-side.
         const { data } = await api.post('/auth/login', {
           email: values.email,
           password: values.password,
         })
-        setAuth(data.data.user, data.data.access_token, data.data.refresh_token)
+        setAuth(
+          toAuthUser(data.data.user),
+          data.data.access_token,
+          data.data.refresh_token,
+        )
       }
       toast.success('Welcome back')
       navigate(from, { replace: true })

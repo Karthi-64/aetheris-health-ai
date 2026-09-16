@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.core.exceptions import BusinessRuleError, NotFoundError, PermissionDeniedError
+from app.core.exceptions import (
+    BusinessRuleError,
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from app.models.user import User, UserStatus
 
 
@@ -158,14 +163,71 @@ class TestInviteUser:
         assert invite_token  # B6: an invite token is minted for activation
         mock_user_repo.create.assert_called_once()
 
+    async def test_invite_user_refreshes_roles_into_the_response(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """Roles assigned during the invite must appear on the returned user.
+
+        Regression: ``user_roles`` is a selectin-loaded collection that had
+        already loaded (empty) before ``add_role`` inserted the rows, so the
+        invite response reported ``roles: []`` for a user that did have roles.
+        """
+        from unittest.mock import MagicMock
+
+        from app.models.role import Role
+        from app.models.user import UserRole
+
+        hospital_id = uuid.uuid4()
+        role_id = uuid.uuid4()
+        created = _make_user()
+        created.status = UserStatus.INVITED
+        mock_user_repo.get_by_email.return_value = None
+        mock_user_repo.create.return_value = created
+        mock_user_repo.has_role.return_value = False
+
+        def _loaded_user_role(user: Any) -> Any:
+            role = MagicMock(spec=Role)
+            role.id = role_id
+            role.name = "Nurse"
+            role.description = "Care coordination"
+            role.is_system = True
+            role.role_permissions = []
+            ur = MagicMock(spec=UserRole)
+            ur.role = role
+            ur.role_id = role_id
+            user.user_roles = [ur]
+            return user
+
+        mock_user_repo.refresh = AsyncMock(side_effect=_loaded_user_role)
+
+        # The requested role must pass the B5 tenant check: a system role
+        # (hospital_id NULL) is visible to every hospital.
+        requested_role = MagicMock(spec=Role)
+        requested_role.id = role_id
+        requested_role.hospital_id = None
+        requested_role.is_system = True
+        mock_role_repo.get_by_id.return_value = requested_role
+
+        result, _ = await user_service.invite_user(
+            hospital_id=hospital_id,
+            email="newuser@hospital.test",
+            first_name="New",
+            last_name="User",
+            role_ids=[role_id],
+            actor_permissions=["user.create"],
+        )
+
+        mock_user_repo.refresh.assert_awaited_once_with(result)
+        assert [r.role.name for r in result.user_roles] == ["Nurse"]
+
     async def test_invite_user_duplicate_email(
         self: Any, user_service: Any, mock_user_repo: Any
     ) -> None:
-        """Duplicate email raises BusinessRuleError."""
+        """Duplicate email raises ConflictError (HTTP 409 per the contract)."""
         hospital_id = uuid.uuid4()
         mock_user_repo.get_by_email.return_value = _make_user()
 
-        with pytest.raises(BusinessRuleError, match="already exists"):
+        with pytest.raises(ConflictError, match="already exists"):
             await user_service.invite_user(
                 hospital_id=hospital_id,
                 email="existing@hospital.test",

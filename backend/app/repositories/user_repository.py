@@ -190,6 +190,21 @@ class UserRepository(BaseRepository[User]):
 
     # ── UserRole Management ────────────────────────────────────────────────
 
+    async def refresh(self, user: User) -> User:
+        """Re-load a user row (and its selectin-loaded relationships) from the DB.
+
+        ``user_roles`` is ``lazy="selectin"``: it loads when the instance is
+        first fetched, so rows inserted later in the same session (role
+        assignment during an invite) do not appear on the stale in-memory
+        collection. Refreshing re-runs the eager loads so the instance the
+        API serializes tells the truth.
+
+        :param user: The user instance to re-load.
+        :returns: The same instance, refreshed.
+        """
+        await self._session.refresh(user)
+        return user
+
     async def has_role(self, user_id: uuid.UUID, role_id: uuid.UUID) -> bool:
         """Check if a user already has a specific role assigned.
 
@@ -197,17 +212,16 @@ class UserRepository(BaseRepository[User]):
         :param role_id: The role's UUID.
         :returns: ``True`` if the user has the role.
         """
-        stmt = (
-            select(UserRole)
-            .where(
-                UserRole.user_id == user_id,
-                UserRole.role_id == role_id,
-            )
+        stmt = select(UserRole).where(
+            UserRole.user_id == user_id,
+            UserRole.role_id == role_id,
         )
         result = await self._session.execute(stmt)
         return result.unique().scalar_one_or_none() is not None
 
-    async def add_role(self, user_id: uuid.UUID, role_id: uuid.UUID, assigned_by: uuid.UUID | None = None) -> UserRole:
+    async def add_role(
+        self, user_id: uuid.UUID, role_id: uuid.UUID, assigned_by: uuid.UUID | None = None
+    ) -> UserRole:
         """Assign a role to a user.
 
         :param user_id: The user's UUID.
@@ -231,12 +245,9 @@ class UserRepository(BaseRepository[User]):
         :param role_id: The role's UUID.
         :returns: ``True`` if a role was removed, ``False`` if it wasn't assigned.
         """
-        stmt = (
-            select(UserRole)
-            .where(
-                UserRole.user_id == user_id,
-                UserRole.role_id == role_id,
-            )
+        stmt = select(UserRole).where(
+            UserRole.user_id == user_id,
+            UserRole.role_id == role_id,
         )
         result = await self._session.execute(stmt)
         user_role = result.unique().scalar_one_or_none()

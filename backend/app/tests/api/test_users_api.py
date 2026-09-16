@@ -8,6 +8,7 @@ match ``docs/06-API_STANDARDS.md`` §5.2.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -18,7 +19,7 @@ from sqlalchemy import func, select
 from app.api.dependencies.db import get_db_session
 from app.core.security import create_access_token, hash_password
 from app.main import create_app
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.tests.conftest import grant_permissions
 
 if TYPE_CHECKING:
@@ -307,3 +308,243 @@ class TestCrossTenantIsolation:
             f"/api/v1/users/{foreign_user}/roles/{any_role}", headers=admin["headers"]
         )
         assert response.status_code == 404
+
+    async def test_assign_foreign_hospitals_role_is_404(
+        self,
+        api: AsyncClient,
+        admin: dict[str, Any],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+    ) -> None:
+        """A role belonging to another hospital is invisible to this tenant."""
+        from app.models.role import Role
+
+        foreign_role = Role(
+            id=uuid.uuid4(), hospital_id=other_hospital_id, name=f"Theirs {uuid.uuid4().hex[:8]}"
+        )
+        db_session.add(foreign_role)
+
+        invitee = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"invitee-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Local",
+            last_name="Invitee",
+        )
+        db_session.add(invitee)
+        await db_session.flush()
+
+        response = await api.post(
+            f"/api/v1/users/{invitee.id}/roles",
+            json={"role_id": str(foreign_role.id)},
+            headers=admin["headers"],
+        )
+        assert response.status_code == 404
+
+    async def test_assign_system_role_succeeds(
+        self,
+        api: AsyncClient,
+        admin: dict[str, Any],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        """The allowed case: a system role (tenantless) can be assigned."""
+        from app.models.role import Role
+
+        system_role = Role(
+            id=uuid.uuid4(),
+            hospital_id=None,
+            name=f"System {uuid.uuid4().hex[:8]}",
+            is_system=True,
+        )
+        db_session.add(system_role)
+
+        invitee = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"invitee-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Local",
+            last_name="Invitee",
+        )
+        db_session.add(invitee)
+        await db_session.flush()
+
+        response = await api.post(
+            f"/api/v1/users/{invitee.id}/roles",
+            json={"role_id": str(system_role.id)},
+            headers=admin["headers"],
+        )
+        assert response.status_code == 200, response.text
+
+
+class TestRoleAssignmentAuthorization:
+    """Authorization edges around role assignment (module spec §4 rule 8, AC-3).
+
+    The dependency already gates on ``role.assign``; these tests pin the
+    allowed/denied matrix end-to-end so a future refactor cannot quietly swap
+    the gate for a role-name check.
+    """
+
+    @pytest_asyncio.fixture
+    async def invitee(self, db_session: AsyncSession, hospital_id: uuid.UUID) -> dict[str, Any]:
+        """A role-less invited user to operate on."""
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"invitee-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Invited",
+            last_name="User",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        return {"id": user.id}
+
+    @pytest_asyncio.fixture
+    async def system_role(self, db_session: AsyncSession) -> uuid.UUID:
+        """A system role whose id can be assigned by an authorized actor."""
+        from app.models.role import Role
+
+        role = Role(
+            id=uuid.uuid4(), hospital_id=None, name=f"System {uuid.uuid4().hex[:8]}", is_system=True
+        )
+        db_session.add(role)
+        await db_session.flush()
+        return role.id
+
+    async def test_actor_with_role_assign_can_assign(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        invitee: dict[str, Any],
+        system_role: uuid.UUID,
+    ) -> None:
+        """Allowed: an actor holding ``role.assign`` may assign a visible role."""
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"assigner-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Role",
+            last_name="Assigner",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        await grant_permissions(
+            db_session, hospital_id=hospital_id, user_id=user.id, codes=["role.assign"]
+        )
+        token = create_access_token(user_id=user.id, hospital_id=hospital_id)
+
+        response = await api.post(
+            f"/api/v1/users/{invitee['id']}/roles",
+            json={"role_id": str(system_role)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+
+        rows = await db_session.execute(
+            select(UserRole).where(
+                UserRole.user_id == invitee["id"], UserRole.role_id == system_role
+            )
+        )
+        assert rows.unique().scalar_one_or_none() is not None
+
+    async def test_actor_without_role_assign_is_403(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        invitee: dict[str, Any],
+        system_role: uuid.UUID,
+    ) -> None:
+        """Denied: full user-management rights minus ``role.assign`` still 403."""
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"noassign-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Cannot",
+            last_name="Assign",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        await grant_permissions(
+            db_session,
+            hospital_id=hospital_id,
+            user_id=user.id,
+            codes=["user.read", "user.update"],
+        )
+        token = create_access_token(user_id=user.id, hospital_id=hospital_id)
+
+        response = await api.post(
+            f"/api/v1/users/{invitee['id']}/roles",
+            json={"role_id": str(system_role)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 403
+
+    async def test_unauthenticated_assignment_is_401(
+        self, api: AsyncClient, invitee: dict[str, Any], system_role: uuid.UUID
+    ) -> None:
+        response = await api.post(
+            f"/api/v1/users/{invitee['id']}/roles", json={"role_id": str(system_role)}
+        )
+        assert response.status_code == 401
+
+
+class TestLoginPayloadCarriesPermissions:
+    """The SPA builds its RBAC navigation from the login response's user object."""
+
+    async def test_login_user_payload_includes_permission_codes(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        """``user.permissions`` mirrors the codes enforced by require_permission."""
+        from httpx import ASGITransport
+
+        from app.main import create_app
+
+        password = "Str0ng!Passw0rd123"
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"login-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password(password),
+            first_name="Permy",
+            last_name="User",
+            password_changed_at=datetime.now(UTC),
+        )
+        db_session.add(user)
+        await db_session.flush()
+        await grant_permissions(
+            db_session,
+            hospital_id=hospital_id,
+            user_id=user.id,
+            codes=["patient.read", "user.read"],
+        )
+
+        application = create_app()
+
+        async def _override() -> AsyncGenerator[AsyncSession]:
+            yield db_session
+
+        application.dependency_overrides[get_db_session] = _override
+        client = AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
+        try:
+            login = await client.post(
+                "/api/v1/auth/login",
+                json={"email": user.email, "password": password},
+            )
+        finally:
+            await client.aclose()
+            application.dependency_overrides.clear()
+
+        assert login.status_code == 200, login.text
+        profile = login.json()["data"]["user"]
+        assert set(profile["permissions"]) == {"patient.read", "user.read"}
+        assert profile["name"] == "Permy User"

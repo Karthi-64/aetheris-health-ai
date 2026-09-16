@@ -15,7 +15,12 @@ import structlog
 
 from app.core.audit import AuditEvent
 from app.core.config import settings
-from app.core.exceptions import BusinessRuleError, NotFoundError, PermissionDeniedError
+from app.core.exceptions import (
+    BusinessRuleError,
+    ConflictError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 from app.core.security import generate_opaque_token, hash_password
 from app.models.user import User, UserStatus
 
@@ -204,10 +209,12 @@ class UserService:
         if not actor_permissions or "user.create" not in actor_permissions:
             raise PermissionDeniedError("You do not have permission to create users.")
 
-        # Check for duplicate email
+        # Check for duplicate email — a 409, not a 400: the request is well-formed
+        # but conflicts with current state (docs/06-API_STANDARDS.md §14; the
+        # endpoint contract documents 409 for this case).
         existing = await self._user_repo.get_by_email(hospital_id, email)
         if existing is not None:
-            raise BusinessRuleError("A user with this email already exists in this hospital.")
+            raise ConflictError("A user with this email already exists in this hospital.")
 
         # B5: validate every requested role BEFORE creating the user — the
         # invite is all-or-nothing. Unknown ids and another hospital's roles
@@ -247,6 +254,13 @@ class UserService:
         for role_id in validated_roles:
             if not await self._user_repo.has_role(user.id, role_id):
                 await self._user_repo.add_role(user.id, role_id)
+
+        # The ``user_roles`` collection was eager-loaded when the row was
+        # created — before any role was inserted — so the instance this method
+        # returns would otherwise report ``roles: []`` even though the rows
+        # exist. Refresh so the API response reflects reality.
+        if validated_roles:
+            await self._user_repo.refresh(user)
 
         # B6: mint the single-use invitation token (stored hashed) and hand
         # the raw token to the caller for the Notifications module to deliver.

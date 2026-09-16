@@ -104,10 +104,10 @@ describe('SessionRestorer', () => {
       data: {
         data: {
           id: '42',
-          name: 'Dr. Smith',
+          first_name: 'Dr. Smith',
           email: 'smith@hospital.com',
-          role: 'doctor',
-          permissions: ['patients:read'],
+          roles: ['Doctor'],
+          permissions: ['patient.read'],
         },
       },
     })
