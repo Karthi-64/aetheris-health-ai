@@ -39,6 +39,12 @@ The root `CLAUDE.md` marks `docs/` as a *prohibited area*: "Any file in `docs/` 
 ### 2.4 Self-service "change own password / MFA" profile page (module spec §12 "Own profile page")
 **Status: NOT DONE — consciously deferred.** The sprint file's scope is admin user management + RBAC; the backend endpoints (`POST /auth/password/change`, `/mfa/*`) already exist and Sprint 1 covered the auth frontend. A dedicated profile settings screen is frontend-only work not listed in the sprint document's §3 Scope, so it was left out rather than half-built. The "limited fields" self-profile endpoints (`PATCH /users/me`) are wired and tested on the backend.
 
+### 2.5 PR authorship under the `Karthi-64` GitHub account
+**Status: BLOCKED — no credentials for that account in this environment.**
+The PR was requested to be raised "from Karthi-64". This machine has no credentials for that account: `gh` is authenticated as `SrinivasVarshithAchanta` (keyring), the macOS keychain holds only that identity, no SSH key is loaded (`ssh-add -l`: no identities), and `Karthi-64` has no fork of `harshit2005-rgb/aetheris-health-ai`. Pushing to the upstream as Karthi-64 is therefore impossible from here.
+
+**Resolution:** the branch `feat/sprint2-user-management-rbac` is pushed to the available fork (`SrinivasVarshithAchanta/aetheris-health-ai`) and the PR is opened from there into `develop`. To re-author it under Karthi-64: run `gh auth login` as Karthi-64 (or add Karthi-64 as a collaborator on the upstream and push the branch there), then re-open the PR — the branch tip to PR is `04a4f7d`.
+
 ## 3. Defects found during verification and fixed in this branch
 
 | Defect | Found by | Fix |
@@ -69,4 +75,4 @@ The root `CLAUDE.md` marks `docs/` as a *prohibited area*: "Any file in `docs/` 
 
 ## 5. Pull request
 
-PR opened against `develop` from `feat/auth-frontend-sprint` — link is in the chat message accompanying this report.
+PR opened against `develop` from the fork (`SrinivasVarshithAchanta:feat/sprint2-user-management-rbac`) — link in the chat message accompanying this report. §2.5 documents why it could not be raised under the `Karthi-64` account.
