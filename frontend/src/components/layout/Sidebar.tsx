@@ -112,17 +112,27 @@ function SidebarBody({ collapsed, onToggleCollapse, onNavigate, onOpenCopilot }:
         {!collapsed && <span className="font-label text-label-caps">AI Copilot</span>}
       </button>
 
-      {/* User */}
+      {/* User — the identity block is the way into the own-profile page, which
+          is available to every authenticated user regardless of permissions. */}
       <div className="border-outline-variant/30 mt-2 flex items-center gap-3 border-t pt-3">
-        <span className="neo-extruded bg-primary-container flex size-10 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white">
+        <Link
+          to="/settings/profile"
+          onClick={onNavigate}
+          title="My profile"
+          className="neo-extruded bg-primary-container flex size-10 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white transition-transform active:scale-95"
+        >
           {initials(name)}
-        </span>
+        </Link>
         {!collapsed && (
           <>
-            <div className="min-w-0 flex-1">
+            <Link
+              to="/settings/profile"
+              onClick={onNavigate}
+              className="min-w-0 flex-1 text-left"
+            >
               <p className="font-body text-body-sm text-primary truncate font-bold">{name}</p>
               <p className="font-body text-outline truncate text-xs">{roleLabel}</p>
-            </div>
+            </Link>
             <button
               onClick={handleLogout}
               aria-label="Sign out"

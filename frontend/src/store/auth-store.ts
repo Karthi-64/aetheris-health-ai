@@ -44,6 +44,13 @@ interface AuthState {
   /** True while the app is attempting to restore a session on load. */
   isRestoring: boolean
   setAuth: (user: AuthUser, accessToken: string, refreshToken?: string | null) => void
+  /**
+   * Replace the cached profile without touching the session tokens — used when
+   * the user edits their own name on the profile page and the sidebar has to
+   * catch up. Permissions are never widened here: they stay whatever the
+   * server issued for this session.
+   */
+  setUser: (update: Partial<Omit<AuthUser, 'permissions'>>) => void
   logout: () => void
   setRestoring: (v: boolean) => void
 }
@@ -67,6 +74,8 @@ export const useAuthStore = create<AuthState>((set) => ({
     }
     set({ user, isAuthenticated: true })
   },
+  setUser: (update) =>
+    set((state) => (state.user ? { user: { ...state.user, ...update } } : state)),
   logout: () => {
     tokenStore.clear()
     set({ user: null, isAuthenticated: false })

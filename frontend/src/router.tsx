@@ -24,6 +24,7 @@ const BillingPage = lazy(() => import('@/pages/billing/BillingPage'))
 const ReportsPage = lazy(() => import('@/pages/reports/ReportsPage'))
 const UsersPage = lazy(() => import('@/pages/users/UsersPage'))
 const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'))
+const ProfilePage = lazy(() => import('@/pages/settings/ProfilePage'))
 
 export const router = createBrowserRouter([
   {
@@ -111,6 +112,14 @@ export const router = createBrowserRouter([
                 <SettingsPage />
               </RequirePermission>
             ),
+          },
+          {
+            // Own profile (module spec 02 §12). Deliberately NOT behind
+            // RequirePermission: it acts only on the caller's own account, so
+            // every authenticated user reaches it — including one with no
+            // roles at all.
+            path: '/settings/profile',
+            element: <ProfilePage />,
           },
         ],
       },
