@@ -440,7 +440,8 @@ class TestRoleManagement:
             actor_hospital_id=user.hospital_id,
         )
 
-        mock_user_repo.add_role.assert_called_once_with(user.id, role_id)
+        # BR-9: the join row records who granted the role.
+        mock_user_repo.add_role.assert_called_once_with(user.id, role_id, assigned_by=None)
         mock_auth_service.logout_all.assert_called_once_with(user.id)
 
     async def test_assign_role_already_assigned(
@@ -594,3 +595,198 @@ class TestRoleManagement:
                     actor_permissions=permissions,
                     last_name="Nope",
                 )
+
+
+# ── Privilege Escalation & Lockout Tests ───────────────────────────────────
+
+
+def _role_granting(*codes: str, name: str = "Lab Technician") -> MagicMock:
+    """Build a role mock whose ``role_permissions`` expose the given codes."""
+    role = MagicMock()
+    role.id = uuid.uuid4()
+    role.name = name
+    role.hospital_id = None
+    role.role_permissions = [MagicMock(permission=MagicMock(code=code)) for code in codes]
+    return role
+
+
+class TestPrivilegeEscalation:
+    """BR-8 / FR-3 / AC-3: an actor may only grant permissions they hold."""
+
+    async def test_assign_role_rejects_permissions_the_actor_lacks(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """Assigning a role that outranks the actor is denied."""
+        user = _make_user()
+        role = _role_granting("lab.create", "lab.update")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_by_id.return_value = role
+        mock_role_repo.get_with_permissions.return_value = role
+
+        with pytest.raises(PermissionDeniedError, match="permissions you do not hold"):
+            await user_service.assign_role(
+                user_id=user.id,
+                role_id=role.id,
+                actor_permissions=["role.assign"],
+                actor_hospital_id=user.hospital_id,
+            )
+
+        mock_user_repo.add_role.assert_not_called()
+
+    async def test_assign_role_reports_exactly_what_is_missing(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """The 403 names the permissions that blocked it, for a usable error."""
+        user = _make_user()
+        role = _role_granting("lab.create", "lab.update", "patient.read")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_by_id.return_value = role
+        mock_role_repo.get_with_permissions.return_value = role
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            await user_service.assign_role(
+                user_id=user.id,
+                role_id=role.id,
+                actor_permissions=["role.assign", "patient.read"],
+                actor_hospital_id=user.hospital_id,
+            )
+
+        assert exc_info.value.detail["missing_permissions"] == ["lab.create", "lab.update"]
+
+    async def test_assign_role_allows_a_role_the_actor_fully_covers(
+        self: Any,
+        user_service: Any,
+        mock_user_repo: Any,
+        mock_role_repo: Any,
+        mock_auth_service: Any,
+    ) -> None:
+        """Holding every permission the role grants is enough — and no more."""
+        user = _make_user()
+        role = _role_granting("patient.read", "patient.create", name="Receptionist")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_by_id.return_value = role
+        mock_role_repo.get_with_permissions.return_value = role
+        mock_user_repo.has_role.return_value = False
+
+        await user_service.assign_role(
+            user_id=user.id,
+            role_id=role.id,
+            actor_permissions=["role.assign", "patient.read", "patient.create"],
+            actor_hospital_id=user.hospital_id,
+        )
+
+        mock_user_repo.add_role.assert_called_once_with(user.id, role.id, assigned_by=None)
+        mock_auth_service.logout_all.assert_called_once_with(user.id)
+
+    async def test_self_assignment_cannot_escalate(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """The reported hole: an admin granting *themselves* a richer role."""
+        admin = _make_user()
+        role = _role_granting("pharmacy.dispense", name="Pharmacist")
+
+        mock_user_repo.get_by_id.return_value = admin
+        mock_role_repo.get_by_id.return_value = role
+        mock_role_repo.get_with_permissions.return_value = role
+
+        with pytest.raises(PermissionDeniedError):
+            await user_service.assign_role(
+                user_id=admin.id,  # self
+                role_id=role.id,
+                actor_permissions=["role.assign", "user.read"],
+                actor_id=admin.id,
+                actor_hospital_id=admin.hospital_id,
+            )
+
+    async def test_invite_cannot_escalate_through_initial_roles(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """Inviting into a privileged role is the same hole — the token is returned."""
+        hospital_id = uuid.uuid4()
+        role = _role_granting("pharmacy.dispense", name="Pharmacist")
+
+        mock_user_repo.get_by_email.return_value = None
+        mock_role_repo.get_by_id.return_value = role
+        mock_role_repo.get_with_permissions.return_value = role
+
+        with pytest.raises(PermissionDeniedError, match="permissions you do not hold"):
+            await user_service.invite_user(
+                hospital_id=hospital_id,
+                email="escalate@hospital.test",
+                first_name="Priv",
+                last_name="Escalator",
+                role_ids=[role.id],
+                actor_permissions=["user.create"],
+            )
+
+        mock_user_repo.create.assert_not_called()
+
+
+class TestAdministratorLockout:
+    """§14: the last remaining administrator cannot give up the admin role."""
+
+    async def test_removing_last_administrator_role_is_blocked(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """No other active holder of ``role.assign`` → refuse."""
+        user = _make_user()
+        role = _role_granting("role.assign", "user.read", name="Hospital Admin")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_with_permissions.return_value = role
+        mock_user_repo.count_other_active_holders.return_value = 0
+
+        with pytest.raises(BusinessRuleError, match="last administrator"):
+            await user_service.remove_role(
+                user_id=user.id,
+                role_id=role.id,
+                actor_permissions=["role.assign"],
+                actor_hospital_id=user.hospital_id,
+            )
+
+        mock_user_repo.remove_role.assert_not_called()
+
+    async def test_removal_allowed_while_another_administrator_remains(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """A second active admin makes the removal safe."""
+        user = _make_user()
+        role = _role_granting("role.assign", "user.read", name="Hospital Admin")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_with_permissions.return_value = role
+        mock_user_repo.count_other_active_holders.return_value = 1
+        mock_user_repo.remove_role.return_value = True
+
+        await user_service.remove_role(
+            user_id=user.id,
+            role_id=role.id,
+            actor_permissions=["role.assign"],
+            actor_hospital_id=user.hospital_id,
+        )
+
+        mock_user_repo.remove_role.assert_called_once_with(user.id, role.id)
+
+    async def test_non_administrative_role_removal_is_unaffected(
+        self: Any, user_service: Any, mock_user_repo: Any, mock_role_repo: Any
+    ) -> None:
+        """A clinical role carries no lockout risk, so the count is never taken."""
+        user = _make_user()
+        role = _role_granting("patient.read", name="Nurse")
+
+        mock_user_repo.get_by_id.return_value = user
+        mock_role_repo.get_with_permissions.return_value = role
+        mock_user_repo.remove_role.return_value = True
+
+        await user_service.remove_role(
+            user_id=user.id,
+            role_id=role.id,
+            actor_permissions=["role.assign"],
+            actor_hospital_id=user.hospital_id,
+        )
+
+        mock_user_repo.count_other_active_holders.assert_not_called()
+        mock_user_repo.remove_role.assert_called_once_with(user.id, role.id)

@@ -235,7 +235,8 @@ class TestFullLifecycle:
         await user_service.assign_role(
             user_id=invited.id,
             role_id=role_id,
-            actor_permissions=["role.assign"],
+            # BR-8: the actor must already hold everything the role grants.
+            actor_permissions=["role.assign", "user.read"],
             actor_id=actor_id,
             actor_hospital_id=hospital_id,
         )
@@ -365,7 +366,8 @@ class TestTokenRevocationOnRoleChange:
         await user_service.assign_role(
             user_id=user.id,
             role_id=role_id,
-            actor_permissions=["role.assign"],
+            # BR-8: the actor must already hold everything the role grants.
+            actor_permissions=["role.assign", "user.read"],
             actor_id=actor_id,
             actor_hospital_id=hospital_id,
         )

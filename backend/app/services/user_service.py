@@ -239,6 +239,12 @@ class UserService:
                     detail={"role_ids": unknown_ids},
                 )
 
+            # BR-8: an invite grants permissions just as an assignment does, and
+            # the caller receives the invite token — so the same escalation
+            # guard applies before the user row is written.
+            for role_id in validated_roles:
+                await self._assert_grantable(role_id, actor_permissions, hospital_id)
+
         # Create user without a password (they'll set it via the invite link)
         user = await self._user_repo.create(
             hospital_id=hospital_id,
@@ -253,7 +259,8 @@ class UserService:
         # Assign validated roles (all-or-nothing enforced above)
         for role_id in validated_roles:
             if not await self._user_repo.has_role(user.id, role_id):
-                await self._user_repo.add_role(user.id, role_id)
+                # BR-9: record who granted the role.
+                await self._user_repo.add_role(user.id, role_id, assigned_by=actor_id)
 
         # The ``user_roles`` collection was eager-loaded when the row was
         # created — before any role was inserted — so the instance this method
@@ -451,6 +458,48 @@ class UserService:
 
     # ── Role Management ──────────────────────────────────────────────────────
 
+    async def _assert_grantable(
+        self,
+        role_id: uuid.UUID,
+        actor_permissions: list[str] | None,
+        actor_hospital_id: uuid.UUID | None,
+    ) -> None:
+        """Refuse to hand out permissions the actor does not already hold.
+
+        Business rule 8 of ``docs/modules/02-user-management.md``: "Users cannot
+        grant themselves permissions they don't already have (no privilege
+        escalation)", restated by §5.3 step 2, FR-3 and AC-3. Without this an
+        actor holding only ``role.assign`` can grant *themselves* any seeded
+        role and inherit its whole permission set — and because ``POST /users``
+        returns the invite token, the same trick works by inviting a new user
+        into a privileged role and then claiming that account.
+
+        The check covers both entry points (invite and assign), so the role
+        catalog is the only thing that bounds an admin's reach.
+
+        :param role_id: The role about to be granted.
+        :param actor_permissions: Permission codes the actor currently holds.
+        :param actor_hospital_id: The actor's hospital, for tenant scoping.
+        :raises NotFoundError: If the role is not visible to the actor's tenant.
+        :raises PermissionDeniedError: If the role grants anything the actor lacks.
+        """
+        role = await self._role_repo.get_with_permissions(role_id, hospital_id=actor_hospital_id)
+        if role is None:
+            raise NotFoundError("Role not found.")
+
+        granted = {rp.permission.code for rp in role.role_permissions if rp.permission is not None}
+        missing = sorted(granted - set(actor_permissions or []))
+        if missing:
+            logger.warning(
+                "privilege_escalation_blocked",
+                role_id=str(role_id),
+                missing_permissions=missing,
+            )
+            raise PermissionDeniedError(
+                "You cannot grant a role that includes permissions you do not hold.",
+                detail={"role": role.name, "missing_permissions": missing},
+            )
+
     async def assign_role(
         self,
         user_id: uuid.UUID,
@@ -491,13 +540,17 @@ class UserService:
         ):
             raise NotFoundError("Role not found.")
 
+        # BR-8 / FR-3 / AC-3: the actor may only hand out permissions they
+        # already hold, so ``role.assign`` is not a route to more power.
+        await self._assert_grantable(role_id, actor_permissions, actor_hospital_id)
+
         # Check if already assigned
         if await self._user_repo.has_role(user_id, role_id):
             logger.info("role_already_assigned", user_id=str(user_id), role_id=str(role_id))
             return user
 
-        # Assign the role
-        await self._user_repo.add_role(user_id, role_id)
+        # BR-9: the join row records who granted the role and when.
+        await self._user_repo.add_role(user_id, role_id, assigned_by=actor_id)
 
         # Revoke refresh tokens to force re-login with new claims
         await self._auth_service.logout_all(user_id)
@@ -515,6 +568,47 @@ class UserService:
         await self._uow.commit()
         logger.info("role_assigned", user_id=str(user_id), role_id=str(role_id))
         return user
+
+    async def _assert_not_last_administrator(self, user: User, role_id: uuid.UUID) -> None:
+        """Block a role removal that would leave the hospital unadministrable.
+
+        ``docs/modules/02-user-management.md`` §14: "Last remaining Hospital
+        Admin tries to remove admin role → blocked". The guard keys on the
+        capability rather than the role's name, because what actually locks a
+        hospital out is losing every active holder of ``role.assign`` — after
+        that nobody can grant the role back and the tenant needs operator
+        intervention.
+
+        Only active users count: an invited or suspended account cannot log in,
+        so it cannot undo the lockout either.
+
+        :param user: The user about to lose the role.
+        :param role_id: The role being removed.
+        :raises BusinessRuleError: If no other active administrator would remain.
+        """
+        if user.hospital_id is None:
+            return  # Tenantless (Super Admin) — no hospital to lock out.
+
+        role = await self._role_repo.get_with_permissions(role_id, hospital_id=user.hospital_id)
+        if role is None:
+            return  # Not visible here; ``remove_role`` will simply find nothing.
+
+        grants_administration = any(
+            rp.permission is not None and rp.permission.code == "role.assign"
+            for rp in role.role_permissions
+        )
+        if not grants_administration:
+            return
+
+        others = await self._user_repo.count_other_active_holders(
+            user.hospital_id, role_id, user.id
+        )
+        if others == 0:
+            raise BusinessRuleError(
+                "This is the hospital's last administrator — assign the role to "
+                "someone else before removing it.",
+                detail={"role": role.name},
+            )
 
     async def remove_role(
         self,
@@ -534,11 +628,15 @@ class UserService:
         :returns: The updated user instance.
         :raises PermissionDeniedError: If the actor doesn't have ``role.assign``.
         :raises NotFoundError: If the user doesn't exist or is outside the actor's hospital.
+        :raises BusinessRuleError: If this would strip the hospital's last
+            administrator of the ability to administer roles (§14).
         """
         if not actor_permissions or "role.assign" not in actor_permissions:
             raise PermissionDeniedError("You do not have permission to remove roles.")
 
         user = await self.get_user(user_id, actor_hospital_id)
+
+        await self._assert_not_last_administrator(user, role_id)
 
         removed = await self._user_repo.remove_role(user_id, role_id)
         if removed:

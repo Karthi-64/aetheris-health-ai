@@ -189,8 +189,18 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "billing.approve_discount",
             "billing.record_payment",
             "lab.read",
+            # The Hospital Admin is "full access within a single hospital", so
+            # its grant must cover every hospital-scoped role. Role assignment
+            # enforces BR-8 (an admin may only hand out permissions they hold),
+            # and without these five the admin could not invite a Doctor, Lab
+            # Technician, Pharmacist or Inventory Manager at all.
+            "lab.create",
+            "lab.update",
             "pharmacy.read",
+            "pharmacy.dispense",
             "inventory.read",
+            "inventory.create",
+            "inventory.update",
             "report.read",
             "report.export",
             "settings.read",

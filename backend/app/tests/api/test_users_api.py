@@ -548,3 +548,207 @@ class TestLoginPayloadCarriesPermissions:
         profile = login.json()["data"]["user"]
         assert set(profile["permissions"]) == {"patient.read", "user.read"}
         assert profile["name"] == "Permy User"
+
+
+class TestPrivilegeEscalationOverHttp:
+    """BR-8 / FR-3 / AC-3 at the HTTP boundary.
+
+    The service-level rule is unit-tested; these pin the status codes and the
+    persistence outcome, because the reported hole was reachable with nothing
+    but a valid admin token.
+    """
+
+    @pytest_asyncio.fixture
+    async def privileged_role(self, db_session: AsyncSession) -> uuid.UUID:
+        """A system role granting a permission the test actors do not hold."""
+        from app.models.permission import Permission
+        from app.models.role import Role, RolePermission
+
+        existing = await db_session.execute(
+            select(Permission).where(Permission.code == "pharmacy.dispense")
+        )
+        permission = existing.unique().scalar_one_or_none()
+        if permission is None:
+            permission = Permission(
+                id=uuid.uuid4(),
+                code="pharmacy.dispense",
+                module="pharmacy",
+                description="Dispense medication",
+            )
+            db_session.add(permission)
+            await db_session.flush()
+
+        role = Role(
+            id=uuid.uuid4(),
+            hospital_id=None,
+            name=f"Pharmacist {uuid.uuid4().hex[:8]}",
+            is_system=True,
+        )
+        db_session.add(role)
+        await db_session.flush()
+        db_session.add(
+            RolePermission(id=uuid.uuid4(), role_id=role.id, permission_id=permission.id)
+        )
+        await db_session.flush()
+        return role.id
+
+    @pytest_asyncio.fixture
+    async def assigner(self, db_session: AsyncSession, hospital_id: uuid.UUID) -> dict[str, Any]:
+        """An actor holding ``role.assign`` but no clinical permissions."""
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"assigner-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Limited",
+            last_name="Assigner",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        await grant_permissions(
+            db_session,
+            hospital_id=hospital_id,
+            user_id=user.id,
+            codes=["role.assign", "user.create", "user.read"],
+        )
+        token = create_access_token(user_id=user.id, hospital_id=hospital_id)
+        return {"id": user.id, "headers": {"Authorization": f"Bearer {token}"}}
+
+    async def test_self_assignment_of_a_richer_role_is_403(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        assigner: dict[str, Any],
+        privileged_role: uuid.UUID,
+    ) -> None:
+        """The reported hole: granting yourself permissions you lack."""
+        response = await api.post(
+            f"/api/v1/users/{assigner['id']}/roles",
+            json={"role_id": str(privileged_role)},
+            headers=assigner["headers"],
+        )
+        assert response.status_code == 403, response.text
+
+        rows = await db_session.execute(
+            select(UserRole).where(
+                UserRole.user_id == assigner["id"], UserRole.role_id == privileged_role
+            )
+        )
+        assert rows.unique().scalar_one_or_none() is None, "the role must not have been written"
+
+    async def test_inviting_into_a_richer_role_is_403(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        assigner: dict[str, Any],
+        privileged_role: uuid.UUID,
+    ) -> None:
+        """The invite path grants permissions too — and returns the token."""
+        email = f"escalate-{uuid.uuid4().hex[:12]}@hospital.example"
+        response = await api.post(
+            "/api/v1/users",
+            json={
+                "email": email,
+                "first_name": "Priv",
+                "last_name": "Escalator",
+                "role_ids": [str(privileged_role)],
+            },
+            headers=assigner["headers"],
+        )
+        assert response.status_code == 403, response.text
+
+        count = await db_session.execute(
+            select(func.count()).select_from(User).where(User.email == email)
+        )
+        assert count.scalar_one() == 0, "the invite must be all-or-nothing"
+
+    async def test_assignment_records_who_granted_the_role(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        assigner: dict[str, Any],
+    ) -> None:
+        """BR-9: ``user_roles`` records who granted the role, and when.
+
+        The spec calls the timestamp ``assigned_at``; the table serves it from
+        the ``TimestampMixin``'s ``created_at``, since the row exists only to
+        record the assignment.
+        """
+        from app.models.role import Role
+
+        target = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"target-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Grant",
+            last_name="Target",
+        )
+        db_session.add(target)
+        role = Role(
+            id=uuid.uuid4(),
+            hospital_id=None,
+            name=f"Empty {uuid.uuid4().hex[:8]}",
+            is_system=True,
+        )
+        db_session.add(role)
+        await db_session.flush()
+
+        response = await api.post(
+            f"/api/v1/users/{target.id}/roles",
+            json={"role_id": str(role.id)},
+            headers=assigner["headers"],
+        )
+        assert response.status_code == 200, response.text
+
+        rows = await db_session.execute(
+            select(UserRole).where(UserRole.user_id == target.id, UserRole.role_id == role.id)
+        )
+        user_role = rows.unique().scalar_one()
+        assert user_role.assigned_by == assigner["id"]
+        assert user_role.created_at is not None
+
+
+class TestLastAdministratorLockout:
+    """Module spec §14: the hospital must keep at least one administrator."""
+
+    async def test_removing_the_only_admin_role_is_blocked(
+        self, api: AsyncClient, db_session: AsyncSession, hospital_id: uuid.UUID
+    ) -> None:
+        """The sole holder of ``role.assign`` cannot give the role up."""
+
+        admin_user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"sole-admin-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Sole",
+            last_name="Admin",
+        )
+        db_session.add(admin_user)
+        await db_session.flush()
+        await grant_permissions(
+            db_session,
+            hospital_id=hospital_id,
+            user_id=admin_user.id,
+            codes=["role.assign", "user.read"],
+        )
+        token = create_access_token(user_id=admin_user.id, hospital_id=hospital_id)
+
+        rows = await db_session.execute(select(UserRole).where(UserRole.user_id == admin_user.id))
+        admin_role_id = rows.unique().scalars().one().role_id
+
+        response = await api.delete(
+            f"/api/v1/users/{admin_user.id}/roles/{admin_role_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 400, response.text
+        assert "last administrator" in response.text
+
+        still_there = await db_session.execute(
+            select(UserRole).where(
+                UserRole.user_id == admin_user.id, UserRole.role_id == admin_role_id
+            )
+        )
+        assert still_there.unique().scalar_one_or_none() is not None
