@@ -27,12 +27,32 @@ interface DataTableProps<TData, TValue> {
   toolbarRight?: ReactNode
   pageSize?: number
   className?: string
+  /**
+   * Opt in to server-driven paging. When given, `data` is treated as exactly
+   * one page that the server already selected — the table stops paginating
+   * client-side and the footer drives this callback instead.
+   */
+  serverPagination?: {
+    /** 1-based, matching the API. */
+    page: number
+    pageCount: number
+    onPageChange: (page: number) => void
+  }
+  /**
+   * Controlled search term. Supplying `onSearchChange` hands filtering to the
+   * caller (i.e. the server), so the table stops filtering the rows it was
+   * given — otherwise a server-side search would be filtered twice.
+   */
+  searchValue?: string
+  onSearchChange?: (value: string) => void
 }
 
 /**
  * The single tabular surface for the app (frontend/CLAUDE.md: every table uses
- * TanStack Table). Client-side sort · global search · pagination, Clinical Glass
- * styling, with loading and empty states built in.
+ * TanStack Table). Sort · global search · pagination, Clinical Glass styling,
+ * with loading and empty states built in. Search and paging are client-side
+ * by default; pass `serverPagination` / `onSearchChange` to hand either one
+ * to the API instead, for datasets too large to ship in one response.
  */
 export function DataTable<TData, TValue>({
   columns,
@@ -44,22 +64,30 @@ export function DataTable<TData, TValue>({
   toolbarRight,
   pageSize = 10,
   className,
+  serverPagination,
+  searchValue,
+  onSearchChange,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = useState<SortingState>([])
   const [globalFilter, setGlobalFilter] = useState('')
+
+  const searchIsControlled = onSearchChange !== undefined
+  const searchTerm = searchIsControlled ? (searchValue ?? '') : globalFilter
 
   // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Table manages its own memoization; the compiler lint is a known false positive here.
   const table = useReactTable({
     data,
     columns,
-    state: { sorting, globalFilter },
+    state: { sorting, ...(searchIsControlled ? {} : { globalFilter }) },
     onSortingChange: setSorting,
-    onGlobalFilterChange: setGlobalFilter,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize } },
+    ...(searchIsControlled
+      ? {}
+      : { onGlobalFilterChange: setGlobalFilter, getFilteredRowModel: getFilteredRowModel() }),
+    ...(serverPagination
+      ? {}
+      : { getPaginationRowModel: getPaginationRowModel(), initialState: { pagination: { pageSize } } }),
   })
 
   const rows = table.getRowModel().rows
@@ -73,8 +101,10 @@ export function DataTable<TData, TValue>({
             <div className="relative w-full max-w-xs">
               <Search className="text-outline pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2" />
               <input
-                value={globalFilter}
-                onChange={(e) => setGlobalFilter(e.target.value)}
+                value={searchTerm}
+                onChange={(e) =>
+                  searchIsControlled ? onSearchChange(e.target.value) : setGlobalFilter(e.target.value)
+                }
                 placeholder={searchPlaceholder}
                 aria-label={searchPlaceholder}
                 className="neo-pressed bg-surface font-body text-body-sm text-on-surface placeholder:text-outline-variant w-full rounded-xl py-2.5 pr-4 pl-9 outline-none focus-visible:ring-2 focus-visible:ring-secondary"
@@ -158,24 +188,37 @@ export function DataTable<TData, TValue>({
         {showEmpty && <div className="px-4">{emptyState}</div>}
       </div>
 
-      {!showEmpty && table.getPageCount() > 1 && (
+      {!showEmpty && (serverPagination ? serverPagination.pageCount > 1 : table.getPageCount() > 1) && (
         <div className="flex items-center justify-between gap-4">
           <p className="font-body text-body-sm text-on-surface-variant">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+            Page {serverPagination ? serverPagination.page : table.getState().pagination.pageIndex + 1}{' '}
+            of {serverPagination ? serverPagination.pageCount : table.getPageCount()}
           </p>
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={() => table.previousPage()}
-              disabled={!table.getCanPreviousPage()}
+              onClick={() =>
+                serverPagination
+                  ? serverPagination.onPageChange(serverPagination.page - 1)
+                  : table.previousPage()
+              }
+              disabled={serverPagination ? serverPagination.page <= 1 : !table.getCanPreviousPage()}
               className="neo-extruded bg-surface font-label text-label-caps text-on-surface-variant rounded-xl px-4 py-2 transition-transform active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Previous
             </button>
             <button
               type="button"
-              onClick={() => table.nextPage()}
-              disabled={!table.getCanNextPage()}
+              onClick={() =>
+                serverPagination
+                  ? serverPagination.onPageChange(serverPagination.page + 1)
+                  : table.nextPage()
+              }
+              disabled={
+                serverPagination
+                  ? serverPagination.page >= serverPagination.pageCount
+                  : !table.getCanNextPage()
+              }
               className="neo-extruded bg-surface font-label text-label-caps text-on-surface-variant rounded-xl px-4 py-2 transition-transform active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Next

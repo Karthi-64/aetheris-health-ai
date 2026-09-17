@@ -87,7 +87,7 @@ src/
 | Public / Landing | 2A | — | Built (off-structure) | Restructure to 2A |
 | Auth (login/forgot/reset/session) | 2B/2C | 01-authentication | Login + guards only | Add forgot/reset/session/first-login |
 | App shell (topbar, search, notifications, breadcrumbs, profile, copilot entry) | 2C | 11-notifications | Sidebar only | **Build** |
-| RBAC (7 roles, permissions) | 1, 2B, 10 | 02-user-management | Basic auth store | **Build** |
+| RBAC (7 roles, permissions) | 1, 2B, 10 | 02-user-management | Server-issued permission codes; nav + routes gated | **Built** (Sprint 2) |
 | Dashboards (role-based) | 3 | 10-reports-dashboard | 1 generic | **Build** role variants |
 | Patients | 4 | 03-patient-management | Records stub | **Build** |
 | Doctors / Departments | 5 | 04-doctor-management | — | **Build** |
@@ -95,6 +95,8 @@ src/
 | Billing | 7 | 06-billing | — | **Build** |
 | Reports & Analytics | 8 | 10-reports-dashboard | — | **Build** |
 | AI Copilot (side panel) | 9 | 13-ai-assistant | — | **Build** |
+| Users & Roles (admin) | 10 | 02-user-management | `/users`: directory, invite, role assign/remove, deactivate | **Built** (Sprint 2) |
+| Own profile | 10 | 02-user-management | `/settings/profile`: name/phone, password, MFA | **Built** (Sprint 2) |
 | Settings / Admin | 10 | 14-hospital-settings | — | **Build** |
 | Laboratory / Pharmacy / Inventory | — | 07/08/09 | — | Later modules |
 | Design System / Component Library | 11 | — | Partial (glass) | **Extend** |

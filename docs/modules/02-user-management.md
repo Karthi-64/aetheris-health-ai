@@ -60,6 +60,13 @@ Manage the humans (and future service accounts) who log into Aetheris. Own user 
 4. User clicks link, sets password → status becomes `active`.
 5. Audit: `user.invited`, later `user.activated`.
 
+> **Interim (MVP):** the Notifications module does not exist yet, so step 3
+> does not happen. `POST /users` returns the raw one-time token as
+> `invite_token` in the response body — the only time it is ever readable —
+> and the admin UI surfaces it for delivery through an out-of-band channel.
+> AC-2 is therefore not end-to-end satisfiable until Notifications ships;
+> the token itself, its single use and its TTL already work.
+
 ### 5.2 Deactivate
 
 1. Admin calls `POST /users/{id}/deactivate`.
@@ -70,9 +77,18 @@ Manage the humans (and future service accounts) who log into Aetheris. Own user 
 
 1. Admin calls `POST /users/{id}/roles` with role id.
 2. Service checks admin has all permissions the role includes (prevents escalation via assignment).
-3. Adds `user_roles` row.
+3. Adds `user_roles` row, recording `assigned_by` and the assignment time.
 4. Revokes user's refresh tokens (forces reissue with new claims).
 5. Audit: `user.role_assigned`.
+
+> The same check guards `POST /users`: an invite grants permissions exactly as
+> an assignment does, and the caller receives the invite token, so an
+> unguarded invite is the shorter path to the same escalation.
+>
+> **Consequence for the seeded catalog:** because an admin may only grant what
+> they already hold, the Hospital Admin role has to remain a superset of every
+> hospital-scoped role, or it silently loses the ability to staff those roles.
+> Adding a permission to a clinical role means adding it to Hospital Admin too.
 
 ### 5.4 Directory search
 
@@ -157,7 +173,7 @@ GET    /api/v1/permissions               # read-only catalog
 ## 14. Edge Cases
 
 - Admin deletes themselves → blocked with 400 `BUSINESS_RULE_VIOLATION`.
-- Last remaining Hospital Admin tries to remove admin role → blocked.
+- Last remaining Hospital Admin tries to remove admin role → blocked with 400 `BUSINESS_RULE_VIOLATION`. Keyed on the capability, not the role name: the check refuses when no *other active* user in the hospital would still hold `role.assign`.
 - Bulk import: partial failures return per-row status; no partial commit.
 - Case-sensitivity in email: enforced case-insensitive by index.
 
@@ -176,7 +192,7 @@ GET    /api/v1/permissions               # read-only catalog
 ## 17. Acceptance Criteria
 
 - AC-1: A Hospital Admin can invite a user with roles in under 30 seconds.
-- AC-2: The invited user receives an email and can set their password.
+- AC-2: The invited user receives an email and can set their password. *(Blocked on the Notifications module — see §5.1. The token half works today.)*
 - AC-3: An admin cannot assign a role containing permissions they lack.
 - AC-4: Deactivating a user immediately terminates their sessions.
 - AC-5: The permissions catalog is seeded and read-only in MVP.
