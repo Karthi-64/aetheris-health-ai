@@ -16,12 +16,14 @@ Drives the real running backend (uvicorn on :8000) over HTTP:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8000/api/v1"
+# Overridable so `make e2e` can follow a non-default BACKEND_PORT.
+BASE = os.environ.get("AETHERIS_API_BASE", "http://127.0.0.1:8000/api/v1")
 failures: list[str] = []
 
 
@@ -46,7 +48,8 @@ def call(
     except urllib.error.HTTPError as e:
         try:
             return e.code, json.loads(e.read())
-        except Exception:
+        except json.JSONDecodeError:
+            # Some error responses (e.g. a proxy's 502) carry no JSON body.
             return e.code, {}
 
 

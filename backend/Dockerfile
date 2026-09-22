@@ -73,5 +73,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 EXPOSE 8000
 
-# Run with uvicorn using uv
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Dependencies were installed with `uv pip install --system`, so the console
+# scripts live in /usr/local/bin and are on PATH directly. `uv` itself is only
+# present in the builder stage — invoking it here failed with "uv: executable
+# file not found", and `uv run` would in any case try to build a fresh project
+# venv on top of the packages already installed.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
