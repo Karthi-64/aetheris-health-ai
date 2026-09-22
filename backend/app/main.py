@@ -92,7 +92,11 @@ def _register_middleware(app: FastAPI) -> None:
     Execution order (outermost → innermost), i.e. the reverse of the
     registration order below::
 
-        CORS → RequestID → RequestLogging → Auth → RateLimit → ExceptionHandler
+        CORS → RequestID → RequestLogging → Auth → RateLimit → Timing → ExceptionHandler
+
+    ``TimingMiddleware`` sits inside ``RateLimitMiddleware`` so it measures
+    only the time the route handler and downstream layers actually spend,
+    excluding any time spent waiting behind the limiter's 429 response.
 
     Two orderings here are load-bearing rather than stylistic:
 
@@ -111,9 +115,13 @@ def _register_middleware(app: FastAPI) -> None:
     from app.middleware.logging import RequestLoggingMiddleware
     from app.middleware.rate_limit import RateLimitMiddleware
     from app.middleware.request_id import RequestIDMiddleware
+    from app.middleware.timing import TimingMiddleware
 
     # Registered first → innermost, closest to the route handler.
     app.add_middleware(ExceptionHandlerMiddleware)
+
+    # Timing — measures route-handler and downstream processing time.
+    app.add_middleware(TimingMiddleware)
 
     # Rate limiting — reads the identity Auth resolves just outside it.
     app.add_middleware(RateLimitMiddleware)

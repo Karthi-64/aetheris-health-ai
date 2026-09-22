@@ -75,13 +75,10 @@ class PasswordResetTokenRepository(BaseRepository[PasswordResetToken]):
         :returns: The token instance, or ``None``.
         """
         now = datetime.now(UTC)
-        stmt = (
-            select(PasswordResetToken)
-            .where(
-                PasswordResetToken.token_hash == token_hash,
-                PasswordResetToken.used_at.is_(None),
-                PasswordResetToken.expires_at > now,
-            )
+        stmt = select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == token_hash,
+            PasswordResetToken.used_at.is_(None),
+            PasswordResetToken.expires_at > now,
         )
         result = await self._session.execute(stmt)
         return result.unique().scalar_one_or_none()
@@ -96,12 +93,9 @@ class PasswordResetTokenRepository(BaseRepository[PasswordResetToken]):
         :returns: The number of tokens invalidated.
         """
         now = datetime.now(UTC)
-        stmt = (
-            select(PasswordResetToken)
-            .where(
-                PasswordResetToken.user_id == user_id,
-                PasswordResetToken.used_at.is_(None),
-            )
+        stmt = select(PasswordResetToken).where(
+            PasswordResetToken.user_id == user_id,
+            PasswordResetToken.used_at.is_(None),
         )
         result = await self._session.execute(stmt)
         tokens = list(result.unique().scalars().all())

@@ -1,0 +1,87 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Aetheris Health AI — Local Development Stack
+#
+# Provides PostgreSQL, Redis, the backend API, and the frontend dev server.
+# All four services are orchestrated via Docker Compose.
+#
+# Usage:
+#   make up          # start services
+#   make down        # stop services
+#   make migrate     # apply database migrations
+#   make seed        # seed demo data
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: aetheris
+      POSTGRES_PASSWORD: aetheris
+      POSTGRES_DB: aetheris
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aetheris -d aetheris"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Backend (FastAPI / Uvicorn) ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aetheris:aetheris@postgres:5432/aetheris
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: development
+      APP_DEBUG: "true"
+      LOG_FORMAT: console
+    volumes:
+      - ./backend:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    restart: unless-stopped
+
+  # ── Frontend (Vite dev server) ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      VITE_API_TARGET: http://backend:8000
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+    restart: unless-stopped
+
+volumes:
+  pgdata:

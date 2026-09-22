@@ -12,6 +12,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ── Request Schemas ─────────────────────────────────────────────────────────
 
+
 class LoginRequest(BaseModel):
     """Login credentials payload."""
 
@@ -23,7 +24,9 @@ class MfaVerifyRequest(BaseModel):
     """MFA verification payload."""
 
     mfa_ticket: str = Field(..., description="MFA ticket from the login response")
-    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code")
+    code: str = Field(
+        ..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code"
+    )
 
 
 class RefreshTokenRequest(BaseModel):
@@ -68,17 +71,26 @@ class MfaConfirmRequest(BaseModel):
     """MFA enrollment confirmation payload."""
 
     secret: str = Field(..., description="The TOTP secret from the enroll response")
-    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code to verify setup")
+    code: str = Field(
+        ...,
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$",
+        description="6-digit TOTP code to verify setup",
+    )
 
 
 class MfaDisableRequest(BaseModel):
     """MFA disable payload."""
 
     password: str = Field(..., description="Current password for verification")
-    code: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code")
+    code: str = Field(
+        ..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code"
+    )
 
 
 # ── Response Schemas ────────────────────────────────────────────────────────
+
 
 class UserProfileResponse(BaseModel):
     """Public user profile returned in auth responses."""

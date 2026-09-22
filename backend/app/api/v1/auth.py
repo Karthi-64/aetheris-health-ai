@@ -56,7 +56,8 @@ def _get_ip_address(request: Request) -> str | None:
 async def login(
     payload: LoginRequest,
     request: Request,
-    auth_service: AuthService = Depends(get_auth_service),    ) -> dict[str, Any]:
+    auth_service: AuthService = Depends(get_auth_service),
+) -> dict[str, Any]:
     """Authenticate with email and password."""
     result = await auth_service.login(
         email=payload.email,

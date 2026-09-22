@@ -13,22 +13,31 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ── Request Schemas ─────────────────────────────────────────────────────────
 
+
 class UserCreateRequest(BaseModel):
     """Create/invite a new user payload."""
 
     email: EmailStr
     first_name: str = Field(..., min_length=1, max_length=100, description="User's given name")
     last_name: str = Field(..., min_length=1, max_length=100, description="User's family name")
-    phone: str | None = Field(None, pattern=r"^\+?[1-9]\d{1,14}$", description="Phone number in E.164 format")
+    phone: str | None = Field(
+        None, pattern=r"^\+?[1-9]\d{1,14}$", description="Phone number in E.164 format"
+    )
     role_ids: list[uuid.UUID] | None = Field(None, description="Initial role UUIDs to assign")
 
 
 class UserUpdateRequest(BaseModel):
     """Update user profile payload."""
 
-    first_name: str | None = Field(None, min_length=1, max_length=100, description="User's given name")
-    last_name: str | None = Field(None, min_length=1, max_length=100, description="User's family name")
-    phone: str | None = Field(None, pattern=r"^\+?[1-9]\d{1,14}$", description="Phone number in E.164 format")
+    first_name: str | None = Field(
+        None, min_length=1, max_length=100, description="User's given name"
+    )
+    last_name: str | None = Field(
+        None, min_length=1, max_length=100, description="User's family name"
+    )
+    phone: str | None = Field(
+        None, pattern=r"^\+?[1-9]\d{1,14}$", description="Phone number in E.164 format"
+    )
 
 
 class UserProfileUpdateRequest(BaseModel):
@@ -46,6 +55,7 @@ class AssignRoleRequest(BaseModel):
 
 
 # ── Response Schemas ────────────────────────────────────────────────────────
+
 
 class UserResponse(BaseModel):
     """Full user profile returned in user management responses."""

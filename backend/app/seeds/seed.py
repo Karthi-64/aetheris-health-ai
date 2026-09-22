@@ -5,8 +5,12 @@ This module is called via ``make seed`` to populate a fresh database with:
 1. The permissions catalog (global, read-only in MVP)
 2. System roles with their permission mappings
 3. A demo hospital with demo users (for development)
+4. Realistic clinical demo data — departments, doctors, patients and
+   appointments — from :mod:`app.seeds.demo_data`
 
-All operations are idempotent — safe to run multiple times.
+All operations are idempotent — safe to run multiple times. Every entity is
+looked up by a stable natural key before it is created, so a second run adds
+nothing and changes nothing.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from app.models.hospital import Hospital
 from app.models.permission import Permission
 from app.models.role import Role, RolePermission
 from app.models.user import User, UserRole, UserStatus
+from app.seeds.demo_data import seed_demo_data
 
 logger = structlog.get_logger(__name__)
 
@@ -514,6 +519,11 @@ async def seed_database(database_url: str | None = None) -> None:
             logger.info("demo_receptionist_created", email=receptionist_email)
         else:
             logger.info("demo_receptionist_exists", email=receptionist_email)
+
+        # ── 7. Demo Clinical Data ────────────────────────────────────────────
+        # Departments, doctors, patients and appointments, so the frontend has
+        # real data to build against. Same transaction, same idempotency rules.
+        await seed_demo_data(session, hospital, role_map, actor_id=admin_user.id)
 
         # ── Commit ──────────────────────────────────────────────────────────
         await session.commit()

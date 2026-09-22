@@ -41,15 +41,18 @@ class PasswordResetToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         comment="UUID of the user requesting the password reset.",
     )
     token_hash: Mapped[str] = mapped_column(
-        String(128), nullable=False,
+        String(128),
+        nullable=False,
         comment="SHA-256 hash of the opaque reset token. Used for O(1) lookup.",
     )
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
+        DateTime(timezone=True),
+        nullable=False,
         comment="Token expiration timestamp (UTC). Default 30 minutes from issuance.",
     )
     used_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True,
+        DateTime(timezone=True),
+        nullable=True,
         comment="Timestamp when this token was used. NULL = not yet used.",
     )
 

@@ -61,9 +61,7 @@ async def _make_user(
     )
     session.add(user)
     await session.flush()
-    await grant_permissions(
-        session, hospital_id=hospital_id, user_id=user.id, codes=permissions
-    )
+    await grant_permissions(session, hospital_id=hospital_id, user_id=user.id, codes=permissions)
     return user.id
 
 
@@ -271,9 +269,7 @@ class TestListAndSearchPatients:
         assert body["metadata"]["pagination"]["total_records"] == 1
         assert body["data"][0]["last_name"] == "Rao"
 
-    async def test_search_by_exact_mrn(
-        self, api: AsyncClient, full_access: dict[str, str]
-    ) -> None:
+    async def test_search_by_exact_mrn(self, api: AsyncClient, full_access: dict[str, str]) -> None:
         created = await _register(api, full_access)
 
         response = await api.get(
@@ -300,9 +296,7 @@ class TestListAndSearchPatients:
     async def test_page_size_above_the_cap_returns_422(
         self, api: AsyncClient, full_access: dict[str, str]
     ) -> None:
-        response = await api.get(
-            "/api/v1/patients", params={"page_size": 500}, headers=full_access
-        )
+        response = await api.get("/api/v1/patients", params={"page_size": 500}, headers=full_access)
 
         assert response.status_code == 422
 

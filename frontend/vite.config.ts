@@ -17,7 +17,7 @@ export default defineConfig({
     proxy: {
       // Proxy API calls to the Python backend during dev
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.VITE_API_TARGET || 'http://localhost:8000',
         changeOrigin: true,
       },
     },

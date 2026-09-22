@@ -75,6 +75,7 @@ def password_needs_rehash(hashed_password: str) -> bool:
 
 # ── JWT Token Management ────────────────────────────────────────────────────
 
+
 def _get_jwt_algorithm() -> str:
     """Return the JWT signing algorithm based on configured keys.
 
@@ -198,6 +199,7 @@ def create_mfa_ticket(user_id: uuid.UUID) -> str:
 
 # ── Opaque Token Generation ─────────────────────────────────────────────────
 
+
 def generate_opaque_token() -> tuple[str, str]:
     """Generate an opaque token and its SHA-256 hash.
 
@@ -221,6 +223,7 @@ def hash_token(token: str) -> str:
 
 
 # ── MFA / TOTP ──────────────────────────────────────────────────────────────
+
 
 def generate_totp_secret() -> str:
     """Generate a new TOTP secret key.
@@ -257,6 +260,7 @@ def verify_totp_code(secret: str, code: str) -> bool:
 
 
 # ── Password Policy Validation ──────────────────────────────────────────────
+
 
 def validate_password_strength(password: str) -> list[str]:
     """Validate a password against the project's strength policy.

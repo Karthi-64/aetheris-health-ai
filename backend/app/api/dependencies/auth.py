@@ -150,6 +150,7 @@ def require_permission(permission_code: str) -> Any:
     :returns: A FastAPI dependency that resolves to the authenticated :class:`User`.
     :raises HTTPException: If the user lacks the required permission.
     """
+
     async def _check_permission(
         current_user: User = Depends(get_current_user),
     ) -> User:
@@ -185,6 +186,3 @@ def require_permission(permission_code: str) -> Any:
         return current_user
 
     return _check_permission
-
-
-

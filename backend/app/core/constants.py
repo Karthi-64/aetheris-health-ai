@@ -27,6 +27,7 @@ HEALTH_PATH = "/health"
 # ── Request Context ────────────────────────────────────────────────────────
 REQUEST_ID_HEADER = "X-Request-ID"
 CORRELATION_ID_HEADER = "X-Correlation-ID"
+RESPONSE_TIME_HEADER = "X-Response-Time"
 
 # ── Pagination Defaults ────────────────────────────────────────────────────
 DEFAULT_PAGE_SIZE = 25

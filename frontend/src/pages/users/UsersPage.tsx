@@ -94,7 +94,7 @@ export default function UsersPage() {
           searchValue={search}
           onSearchChange={changeSearch}
           pageSize={PAGE_SIZE}
-          serverPagination={{ page, pageCount, onPageChange: setPage }}
+          serverPagination={{ page, totalPages: pageCount, onPageChange: setPage }}
           toolbarRight={
             <Select value={statusFilter} onValueChange={changeStatus}>
               <SelectTrigger className="w-44">
