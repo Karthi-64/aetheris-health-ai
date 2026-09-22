@@ -114,7 +114,11 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
 
-    @staticmethod
-    def redis_settings() -> RedisSettings:
-        """Broker connection, taken from the same URL the app uses."""
-        return RedisSettings.from_dsn(settings.REDIS_URL)
+    #: Broker connection, taken from the same URL the app uses.
+    #:
+    #: Arq reads this straight out of the class ``__dict__`` and passes it to
+    #: ``create_pool``, so it must be a :class:`RedisSettings` *instance*. It
+    #: was once a ``@staticmethod`` returning one, which handed arq the
+    #: descriptor instead — the worker crashed on boot with ``'staticmethod'
+    #: object has no attribute 'host'`` and the sweeper never ran.
+    redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
