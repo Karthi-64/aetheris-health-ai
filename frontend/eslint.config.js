@@ -28,7 +28,7 @@ export default tseslint.config(
   // Route config + shadcn ui primitives legitimately co-export non-components
   // (the router object; cva variant helpers) — Fast Refresh doesn't apply here.
   {
-    files: ['src/router.tsx', 'src/components/ui/**/*.{ts,tsx}'],
+    files: ['src/router.tsx', 'src/components/ui/**/*.{ts,tsx}', 'src/pages/**/columns.tsx'],
     rules: { 'react-refresh/only-export-components': 'off' },
   },
   // Test files may use jsdom/vitest globals.
