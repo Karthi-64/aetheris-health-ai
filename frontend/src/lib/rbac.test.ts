@@ -16,9 +16,11 @@ describe('rbac', () => {
     expect(hasPermission(undefined, 'dashboard.view')).toBe(false)
   })
 
-  it('hasAnyPermission satisfies a group through write-level codes', () => {
-    // A user with only patient.write still sees the patients module.
-    expect(hasAnyPermission(['patient.write'], 'patient.read')).toBe(true)
+  it('hasAnyPermission gates a group on its seeded read code', () => {
+    expect(hasAnyPermission(['patient.read'], 'patient.read')).toBe(true)
+    // Being able to create patients does not imply the list view: the server
+    // requires patient.read for GET /patients, so the nav must not promise it.
+    expect(hasAnyPermission(['patient.create'], 'patient.read')).toBe(false)
     expect(hasAnyPermission(['report.read'], 'patient.read')).toBe(false)
     expect(hasAnyPermission(undefined, 'dashboard.view')).toBe(false)
   })
@@ -49,11 +51,13 @@ describe('rbac', () => {
     expect(paths).toContain('/settings')
   })
 
-  it('billing staff sees billing and reports but not patients or settings', () => {
+  it('billing staff sees billing and reports but not settings', () => {
+    // Seed grant: Billing Staff holds patient.read (invoice context) but no
+    // settings or user-management permissions.
     const paths = navForPermissions(MOCK_PERMISSIONS_BY_ROLE.billing_staff).map((n) => n.to)
-    expect(paths).toEqual(expect.arrayContaining(['/dashboard', '/billing', '/reports']))
-    expect(paths).not.toContain('/patients')
+    expect(paths).toEqual(expect.arrayContaining(['/dashboard', '/billing', '/reports', '/patients']))
     expect(paths).not.toContain('/settings')
+    expect(paths).not.toContain('/users')
   })
 
   it('an empty permission set sees no nav', () => {

@@ -15,6 +15,7 @@ from app.models.appointment import (
     AppointmentStatusHistory,
     AppointmentType,
 )
+from app.models.audit_log import AuditLog
 from app.models.base import (
     Base,
     CommonColumnsMixin,
@@ -40,6 +41,8 @@ from app.models.role import Role, RolePermission
 from app.models.user import User, UserRole, UserStatus
 
 __all__ = [
+    # Audit
+    "AuditLog",
     # Base + mixins
     "Base",
     "CommonColumnsMixin",

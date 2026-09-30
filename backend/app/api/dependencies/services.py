@@ -40,6 +40,7 @@ from app.api.dependencies.db import get_db_session
 from app.api.dependencies.repositories import (  # noqa: F401
     DbSession,
     get_appointment_repository,
+    get_audit_log_repository,
     get_department_repository,
     get_doctor_repository,
     get_hospital_repository,
@@ -51,10 +52,11 @@ from app.api.dependencies.repositories import (  # noqa: F401
     get_role_repository,
     get_user_repository,
 )
-from app.core.audit import AuditSink, StructlogAuditSink
+from app.core.audit import AuditSink
 from app.database.unit_of_work import UnitOfWork
 from app.repositories import (
     AppointmentRepository,
+    AuditLogRepository,
     DepartmentRepository,
     DoctorRepository,
     HospitalRepository,
@@ -73,6 +75,7 @@ from app.services.appointment_service import (
     NullInvoiceDraftSink,
     SlotRanker,
 )
+from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
 from app.services.department_service import DepartmentService, DepartmentUsageSource
 from app.services.doctor_service import (
@@ -80,6 +83,7 @@ from app.services.doctor_service import (
     DoctorDepartmentUsageSource,
     DoctorService,
 )
+from app.services.hospital_service import HospitalService
 from app.services.mrn_service import MRNService
 from app.services.patient_service import PatientService
 from app.services.role_service import RoleService
@@ -99,14 +103,38 @@ def get_unit_of_work(session: AsyncSession = Depends(get_db_session)) -> UnitOfW
 
 
 # ── Auth service ────────────────────────────────────────────────────────────
-def get_audit_sink() -> AuditSink:
+def get_audit_sink(
+    session: AsyncSession = Depends(get_db_session),
+    audit_repo: AuditLogRepository = Depends(get_audit_log_repository),
+    user_repo: UserRepository = Depends(get_user_repository),
+) -> AuditSink:
     """Provide the audit sink every service records mutations to.
 
-    Returns the interim structlog-backed sink. When
-    ``docs/modules/12-audit-logs.md`` ships, this provider returns the
-    database-backed ``AuditService`` instead and no service changes.
+    Now that ``docs/modules/12-audit-logs.md`` ships, this is the
+    database-backed :class:`~app.services.audit_service.AuditService` — which
+    still emits the structlog line, so observability is unchanged and no
+    service had to change (the seam in :mod:`app.core.audit` did its job).
     """
-    return StructlogAuditSink()
+    return AuditService(session, audit_repo, user_repo)
+
+
+def get_audit_service(
+    session: AsyncSession = Depends(get_db_session),
+    audit_repo: AuditLogRepository = Depends(get_audit_log_repository),
+    user_repo: UserRepository = Depends(get_user_repository),
+) -> AuditService:
+    """Provide an :class:`AuditService` for the audit read endpoints."""
+    return AuditService(session, audit_repo, user_repo)
+
+
+# ── Hospital settings module ─────────────────────────────────────────────────
+def get_hospital_service(
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    uow: UnitOfWork = Depends(get_unit_of_work),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> HospitalService:
+    """Provide a :class:`HospitalService` composed with its dependencies."""
+    return HospitalService(hospitals=hospitals, uow=uow, audit=audit)
 
 
 def get_auth_service(
@@ -315,6 +343,7 @@ __all__ = [
     # Re-exports from repositories
     "DbSession",
     "get_appointment_repository",
+    "get_audit_log_repository",
     "get_department_repository",
     "get_doctor_repository",
     "get_hospital_repository",
@@ -327,6 +356,10 @@ __all__ = [
     "get_auth_service",
     "get_unit_of_work",
     "get_user_service",
+    # Audit Logs module
+    "get_audit_service",
+    # Hospital settings module
+    "get_hospital_service",
     # Roles & Permissions module
     "get_role_service",
     # Patient module

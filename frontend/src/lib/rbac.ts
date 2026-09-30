@@ -37,9 +37,14 @@ export const ROLE_KEY_BY_NAME: Record<string, Role> = Object.fromEntries(
 
 /**
  * Authorization is modelled on PERMISSION CODES issued by the backend
- * (defect F5). The codes below mirror the seeded catalog in
- * `backend/app/seeds/seed.py` — the server checks the same strings via
- * `require_permission()`. The client never derives permissions from a role.
+ * (defect F5). This union mirrors the seeded catalog in
+ * `backend/app/seeds/seed.py` **exactly** — parity is enforced by
+ * `backend/app/tests/unit/test_frontend_permission_parity.py`, so a code
+ * renamed on either side fails CI instead of silently dead-locking the UI.
+ *
+ * `dashboard.view` is the one client-only pseudo-code: the backend has no
+ * such permission because the Dashboard is the home page — any user holding
+ * at least one permission may see it.
  */
 export type Permission =
   // Users & roles (module 02)
@@ -50,59 +55,144 @@ export type Permission =
   | 'user.reset_password'
   | 'role.read'
   | 'role.assign'
-  // Dashboard
-  | 'dashboard.view'
   // Patients
   | 'patient.read'
-  | 'patient.write'
+  | 'patient.create'
+  | 'patient.update'
+  | 'patient.delete'
   // Doctors
   | 'doctor.read'
-  | 'doctor.write'
+  | 'doctor.create'
+  | 'doctor.update'
+  | 'doctor.delete'
+  | 'doctor.availability.read'
+  | 'doctor.availability.update'
+  | 'doctor.leave.create'
+  | 'doctor.leave.delete'
   // Appointments
   | 'appointment.read'
-  | 'appointment.write'
+  | 'appointment.read.own'
+  | 'appointment.book'
+  | 'appointment.reschedule'
+  | 'appointment.cancel'
+  | 'appointment.check_in'
+  | 'appointment.start'
+  | 'appointment.complete'
+  | 'appointment.book_override'
+  | 'appointment.recommend_slot'
   // Billing
   | 'billing.read'
-  | 'billing.write'
+  | 'billing.create'
+  | 'billing.void'
+  | 'billing.approve_discount'
+  | 'billing.record_payment'
+  // Laboratory
+  | 'lab.read'
+  | 'lab.create'
+  | 'lab.update'
+  // Pharmacy
+  | 'pharmacy.read'
+  | 'pharmacy.dispense'
+  // Inventory
+  | 'inventory.read'
+  | 'inventory.create'
+  | 'inventory.update'
   // Reports
   | 'report.read'
-  // Settings
+  | 'report.export'
+  // Settings & departments
   | 'settings.read'
   | 'settings.update'
-  | 'settings.manage'
+  | 'department.read'
+  | 'department.create'
+  | 'department.update'
+  | 'department.delete'
+  // Audit
+  | 'audit.read'
+  | 'audit.export'
+  // Client-only pseudo-code (see docstring above)
+  | 'dashboard.view'
 
 /**
- * Fallback role→permission mapping, used ONLY by the dev mock login. In
- * production the permission set arrives from the server in the auth response;
- * the client never derives it from the role. Kept in sync with the seeded
- * system roles in `backend/app/seeds/seed.py`.
+ * Fallback role→permission mapping, used ONLY by the dev mock login when the
+ * API is unreachable. The codes mirror the seeded system roles in
+ * `backend/app/seeds/seed.py`; in production the permission set arrives from
+ * the server in the auth response and the client never derives it from the
+ * role.
  */
 export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
   super_admin: [
     'user.read', 'user.create', 'user.update', 'user.deactivate', 'user.reset_password',
     'role.read', 'role.assign', 'dashboard.view',
-    'patient.read', 'patient.write', 'doctor.read', 'doctor.write',
-    'appointment.read', 'appointment.write', 'billing.read', 'billing.write',
-    'report.read', 'settings.read', 'settings.update', 'settings.manage',
+    'patient.read', 'patient.create', 'patient.update', 'patient.delete',
+    'doctor.read', 'doctor.create', 'doctor.update', 'doctor.delete',
+    'doctor.availability.read', 'doctor.availability.update',
+    'doctor.leave.create', 'doctor.leave.delete',
+    'appointment.read', 'appointment.read.own', 'appointment.book', 'appointment.reschedule',
+    'appointment.cancel', 'appointment.check_in', 'appointment.start', 'appointment.complete',
+    'appointment.book_override', 'appointment.recommend_slot',
+    'billing.read', 'billing.create', 'billing.void', 'billing.approve_discount',
+    'billing.record_payment',
+    'lab.read', 'lab.create', 'lab.update',
+    'pharmacy.read', 'pharmacy.dispense',
+    'inventory.read', 'inventory.create', 'inventory.update',
+    'report.read', 'report.export',
+    'settings.read', 'settings.update',
+    'department.read', 'department.create', 'department.update', 'department.delete',
+    'audit.read', 'audit.export',
   ],
   hospital_admin: [
     'user.read', 'user.create', 'user.update', 'user.deactivate', 'user.reset_password',
     'role.read', 'role.assign', 'dashboard.view',
-    'patient.read', 'patient.write', 'doctor.read', 'doctor.write',
-    'appointment.read', 'appointment.write', 'billing.read', 'billing.write',
-    'report.read', 'settings.read', 'settings.update', 'settings.manage',
+    'patient.read', 'patient.create', 'patient.update', 'patient.delete',
+    'doctor.read', 'doctor.create', 'doctor.update', 'doctor.delete',
+    'doctor.availability.read', 'doctor.availability.update',
+    'doctor.leave.create', 'doctor.leave.delete',
+    'appointment.read', 'appointment.read.own', 'appointment.book', 'appointment.reschedule',
+    'appointment.cancel', 'appointment.check_in', 'appointment.start', 'appointment.complete',
+    'appointment.book_override', 'appointment.recommend_slot',
+    'billing.read', 'billing.create', 'billing.void', 'billing.approve_discount',
+    'billing.record_payment',
+    'lab.read', 'lab.create', 'lab.update',
+    'pharmacy.read', 'pharmacy.dispense',
+    'inventory.read', 'inventory.create', 'inventory.update',
+    'report.read', 'report.export',
+    'settings.read', 'settings.update',
+    'department.read', 'department.create', 'department.update', 'department.delete',
+    'audit.read',
   ],
   receptionist: [
-    'dashboard.view', 'patient.read', 'patient.write', 'doctor.read',
-    'appointment.read', 'appointment.write', 'billing.read',
+    'dashboard.view',
+    'patient.read', 'patient.create',
+    'appointment.read', 'appointment.book', 'appointment.reschedule', 'appointment.cancel',
+    'appointment.check_in', 'appointment.recommend_slot',
+    'department.read', 'doctor.read', 'doctor.availability.read',
   ],
   doctor: [
-    'dashboard.view', 'patient.read', 'patient.write', 'doctor.read', 'appointment.read',
-    'appointment.write', 'billing.read', 'report.read',
+    'dashboard.view',
+    'patient.read', 'patient.create', 'patient.update',
+    'appointment.read', 'appointment.read.own', 'appointment.start', 'appointment.complete',
+    'appointment.check_in',
+    'lab.read', 'lab.create', 'report.read',
+    'department.read', 'doctor.read', 'doctor.availability.read', 'doctor.availability.update',
+    'doctor.leave.create', 'doctor.leave.delete',
   ],
-  nurse: ['dashboard.view', 'patient.read', 'patient.write', 'doctor.read', 'appointment.read'],
-  billing_staff: ['dashboard.view', 'billing.read', 'billing.write', 'report.read'],
-  lab_technician: ['dashboard.view', 'patient.read'],
+  nurse: [
+    'dashboard.view',
+    'patient.read', 'patient.update',
+    'appointment.read', 'appointment.check_in',
+    'lab.read', 'department.read', 'doctor.read', 'doctor.availability.read',
+  ],
+  billing_staff: [
+    'dashboard.view',
+    'patient.read',
+    'billing.read', 'billing.create', 'billing.void', 'billing.record_payment',
+    'report.read', 'department.read', 'doctor.read',
+  ],
+  lab_technician: [
+    'dashboard.view',
+    'lab.read', 'lab.create', 'lab.update', 'department.read',
+  ],
 }
 
 /** Coarse permission groups the nav/routes are expressed in (spec Parts 3–10). */
@@ -137,19 +227,19 @@ export const NAV: NavItem[] = [
 ]
 
 /**
- * Any of these codes satisfies the group — the backend grants fine-grained
- * codes (e.g. `patient.read`) and the legacy mock set used the `.manage`/`.write`
- * coarse forms, so both must keep working.
+ * The server code that satisfies each nav group. Client-side navigation is
+ * expressed in these coarse groups for readability, but every alias is a real
+ * seeded code — the parity test forbids invented ones.
  */
 const GROUP_ALIASES: Record<PermissionGroup, Permission[]> = {
   'dashboard.view': ['dashboard.view'],
-  'patient.read': ['patient.read', 'patient.write'],
-  'doctor.read': ['doctor.read', 'doctor.write'],
-  'appointment.read': ['appointment.read', 'appointment.write'],
-  'billing.read': ['billing.read', 'billing.write'],
+  'patient.read': ['patient.read'],
+  'doctor.read': ['doctor.read'],
+  'appointment.read': ['appointment.read'],
+  'billing.read': ['billing.read'],
   'report.read': ['report.read'],
   'user.read': ['user.read'],
-  'settings.read': ['settings.read', 'settings.update', 'settings.manage'],
+  'settings.read': ['settings.read'],
 }
 
 export function hasPermission(userPerms: Permission[] | undefined, perm: Permission): boolean {

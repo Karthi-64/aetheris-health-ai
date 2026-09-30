@@ -659,6 +659,9 @@ class DepartmentService:
             actor_id=str(actor_id) if actor_id else None,
             result_count=total,
         )
+        # Deliberately no commit: a read path must not commit a shared
+        # transaction. The search event reaches structlog via the sink; the
+        # durable trail carries mutations only.
 
         return Page[DepartmentSummaryResponse](
             items=[DepartmentSummaryResponse.from_model(row) for row in rows],

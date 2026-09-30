@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies.db import get_db_session
 from app.repositories import (
     AppointmentRepository,
+    AuditLogRepository,
     DepartmentRepository,
     DoctorRepository,
     HospitalRepository,
@@ -45,6 +46,11 @@ from app.repositories import (
 
 #: Request-scoped database session, injected into every repository provider.
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
+
+
+def get_audit_log_repository(session: DbSession) -> AuditLogRepository:
+    """Provide an :class:`AuditLogRepository` bound to the request session."""
+    return AuditLogRepository(session)
 
 
 def get_hospital_repository(session: DbSession) -> HospitalRepository:

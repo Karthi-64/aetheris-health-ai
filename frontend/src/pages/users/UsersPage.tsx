@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useUsers, type ManagedUser, type UserStatus } from '@/api/users'
 import { usersColumns } from './columns'
 import { InviteUserDialog } from './InviteUserDialog'
+import { EditUserDialog } from './EditUserDialog'
 import { ManageRolesDialog } from './ManageRolesDialog'
 import { ConfirmUserActionDialog } from './ConfirmUserActionDialog'
 
@@ -28,6 +29,7 @@ export default function UsersPage() {
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [page, setPage] = useState(1)
   const [rolesTarget, setRolesTarget] = useState<ManagedUser | null>(null)
+  const [editTarget, setEditTarget] = useState<ManagedUser | null>(null)
   const [statusTarget, setStatusTarget] = useState<ManagedUser | null>(null)
 
   // The directory is paged by the server (FR-5 searches across all staff, not
@@ -84,6 +86,7 @@ export default function UsersPage() {
         <DataTable
           columns={usersColumns({
             onManageRoles: setRolesTarget,
+            onEdit: setEditTarget,
             onDeactivate: setStatusTarget,
             onReactivate: setStatusTarget,
           })}
@@ -129,6 +132,7 @@ export default function UsersPage() {
       )}
 
       <ManageRolesDialog user={rolesTarget} onClose={() => setRolesTarget(null)} />
+      <EditUserDialog user={editTarget} onClose={() => setEditTarget(null)} />
       <ConfirmUserActionDialog user={statusTarget} onClose={() => setStatusTarget(null)} />
     </div>
   )

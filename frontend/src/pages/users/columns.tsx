@@ -6,6 +6,7 @@ import { USER_STATUS_LABELS, USER_STATUS_VARIANT } from './usersShared'
 
 export interface UsersTableActions {
   onManageRoles: (user: ManagedUser) => void
+  onEdit: (user: ManagedUser) => void
   onDeactivate: (user: ManagedUser) => void
   onReactivate: (user: ManagedUser) => void
 }
@@ -76,6 +77,9 @@ export function usersColumns(actions: UsersTableActions): ColumnDef<ManagedUser>
         const canReactivate = user.status === 'suspended'
         return (
           <div className="flex justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={() => actions.onEdit(user)}>
+              Edit
+            </Button>
             <Button variant="ghost" size="sm" onClick={() => actions.onManageRoles(user)}>
               Roles
             </Button>

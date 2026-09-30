@@ -576,6 +576,10 @@ class PatientService:
             actor_id=str(actor_id) if actor_id else None,
             result_count=total,
         )
+        # Deliberately no commit: a read path must not commit a shared
+        # transaction (the suite pins this invariant). The search event is an
+        # observability entry — it reaches structlog via the sink, while the
+        # durable trail carries mutations only.
 
         return Page[PatientSummaryResponse](
             items=[PatientSummaryResponse.from_model(row) for row in rows],

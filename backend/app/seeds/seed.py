@@ -87,6 +87,9 @@ PERMISSION_DEFINITIONS: list[tuple[str, str, str]] = [
     # Settings
     ("settings.read", "settings", "View hospital settings"),
     ("settings.update", "settings", "Update hospital settings"),
+    # Audit (docs/modules/12-audit-logs.md §10)
+    ("audit.read", "audit", "Search and read the audit trail"),
+    ("audit.export", "audit", "Export audit trail entries"),
     # Departments (docs/modules/14-hospital-settings.md §10)
     ("department.read", "settings", "List and read departments"),
     ("department.create", "settings", "Create departments"),
@@ -161,6 +164,8 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "doctor.availability.update",
             "doctor.leave.create",
             "doctor.leave.delete",
+            "audit.read",
+            "audit.export",
         ],
     ),
     (
@@ -222,6 +227,7 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "doctor.availability.update",
             "doctor.leave.create",
             "doctor.leave.delete",
+            "audit.read",
         ],
     ),
     (
