@@ -308,7 +308,8 @@ class UserService:
         :param actor_hospital_id: The hospital ID of the requesting user.
         :param actor_permissions: Permissions of the actor.
         :param actor_id: UUID of the acting user, for the audit trail.
-        :param updates: Fields to update (first_name, last_name, phone).
+        :param updates: Fields to update (first_name, last_name, phone). Pass
+            only the fields the client sent; ``phone=None`` clears the number.
         :returns: The updated user instance.
         :raises NotFoundError: If the user doesn't exist.
         :raises PermissionDeniedError: If the actor doesn't have ``user.update``.
@@ -319,8 +320,7 @@ class UserService:
             raise PermissionDeniedError("You do not have permission to update users.")
 
         # Only allow updating allowed fields
-        allowed_fields = {"first_name", "last_name", "phone"}
-        safe_updates = {k: v for k, v in updates.items() if k in allowed_fields and v is not None}
+        safe_updates = self._profile_updates(updates)
 
         if safe_updates:
             user = await self._user_repo.update(user, **safe_updates)
@@ -341,6 +341,25 @@ class UserService:
 
         return user
 
+    @staticmethod
+    def _profile_updates(updates: dict[str, Any]) -> dict[str, Any]:
+        """Reduce a profile update to the fields that may be written.
+
+        Callers pass only the fields the client actually sent. ``phone`` is the
+        one nullable profile column, so an explicit ``None`` for it is kept: it
+        is how a number is cleared. ``None`` for a name is dropped, because
+        those columns are ``NOT NULL`` and a null there can only be a mistake.
+
+        :param updates: Field names and values from the request.
+        :returns: The subset to apply.
+        """
+        allowed_fields = {"first_name", "last_name", "phone"}
+        return {
+            field: value
+            for field, value in updates.items()
+            if field in allowed_fields and (value is not None or field == "phone")
+        }
+
     async def update_own_profile(self, user_id: uuid.UUID, **updates: Any) -> User:
         """Update the current user's own profile.
 
@@ -350,8 +369,7 @@ class UserService:
         """
         user = await self.get_user(user_id)
 
-        allowed_fields = {"first_name", "last_name", "phone"}
-        safe_updates = {k: v for k, v in updates.items() if k in allowed_fields and v is not None}
+        safe_updates = self._profile_updates(updates)
 
         if safe_updates:
             user = await self._user_repo.update(user, **safe_updates)

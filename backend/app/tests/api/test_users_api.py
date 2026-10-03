@@ -752,3 +752,80 @@ class TestLastAdministratorLockout:
             )
         )
         assert still_there.unique().scalar_one_or_none() is not None
+
+
+class TestClearingThePhoneNumber:
+    """``PATCH /api/v1/users/{id}`` and ``PATCH /api/v1/users/me``.
+
+    PR #29 review finding 9: the UI sends ``phone: null`` to clear a number,
+    but the service used to drop every ``None``, so the old number stayed and
+    the response still said the update succeeded.
+    """
+
+    @pytest_asyncio.fixture
+    async def member(self, db_session: AsyncSession, hospital_id: uuid.UUID) -> User:
+        """A user in the admin's hospital who has a phone number."""
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"member-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password("Str0ng!Passw0rd123"),
+            first_name="Meera",
+            last_name="Nair",
+            phone="+919812000199",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        return user
+
+    async def test_an_explicit_null_clears_the_number(
+        self, api: AsyncClient, db_session: AsyncSession, admin: dict[str, Any], member: User
+    ) -> None:
+        response = await api.patch(
+            f"/api/v1/users/{member.id}", json={"phone": None}, headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["phone"] is None
+        await db_session.refresh(member)
+        assert member.phone is None
+
+    async def test_an_omitted_phone_is_left_alone(
+        self, api: AsyncClient, db_session: AsyncSession, admin: dict[str, Any], member: User
+    ) -> None:
+        # The other half of the same rule: only an *explicit* null clears.
+        response = await api.patch(
+            f"/api/v1/users/{member.id}", json={"last_name": "Menon"}, headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        await db_session.refresh(member)
+        assert member.last_name == "Menon"
+        assert member.phone == "+919812000199"
+
+    async def test_a_null_name_does_not_blank_a_required_column(
+        self, api: AsyncClient, db_session: AsyncSession, admin: dict[str, Any], member: User
+    ) -> None:
+        response = await api.patch(
+            f"/api/v1/users/{member.id}",
+            json={"first_name": None, "phone": None},
+            headers=admin["headers"],
+        )
+
+        assert response.status_code == 200, response.text
+        await db_session.refresh(member)
+        assert member.first_name == "Meera"
+        assert member.phone is None
+
+    async def test_a_user_can_clear_their_own_number(
+        self, api: AsyncClient, db_session: AsyncSession, hospital_id: uuid.UUID, member: User
+    ) -> None:
+        token = create_access_token(user_id=member.id, hospital_id=hospital_id)
+
+        response = await api.patch(
+            "/api/v1/users/me", json={"phone": None}, headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200, response.text
+        await db_session.refresh(member)
+        assert member.phone is None

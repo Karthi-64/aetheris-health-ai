@@ -68,9 +68,9 @@ async def update_own_profile(
     """Update the current user's own profile."""
     user = await user_service.update_own_profile(
         user_id=current_user.id,
-        first_name=payload.first_name,
-        last_name=payload.last_name,
-        phone=payload.phone,
+        # Only what the client sent: an omitted phone is left alone, an
+        # explicit null clears it.
+        **payload.model_dump(exclude_unset=True),
     )
     roles = [
         {
@@ -269,9 +269,9 @@ async def update_user(
         actor_hospital_id=current_user.hospital_id,
         actor_permissions=actor_permissions,
         actor_id=current_user.id,
-        first_name=payload.first_name,
-        last_name=payload.last_name,
-        phone=payload.phone,
+        # Only what the client sent: an omitted phone is left alone, an
+        # explicit null clears it.
+        **payload.model_dump(exclude_unset=True),
     )
     roles = [
         {
