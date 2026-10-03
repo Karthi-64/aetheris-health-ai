@@ -1208,6 +1208,14 @@ async def seed_demo_data(
     :param actor_id: User recorded as the author of seeded appointments.
     """
     today = datetime.now(UTC).astimezone(CLINIC_TZ).date()
+    # The demo assumes a Mon–Fri clinic. Seeding on a weekend would place the
+    # "today" in-flight queue on a closed day (a contradiction — an appointment
+    # cannot be IN_PROGRESS on a Sunday) and push the "next working day"
+    # bookings the generator derives from it out of range. Anchor the seeded
+    # day to the previous Friday so the fixture is date-independent; the
+    # integration suite pins every BOOKED appointment to a weekday.
+    while today.weekday() >= 5:  # noqa: PLR2004 — 5 = Saturday, 6 = Sunday.
+        today -= timedelta(days=1)
 
     departments = await _seed_departments(session, hospital)
     doctors = await _seed_doctors(

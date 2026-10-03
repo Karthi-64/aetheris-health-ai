@@ -18,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.api.dependencies.db import get_db_session
+from app.core.audit import AuditEvent
 from app.core.security import create_access_token
 from app.main import create_app
 from app.models.audit_log import AuditLog
@@ -246,6 +247,69 @@ class TestListAuditLogs:
         )
         assert response.status_code == 422
 
+    async def test_naive_from_alone_is_rejected(
+        self, api: AsyncClient, reader: dict[str, str]
+    ) -> None:
+        """PR #29 review finding 3: a naive datetime is a 422, never a 500."""
+        response = await api.get(
+            "/api/v1/audit-logs",
+            headers=reader,
+            params={"from": "2026-09-30T00:00:00"},
+        )
+        assert response.status_code == 422
+
+    async def test_naive_to_alone_is_rejected(
+        self, api: AsyncClient, reader: dict[str, str]
+    ) -> None:
+        response = await api.get(
+            "/api/v1/audit-logs",
+            headers=reader,
+            params={"to": "2026-09-30T00:00:00"},
+        )
+        assert response.status_code == 422
+
+    async def test_naive_from_with_aware_to_is_rejected(
+        self, api: AsyncClient, reader: dict[str, str]
+    ) -> None:
+        """The old ``elif`` skipped the ``from`` tz check whenever ``to`` existed.
+
+        The naive/aware comparison then raised ``TypeError`` and the caller saw
+        a 500. Both bounds must now be validated before anything is compared.
+        """
+        response = await api.get(
+            "/api/v1/audit-logs",
+            headers=reader,
+            params={
+                "from": "2026-09-01T00:00:00",
+                "to": datetime.now(UTC).isoformat(),
+            },
+        )
+        assert response.status_code == 422
+
+    async def test_naive_to_with_aware_from_is_rejected(
+        self, api: AsyncClient, reader: dict[str, str]
+    ) -> None:
+        response = await api.get(
+            "/api/v1/audit-logs",
+            headers=reader,
+            params={
+                "from": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                "to": "2026-09-30T00:00:00",
+            },
+        )
+        assert response.status_code == 422
+
+    async def test_export_rejects_naive_bounds(
+        self, api: AsyncClient, exporter: dict[str, str]
+    ) -> None:
+        """The same guard covers the export path (§9)."""
+        response = await api.get(
+            "/api/v1/audit-logs/export",
+            headers=exporter,
+            params={"format": "csv", "from": "2026-09-30T00:00:00"},
+        )
+        assert response.status_code == 422
+
     async def test_other_tenants_entries_are_invisible(
         self,
         api: AsyncClient,
@@ -298,11 +362,123 @@ class TestGetAuditLog:
         assert response.status_code == 404
 
     async def test_permission_denied_without_audit_read(
-        self, api: AsyncClient, db_session: AsyncSession, hospital_id: uuid.UUID, no_audit
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_audit: dict[str, str],
     ) -> None:
         entry = await _seed_entry(db_session, hospital_id)
         response = await api.get(f"/api/v1/audit-logs/{entry.id}", headers=no_audit)
         assert response.status_code == 403
+
+
+class TestDurableSerialization:
+    """The trail must survive domain values the JSON encoder refuses.
+
+    PR #29 review finding 1: ``record()`` used to pass ``date``, ``Decimal``
+    and ``UUID`` values straight to the JSONB columns. Serialization raised
+    inside the SAVEPOINT, the surrounding ``except`` swallowed it, and the
+    business action succeeded with **no audit row** — invisible data loss on
+    exactly the events compliance cares about (patient DOB changes, doctor
+    fees). These tests reproduce that shape end to end.
+    """
+
+    async def test_event_with_date_decimal_uuid_values_persists(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        from datetime import date
+        from decimal import Decimal
+
+        from app.repositories import AuditLogRepository, UserRepository
+        from app.services.audit_service import AuditService
+
+        service = AuditService(
+            db_session,
+            AuditLogRepository(db_session),
+            UserRepository(db_session),
+        )
+        target = uuid.uuid4()
+        await service.record(
+            AuditEvent(
+                action="doctor.updated",
+                hospital_id=hospital_id,
+                target_type="doctor",
+                target_id=target,
+                actor_id=None,
+                changes={
+                    # The shapes the review calls out: date of birth, a money
+                    # column and an entity id — all refused by json.dumps.
+                    "date_of_birth": {"before": date(1990, 5, 2), "after": date(1990, 5, 12)},
+                    "consultation_fee": {
+                        "before": Decimal("500.00"),
+                        "after": Decimal("650.50"),
+                    },
+                    "linked_id": {"before": None, "after": target},
+                },
+                context={"reason": "fee revision", "effective": date(2026, 10, 1)},
+            )
+        )
+
+        row = (
+            (
+                await db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.hospital_id == hospital_id,
+                        AuditLog.action == "doctor.updated",
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert row.before is not None and row.after is not None
+        assert row.before["date_of_birth"] == "1990-05-02"
+        assert row.after["date_of_birth"] == "1990-05-12"
+        # Decimals serialize with their scale preserved (no float rounding).
+        assert row.before["consultation_fee"] == "500.00"
+        assert row.after["consultation_fee"] == "650.50"
+        assert row.after["linked_id"] == str(target)
+        assert row.context is not None
+        assert row.context["effective"] == "2026-10-01"
+
+    async def test_patient_like_update_is_readable_through_the_api(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        reader: dict[str, str],
+    ) -> None:
+        from datetime import date
+
+        from app.repositories import AuditLogRepository, UserRepository
+        from app.services.audit_service import AuditService
+
+        service = AuditService(
+            db_session,
+            AuditLogRepository(db_session),
+            UserRepository(db_session),
+        )
+        await service.record(
+            AuditEvent(
+                action="patient.updated",
+                hospital_id=hospital_id,
+                target_type="patient",
+                target_id=uuid.uuid4(),
+                actor_id=None,
+                changes={"date_of_birth": {"before": date(1971, 5, 2), "after": date(1971, 5, 12)}},
+            )
+        )
+
+        response = await api.get(
+            "/api/v1/audit-logs", headers=reader, params={"action": "patient.updated"}
+        )
+        assert response.status_code == 200
+        rows = response.json()["data"]
+        assert rows, "the durable row must exist, not only the log line"
+        assert rows[0]["after"]["date_of_birth"] == "1971-05-12"
 
 
 class TestExport:

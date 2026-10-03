@@ -7,6 +7,7 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
 import { useAuthStore } from '@/store/auth-store'
+import { usePermissions } from '@/hooks/usePermissions'
 import { usePatients } from '@/api/patients'
 import { useDoctors } from '@/api/doctors'
 import { useAppointments } from '@/api/appointments'
@@ -35,6 +36,9 @@ function StatTile({
 
 export default function DashboardPage() {
   const name = useAuthStore((s) => s.user?.name) ?? 'there'
+  const { can } = usePermissions()
+  const canBook = can('appointment.book')
+  const canRegister = can('patient.create')
   const today = todayISODate()
 
   const patients = usePatients({ page: 1, page_size: 1 })
@@ -56,20 +60,27 @@ export default function DashboardPage() {
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
-          <RegisterPatientDialog
-            trigger={
-              <Button variant="outline" className="rounded-full">
-                <UserPlus className="size-4" /> Register Patient
-              </Button>
-            }
-          />
-          <BookAppointmentDialog
-            trigger={
-              <Button className="rounded-full">
-                <CalendarPlus className="size-4" /> Book Appointment
-              </Button>
-            }
-          />
+          {/* Hidden per permission (PR #29 review finding 10) — a Nurse holds
+              neither patient.create nor appointment.book, so these controls
+              used to open a dialog that could only end in a 403. */}
+          {canRegister && (
+            <RegisterPatientDialog
+              trigger={
+                <Button variant="outline" className="rounded-full">
+                  <UserPlus className="size-4" /> Register Patient
+                </Button>
+              }
+            />
+          )}
+          {canBook && (
+            <BookAppointmentDialog
+              trigger={
+                <Button className="rounded-full">
+                  <CalendarPlus className="size-4" /> Book Appointment
+                </Button>
+              }
+            />
+          )}
         </div>
       </div>
 
@@ -126,13 +137,15 @@ export default function DashboardPage() {
                 title="No appointments today"
                 description="Booked appointments for today will appear here."
                 action={
-                  <BookAppointmentDialog
-                    trigger={
-                      <Button className="rounded-full">
-                        <CalendarPlus className="size-4" /> Book Appointment
-                      </Button>
-                    }
-                  />
+                  canBook ? (
+                    <BookAppointmentDialog
+                      trigger={
+                        <Button className="rounded-full">
+                          <CalendarPlus className="size-4" /> Book Appointment
+                        </Button>
+                      }
+                    />
+                  ) : undefined
                 }
               />
             }

@@ -5,6 +5,7 @@ from __future__ import annotations
 # NOTE: ``datetime``/``UUID`` must be imported at runtime, not under
 # TYPE_CHECKING — Pydantic resolves annotations against the module globals.
 from datetime import datetime  # noqa: TC003
+from typing import Any  # noqa: TC003
 from uuid import UUID  # noqa: TC003
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,7 +28,11 @@ class AuditLogResponse(BaseModel):
     actor_type: str = Field(description="user / system / ai.")
     target_type: str | None = Field(default=None, description="Entity type acted on.")
     target_id: UUID | None = Field(default=None, description="Entity acted on.")
-    before: dict | None = Field(default=None, description="Field values before the change.")
-    after: dict | None = Field(default=None, description="Field values after the change.")
-    context: dict | None = Field(default=None, description="Non-PII context (reason, counts).")
+    before: dict[str, Any] | None = Field(
+        default=None, description="Field values before the change."
+    )
+    after: dict[str, Any] | None = Field(default=None, description="Field values after the change.")
+    context: dict[str, Any] | None = Field(
+        default=None, description="Non-PII context (reason, counts)."
+    )
     created_at: datetime = Field(description="When the action occurred.")

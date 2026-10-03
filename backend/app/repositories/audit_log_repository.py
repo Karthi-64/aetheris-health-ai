@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid  # noqa: TC003 — needed at runtime for type hints
 from datetime import datetime  # noqa: TC003
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
 
@@ -39,9 +39,9 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         action: str,
         target_type: str | None,
         target_id: uuid.UUID | None,
-        before: dict | None,
-        after: dict | None,
-        context: dict | None,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        context: dict[str, Any] | None,
         request_id: uuid.UUID | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,

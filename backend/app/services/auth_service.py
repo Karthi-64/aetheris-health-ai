@@ -573,6 +573,11 @@ class AuthService:
         :param password: Current password for verification.
         :returns: Dict with ``secret``, ``provisioning_uri``.
         :raises AuthenticationError: If verification fails.
+        :raises BusinessRuleError: If MFA is already enabled — re-enrolment
+            would overwrite the working secret stored on the account before the
+            user confirms the new one, and from then on no TOTP code the user
+            enters would verify (lockout recoverable only from the database).
+            Disabling MFA first is the supported path back to enrolment.
         """
         user = await self._user_repo.get_by_id(user_id)
         if user is None:
@@ -580,6 +585,11 @@ class AuthService:
 
         if not verify_password(password, user.password_hash):
             raise AuthenticationError("Invalid password.")
+
+        if user.mfa_enabled:
+            raise BusinessRuleError(
+                "MFA is already enabled for this account. Disable it first if you want to re-enroll."
+            )
 
         secret = generate_totp_secret()
         provisioning_uri = get_totp_provisioning_uri(secret, user.email)

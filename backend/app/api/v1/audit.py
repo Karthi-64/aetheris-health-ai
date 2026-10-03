@@ -69,8 +69,21 @@ def _tenant_of(current_user: User) -> uuid.UUID:
 def _validate_range(start: datetime | None, end: datetime | None) -> None:
     """Enforce §11's one-year window and sane ordering.
 
-    :raises ValidationError: If the window exceeds a year or ends before it starts.
+    The timezone check runs **first**, for both bounds. A naive datetime cannot
+    be compared with an aware one — ``end < start`` or ``start > now()`` would
+    raise ``TypeError`` and surface as a 500 — and folding the ``from`` check
+    into an ``elif`` skipped it entirely whenever ``to`` was also supplied
+    (PR #29 review finding 3). A client mistake is a 422, not a server error.
+
+    :raises ValidationError: If a bound is naive, the window exceeds a year, or
+        ``to`` is before ``from``.
     """
+    if start is not None and start.tzinfo is None:
+        msg = "`from` must include a timezone offset."
+        raise ValidationError(msg)
+    if end is not None and end.tzinfo is None:
+        msg = "`to` must include a timezone offset."
+        raise ValidationError(msg)
     if start is not None and end is not None:
         if end < start:
             msg = "`to` must not be before `from`."
@@ -78,14 +91,8 @@ def _validate_range(start: datetime | None, end: datetime | None) -> None:
         if (end - start).days > _MAX_RANGE_DAYS:
             msg = "Date range must not exceed one year per call."
             raise ValidationError(msg)
-    elif start is not None and start.tzinfo is None:
-        msg = "`from` must include a timezone offset."
-        raise ValidationError(msg)
     if start is not None and start > datetime.now(UTC):
         msg = "`from` must not be in the future."
-        raise ValidationError(msg)
-    if end is not None and end.tzinfo is None:
-        msg = "`to` must include a timezone offset."
         raise ValidationError(msg)
 
 

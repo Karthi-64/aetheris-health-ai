@@ -203,6 +203,8 @@ class TestUpdateSettings:
         assert entry.target_id == hospital_id
         assert entry.actor_user_id is not None
         # The sink splits the AuditEvent diff into flat before/after maps.
+        assert entry.before is not None
+        assert entry.after is not None
         assert entry.before["name"].startswith("Test Hospital")
         assert entry.after["name"] == "Renamed Hospital"
 
@@ -254,6 +256,43 @@ class TestUpdateSettings:
     async def test_empty_patch_is_a_noop(self, api: AsyncClient, admin: dict[str, str]) -> None:
         response = await api.patch("/api/v1/hospitals/current", headers=admin, json={})
         assert response.status_code == 200
+
+    async def test_explicit_null_for_required_fields_is_422(
+        self, api: AsyncClient, admin: dict[str, str]
+    ) -> None:
+        """PR #29 review finding 4: name/address/locale/settings are NOT NULL.
+
+        ``model_dump(exclude_unset=True)`` keeps explicit nulls, so before the
+        validator these reached the database, raised IntegrityError, and the
+        caller saw a 500 with the session stuck in a failed transaction.
+        """
+        for body in (
+            {"name": None},
+            {"address": None},
+            {"locale": None},
+            {"settings": None},
+        ):
+            response = await api.patch("/api/v1/hospitals/current", headers=admin, json=body)
+            assert response.status_code == 422, body
+
+    async def test_explicit_null_clears_nullable_fields(
+        self, api: AsyncClient, admin: dict[str, str]
+    ) -> None:
+        """phone/email/logo_url are nullable, so null is the clear path (finding 5)."""
+        await api.patch(
+            "/api/v1/hospitals/current",
+            headers=admin,
+            json={"phone": "+919999000011", "email": "settings-clear@hospital.test"},
+        )
+        response = await api.patch(
+            "/api/v1/hospitals/current",
+            headers=admin,
+            json={"phone": None, "email": None},
+        )
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["phone"] is None
+        assert data["email"] is None
 
     async def test_user_without_permission_is_denied(
         self, api: AsyncClient, no_settings: dict[str, str]

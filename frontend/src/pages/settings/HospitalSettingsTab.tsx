@@ -7,7 +7,11 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
 import { ApiError } from '@/api/types'
-import { useHospitalSettings, useUpdateHospitalSettings } from '@/api/hospitals'
+import {
+  useHospitalSettings,
+  useUpdateHospitalSettings,
+  type UpdateHospitalSettingsInput,
+} from '@/api/hospitals'
 import { usePermissions } from '@/hooks/usePermissions'
 
 interface FormState {
@@ -76,23 +80,40 @@ export function HospitalSettingsTab() {
 
   async function onSave() {
     if (!data) return
+
+    // Canonical address keys (finding 6): patients already store `line1` /
+    // `postal_code`, so the hospital must too. Merge over the existing object
+    // so keys this form does not render (e.g. a landmark) survive, and drop the
+    // legacy `street`/`zip` pair so a record never carries both key sets.
+    const address: Record<string, string> = { ...data.address }
+    delete address.street
+    delete address.zip
+    const addressFields: Record<string, string> = {
+      line1: form.line1,
+      city: form.city,
+      state: form.state,
+      postal_code: form.postal_code,
+      country: form.country,
+    }
+    for (const [key, value] of Object.entries(addressFields)) {
+      // A filled input writes the canonical key; an emptied one clears the part
+      // (finding 5) instead of silently leaving the old value in place.
+      if (value.trim()) address[key] = value.trim()
+      else delete address[key]
+    }
+
+    // Only fields the admin actually touched are sent (finding 5). NOT NULL
+    // fields (name, locale) cannot be cleared: an emptied input is sent as-is
+    // so the server's 422 is surfaced, rather than a toast that lies.
+    const payload: UpdateHospitalSettingsInput = { address }
+    if ('name' in overrides) payload.name = form.name.trim()
+    if ('locale' in overrides) payload.locale = form.locale.trim()
+    // Nullable fields: `null` is the clear signal the server now applies.
+    if ('email' in overrides) payload.email = form.email.trim() || null
+    if ('phone' in overrides) payload.phone = form.phone.trim() || null
+
     try {
-      await update.mutateAsync({
-        name: form.name.trim() || undefined,
-        email: form.email.trim() || undefined,
-        phone: form.phone.trim() || undefined,
-        locale: form.locale.trim() || undefined,
-        // Merge, never replace: the address JSONB may carry keys this form
-        // does not render (e.g. a landmark), and a PATCH must not drop them.
-        address: {
-          ...data.address,
-          ...(form.line1 ? { line1: form.line1.trim() } : {}),
-          ...(form.city ? { city: form.city.trim() } : {}),
-          ...(form.state ? { state: form.state.trim() } : {}),
-          ...(form.postal_code ? { postal_code: form.postal_code.trim() } : {}),
-          ...(form.country ? { country: form.country.trim() } : {}),
-        },
-      })
+      await update.mutateAsync(payload)
       toast.success('Hospital settings saved')
     } catch (err) {
       const message =

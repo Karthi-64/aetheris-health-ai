@@ -5,7 +5,19 @@ import type { Paginated } from '@/api/types'
 import type { AppointmentSummary } from '@/api/appointments'
 import AppointmentsPage from './AppointmentsPage'
 
+const { canMock } = vi.hoisted(() => ({ canMock: vi.fn() }))
 const useAppointmentsMock = vi.fn()
+
+// Permission gate (PR #29 review finding 10). Defaults to allowing everything
+// so the layout tests below are unaffected; the gating test narrows it.
+vi.mock('@/hooks/usePermissions', () => ({
+  usePermissions: () => ({
+    can: (p: string) => canMock(p),
+    canAny: () => true,
+    nav: [],
+    role: undefined,
+  }),
+}))
 vi.mock('@/api/appointments', () => ({
   useAppointments: (p: unknown) => useAppointmentsMock(p),
   useBookAppointment: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -52,7 +64,11 @@ function renderPage() {
 }
 
 describe('AppointmentsPage', () => {
-  beforeEach(() => useAppointmentsMock.mockReset())
+  beforeEach(() => {
+    useAppointmentsMock.mockReset()
+    canMock.mockReset()
+    canMock.mockReturnValue(true)
+  })
 
   it('renders appointment rows from the API response', () => {
     useAppointmentsMock.mockReturnValue(result({ data: page([appt]) }))
@@ -73,5 +89,19 @@ describe('AppointmentsPage', () => {
     renderPage()
     expect(screen.getByText("Couldn't load appointments")).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument()
+  })
+
+  it('hides Book for a role without appointment.book', () => {
+    // A Doctor lacks appointment.book; the trigger must not render at all.
+    canMock.mockImplementation((p: string) => p !== 'appointment.book')
+    useAppointmentsMock.mockReturnValue(result({ data: page([appt]) }))
+    renderPage()
+    expect(screen.queryByRole('button', { name: /^book$/i })).not.toBeInTheDocument()
+  })
+
+  it('shows Book for a role that holds appointment.book', () => {
+    useAppointmentsMock.mockReturnValue(result({ data: page([appt]) }))
+    renderPage()
+    expect(screen.getByRole('button', { name: /^book$/i })).toBeInTheDocument()
   })
 })

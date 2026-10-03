@@ -13,16 +13,23 @@ from __future__ import annotations
 # NOTE: ``datetime``/``UUID`` must be imported at runtime, not under
 # TYPE_CHECKING — Pydantic resolves annotations against the module globals.
 from datetime import datetime  # noqa: TC003
-from typing import Any  # noqa: TC003
+from typing import Any, Self  # noqa: TC003
 from uuid import UUID  # noqa: TC003
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
     "HospitalPublicResponse",
     "HospitalSettingsResponse",
     "UpdateHospitalSettingsRequest",
 ]
+
+#: Update fields whose columns are ``NOT NULL``. Declared optional so a PATCH
+#: can omit them, but an explicit ``null`` is rejected — see
+#: :meth:`UpdateHospitalSettingsRequest._reject_null_for_non_nullable_columns`.
+#: ``phone``, ``email`` and ``logo_url`` are intentionally absent: their columns
+#: are nullable, so ``null`` is the supported way to clear them.
+_NON_NULLABLE_UPDATE_FIELDS = frozenset({"name", "address", "locale", "settings"})
 
 #: Pragmatic RFC 5322 subset, identical to the one in
 #: :mod:`app.schemas.department` (no new dependencies — CLAUDE.md).
@@ -102,3 +109,24 @@ class UpdateHospitalSettingsRequest(BaseModel):
                 msg = f"Address field '{key}' is too long."
                 raise ValueError(msg)
         return value
+
+    @model_validator(mode="after")
+    def _reject_null_for_non_nullable_columns(self) -> Self:
+        """Reject an explicit ``null`` on a column the database requires.
+
+        Every field here is ``| None`` so that it can be *omitted*, but ``name``,
+        ``address``, ``locale`` and ``settings`` back ``NOT NULL`` columns.
+        Because the service uses ``model_dump(exclude_unset=True)`` — which keeps
+        explicit nulls — ``PATCH {"name": null}`` used to reach the database and
+        return a 500 IntegrityError instead of a 422 naming the field (PR #29
+        review finding 4; same pattern as ``app.schemas.patient``).
+        """
+        offenders = sorted(
+            name
+            for name in _NON_NULLABLE_UPDATE_FIELDS & self.model_fields_set
+            if getattr(self, name) is None
+        )
+        if offenders:
+            msg = f"These fields cannot be set to null: {', '.join(offenders)}."
+            raise ValueError(msg)
+        return self

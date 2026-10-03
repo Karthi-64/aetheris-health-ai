@@ -77,7 +77,10 @@ function EditUserForm({ user, onClose }: { user: ManagedUser; onClose: () => voi
         id: user.id,
         first_name: values.first_name,
         last_name: values.last_name,
-        phone: values.phone || undefined,
+        // An emptied phone must clear the value (PR #29 review finding 9):
+        // `undefined` drops the key from the PATCH and the old number survives,
+        // while the toast still claims success. The update schema accepts null.
+        phone: values.phone || null,
       })
       toast.success('User updated')
       onClose()

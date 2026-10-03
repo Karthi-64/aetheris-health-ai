@@ -22,6 +22,25 @@ import { usePermissions } from '@/hooks/usePermissions'
 
 const PAGE_SIZE = 10
 
+/** Parse a `YYYY-MM-DD` picker value into its local-midnight instant.
+ *
+ * The date input yields a local calendar date, so the bound must be built in
+ * the browser's own timezone. The old `${date}T00:00:00.000Z` treated it as
+ * UTC midnight (PR #29 review finding 8): in India the window was shifted by
+ * 5h30m, and before 05:30 local "From = today" was in the future and the
+ * server rejected it with a 422.
+ */
+function localDayStart(date: string): string {
+  const [y, m, d] = date.split('-').map(Number)
+  return new Date(y, m - 1, d).toISOString()
+}
+
+/** The exclusive next local midnight, minus 1ms so the day is inclusive. */
+function localDayEnd(date: string): string {
+  const [y, m, d] = date.split('-').map(Number)
+  return new Date(new Date(y, m - 1, d + 1).getTime() - 1).toISOString()
+}
+
 function formatTimestamp(iso: string) {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
@@ -90,8 +109,8 @@ export function AuditLogTab() {
     () => ({
       q: debouncedQ || undefined,
       action: action.trim() || undefined,
-      from: from ? `${from}T00:00:00.000Z` : undefined,
-      to: to ? `${to}T23:59:59.999Z` : undefined,
+      from: from ? localDayStart(from) : undefined,
+      to: to ? localDayEnd(to) : undefined,
     }),
     [debouncedQ, action, from, to],
   )

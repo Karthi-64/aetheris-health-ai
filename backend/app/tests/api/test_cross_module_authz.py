@@ -18,7 +18,7 @@ router yet, so there is nothing to guard.
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
@@ -54,7 +54,7 @@ READ_ENDPOINTS: list[tuple[str, str]] = [
 #: is valid JSON; 403 must win over validation because the permission gate is
 #: the outermost check. The method matters — routing rejects a wrong method
 #: (405) before any dependency runs.
-MUTATION_ENDPOINTS: list[tuple[str, str, str, dict]] = [
+MUTATION_ENDPOINTS: list[tuple[str, str, str, dict[str, Any]]] = [
     ("POST", "/api/v1/patients", "patient.create", {}),
     ("POST", "/api/v1/doctors", "doctor.create", {}),
     ("POST", "/api/v1/departments", "department.create", {}),
@@ -152,7 +152,7 @@ async def test_mutation_denied_without_permission(
     method: str,
     path: str,
     permission: str,
-    body: dict,
+    body: dict[str, Any],
 ) -> None:
     """Mutating endpoints refuse writes from a caller lacking the permission."""
     response = await api.request(method, path, headers=no_permissions, json=body)

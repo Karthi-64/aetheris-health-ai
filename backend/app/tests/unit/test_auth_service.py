@@ -434,6 +434,31 @@ class TestMFA:
         assert "provisioning_uri" in result
         mock_user_repo.update.assert_called_once()
 
+    async def test_re_enrolment_is_refused_when_mfa_already_enabled(
+        self: Any, auth_service: Any, mock_user_repo: Any
+    ) -> None:
+        """PR #29 review finding 2: re-enrolling must not overwrite a live secret.
+
+        Before the fix the new secret was written and committed immediately, so
+        a user who started — but did not confirm — a second enrolment lost the
+        only secret their authenticator knew and could never log in again
+        (disable_mfa needs a valid code too). The guard must leave the stored
+        secret untouched and refuse with a 4xx-worthy BusinessRuleError.
+        """
+        existing_secret = "JBSWY3DPEHPK3PXP"
+        user = _make_user({"mfa_enabled": True, "mfa_secret": existing_secret})
+        mock_user_repo.get_by_id.return_value = user
+
+        with pytest.raises(BusinessRuleError, match="MFA is already enabled"):
+            await auth_service.enroll_mfa(
+                user_id=user.id,
+                password="TestPass@123",
+            )
+
+        # The working secret survives and nothing was persisted.
+        assert user.mfa_secret == existing_secret
+        mock_user_repo.update.assert_not_called()
+
 
 # ── PII / Logging Tests ────────────────────────────────────────────────────
 

@@ -46,7 +46,8 @@ export interface InviteUserInput {
 export interface UpdateUserInput {
   first_name?: string
   last_name?: string
-  phone?: string
+  /** `null` clears the number — an empty string is not a valid phone. */
+  phone?: string | null
 }
 
 /** Query-key factory — `["users", ...]` (CLAUDE.md React Query patterns). */

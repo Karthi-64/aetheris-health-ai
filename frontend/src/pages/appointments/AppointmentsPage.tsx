@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAppointments, type AppointmentStatus } from '@/api/appointments'
+import { usePermissions } from '@/hooks/usePermissions'
 import { todayISODate } from '@/lib/format'
 import { appointmentColumns } from './columns'
 
@@ -24,6 +25,7 @@ const STATUS_OPTIONS: { value: AppointmentStatus; label: string }[] = [
 ]
 
 export default function AppointmentsPage() {
+  const { can } = usePermissions()
   const [date, setDate] = useState<string>(todayISODate)
   const [status, setStatus] = useState<string>(ALL)
   const [page, setPage] = useState(1)
@@ -87,13 +89,18 @@ export default function AppointmentsPage() {
                 ))}
               </SelectContent>
             </Select>
-            <BookAppointmentDialog
-              trigger={
-                <Button className="rounded-full">
-                  <CalendarPlus className="size-4" /> Book
-                </Button>
-              }
-            />
+            {/* Only shown when the role can actually book (PR #29 review
+                finding 10) — a Doctor lacks appointment.book, so the dialog
+                used to open and only fail with a 403 at submit. */}
+            {can('appointment.book') && (
+              <BookAppointmentDialog
+                trigger={
+                  <Button className="rounded-full">
+                    <CalendarPlus className="size-4" /> Book
+                  </Button>
+                }
+              />
+            )}
           </>
         }
       />

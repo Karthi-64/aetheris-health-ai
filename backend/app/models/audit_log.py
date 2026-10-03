@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid  # noqa: TC003 — needed at runtime for column type resolution
 from datetime import datetime  # noqa: TC003
+from typing import Any
 
 from sqlalchemy import DateTime, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
@@ -53,13 +54,13 @@ class AuditLog(Base):
     target_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, comment="UUID of the entity acted on."
     )
-    before: Mapped[dict | None] = mapped_column(
+    before: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="Field values before the change."
     )
-    after: Mapped[dict | None] = mapped_column(
+    after: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True, comment="Field values after the change."
     )
-    context: Mapped[dict | None] = mapped_column(
+    context: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
         comment="Non-PII context (reason, counts) carried by the AuditEvent.",

@@ -20,6 +20,7 @@ from datetime import datetime  # noqa: TC003
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from pydantic_core import to_jsonable_python
 
 from app.core.audit import AuditEvent, StructlogAuditSink
 from app.core.exceptions import NotFoundError
@@ -39,6 +40,23 @@ logger = structlog.get_logger("aetheris.audit")
 
 #: Shared structlog sink — values are redacted there (see its docstring).
 _structlog_sink = StructlogAuditSink()
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert ``value`` to something the JSONB columns can serialize.
+
+    Audit diffs carry domain values — ``date`` of birth, ``Decimal``
+    consultation fees, ``UUID`` ids — that ``json.dumps`` refuses, and a raw
+    insert would raise inside the SAVEPOINT, silently drop the audit row, and
+    only leave a warning in the logs. Pydantic's encoder turns dates into ISO
+    strings, Decimals into numbers and UUIDs into strings; anything it still
+    cannot handle is stringified so the row survives (an audit entry must
+    never be lost over a serialization quirk).
+    """
+    try:
+        return to_jsonable_python(value)
+    except Exception:  # noqa: BLE001 — a lossy string is better than no audit row
+        return str(value)
 
 
 class AuditService:
@@ -80,9 +98,10 @@ class AuditService:
                     action=event.action,
                     target_type=event.target_type,
                     target_id=event.target_id,
-                    before={k: v.get("before") for k, v in event.changes.items()} or None,
-                    after={k: v.get("after") for k, v in event.changes.items()} or None,
-                    context=event.context or None,
+                    before=_jsonable({k: v.get("before") for k, v in event.changes.items()})
+                    or None,
+                    after=_jsonable({k: v.get("after") for k, v in event.changes.items()}) or None,
+                    context=_jsonable(event.context) or None,
                 )
         except Exception:  # noqa: BLE001 — audit failure must not abort the caller
             logger.warning(
