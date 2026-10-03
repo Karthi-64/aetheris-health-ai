@@ -19,7 +19,13 @@ import jwt as pyjwt
 import pytest
 from fastapi import HTTPException
 
-from app.api.dependencies.auth import get_current_user, require_permission
+from app.api.dependencies.auth import (
+    get_current_user,
+    require_any_permission,
+    require_permission,
+    user_has_permission,
+    user_permission_codes,
+)
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.models.user import User, UserStatus
@@ -195,3 +201,80 @@ class TestRequirePermission:
 
         resolved = await checker(current_user=user)
         assert resolved.id == user.id
+
+
+class TestRequireAnyPermission:
+    """The gate for endpoints that a full permission and a narrower one both open."""
+
+    async def test_holding_one_of_the_codes_passes(self: Any) -> None:
+        """A user holding any listed code is admitted."""
+        user = _make_user()  # grants only user.read
+        checker = require_any_permission("patient.read", "user.read")
+
+        resolved = await checker(current_user=user)
+        assert resolved.id == user.id
+
+    async def test_holding_none_of_the_codes_returns_403(self: Any) -> None:
+        """A user holding none of them gets 403, naming what would have sufficed."""
+        user = _make_user()  # grants only user.read
+        checker = require_any_permission("invoice.read", "invoice.read.own")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await checker(current_user=user)
+        assert exc_info.value.status_code == 403
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["error_code"] == "PERMISSION_DENIED"
+        assert "invoice.read, invoice.read.own" in detail["message"]
+
+    async def test_a_user_with_no_roles_returns_403(self: Any) -> None:
+        """No roles means no permissions, not an error."""
+        user = _make_user({"user_roles": None})
+        checker = require_any_permission("user.read")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await checker(current_user=user)
+        assert exc_info.value.status_code == 403
+
+    async def test_super_admin_bypasses_the_check(self: Any) -> None:
+        """A Super Admin passes, exactly as with :func:`require_permission`."""
+        user = _make_user({"hospital_id": None})
+        checker = require_any_permission("anything.at.all")
+
+        resolved = await checker(current_user=user)
+        assert resolved.id == user.id
+
+    def test_naming_no_codes_is_a_programming_error(self: Any) -> None:
+        """An endpoint that requires "any of nothing" would admit no one silently."""
+        with pytest.raises(ValueError, match="at least one permission code"):
+            require_any_permission()
+
+
+class TestUserHasPermission:
+    """The non-refusing check used to tell a full permission from a narrow one."""
+
+    def test_reports_held_and_missing_codes(self: Any) -> None:
+        user = _make_user()  # grants only user.read
+
+        assert user_has_permission(user, "user.read") is True
+        assert user_has_permission(user, "invoice.read") is False
+        assert user_permission_codes(user) == {"user.read"}
+
+    def test_super_admin_holds_everything(self: Any) -> None:
+        user = _make_user({"hospital_id": None})
+
+        assert user_has_permission(user, "anything.at.all") is True
+
+    async def test_agrees_with_require_permission(self: Any) -> None:
+        # The two must never disagree, or a route could admit a caller the
+        # narrowing check then treats as holding the wider code (or the reverse).
+        user = _make_user()
+
+        for code in ("user.read", "patient.read"):
+            checker = require_permission(code)
+            try:
+                await checker(current_user=user)
+                admitted = True
+            except HTTPException:
+                admitted = False
+            assert user_has_permission(user, code) is admitted
