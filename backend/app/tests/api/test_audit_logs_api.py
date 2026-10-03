@@ -558,3 +558,64 @@ class TestEndToEndAudit:
         assert listing.status_code == 200
         actions = [row["action"] for row in listing.json()["data"]]
         assert "settings.hospital_updated" in actions
+
+
+class TestCsvExportIsSafeToOpen:
+    """The CSV is opened in a spreadsheet, and some cells are user-controlled."""
+
+    async def test_a_formula_in_a_users_name_is_neutralised(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        exporter: dict[str, str],
+    ) -> None:
+        import csv
+        import io
+
+        actor = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"csv-{uuid.uuid4().hex[:12]}@hospital.test",
+            password_hash="test-placeholder-not-a-hash",
+            first_name='=HYPERLINK("http://evil.example","x")',
+            last_name="Tester",
+        )
+        db_session.add(actor)
+        await db_session.flush()
+        entry = await _seed_entry(db_session, hospital_id, actor_id=actor.id)
+
+        response = await api.get(
+            "/api/v1/audit-logs/export", headers=exporter, params={"format": "csv"}
+        )
+
+        assert response.status_code == 200
+        rows = list(csv.DictReader(io.StringIO(response.text)))
+        row = next(r for r in rows if r["id"] == str(entry.id))
+        # A leading apostrophe makes the spreadsheet treat the cell as text.
+        assert row["actor_name"].startswith("'=HYPERLINK")
+        # And no cell anywhere in the export starts with a formula character.
+        assert not [
+            cell
+            for r in rows
+            for cell in r.values()
+            if cell and cell.startswith(("=", "+", "-", "@"))
+        ]
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("=1+1", "'=1+1"),
+            ("+91 98120 00199", "'+91 98120 00199"),
+            ("-2", "'-2"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("\tcmd", "'\tcmd"),
+            ("Asha Menon", "Asha Menon"),
+            ("user.invited", "user.invited"),
+            ("", ""),
+        ],
+    )
+    def test_csv_safe(self, value: str, expected: str) -> None:
+        from app.api.v1.audit import _csv_safe
+
+        assert _csv_safe(value) == expected

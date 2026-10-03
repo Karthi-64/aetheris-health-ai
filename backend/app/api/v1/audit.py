@@ -66,6 +66,27 @@ def _tenant_of(current_user: User) -> uuid.UUID:
     return current_user.hospital_id
 
 
+#: Leading characters a spreadsheet treats as the start of a formula.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: str) -> str:
+    """Neutralise a cell that a spreadsheet would run as a formula.
+
+    The export is opened in Excel or Sheets by a compliance reviewer, and some
+    of its cells are user-controlled — a display name or an email. A value such
+    as ``=HYPERLINK(...)`` would execute when the file is opened. Prefixing an
+    apostrophe makes the application treat the cell as text (the OWASP CSV
+    injection guidance); the apostrophe is not shown in the cell.
+
+    :param value: The cell text.
+    :returns: The text, prefixed with ``'`` if it starts with a formula character.
+    """
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
 def _validate_range(start: datetime | None, end: datetime | None) -> None:
     """Enforce §11's one-year window and sane ordering.
 
@@ -212,11 +233,11 @@ async def export_audit_logs(
                 [
                     str(row.id),
                     row.created_at.isoformat(),
-                    row.action,
+                    _csv_safe(row.action),
                     str(row.actor_id) if row.actor_id else "",
-                    row.actor_name or "",
-                    row.actor_email or "",
-                    row.target_type or "",
+                    _csv_safe(row.actor_name or ""),
+                    _csv_safe(row.actor_email or ""),
+                    _csv_safe(row.target_type or ""),
                     str(row.target_id) if row.target_id else "",
                 ]
             )
