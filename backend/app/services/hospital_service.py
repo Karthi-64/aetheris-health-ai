@@ -76,6 +76,19 @@ class HospitalService:
         hospital = await self.get_current(hospital_id)
 
         updates = payload.model_dump(exclude_unset=True)
+        if "settings" in updates:
+            # Merge, never replace. ``settings`` is shared: the appointment
+            # module keeps its no-show grace period and feature flags there,
+            # billing its tax rate. A PATCH that sent one key used to wipe
+            # every other one. A key sent as null is removed.
+            merged = dict(hospital.settings or {})
+            for key, value in updates["settings"].items():
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            updates["settings"] = merged
+
         changes: dict[str, dict[str, object]] = {}
         for field, new_value in updates.items():
             old_value = getattr(hospital, field)

@@ -31,6 +31,10 @@ __all__ = [
 #: are nullable, so ``null`` is the supported way to clear them.
 _NON_NULLABLE_UPDATE_FIELDS = frozenset({"name", "address", "locale", "settings"})
 
+#: Keys in ``hospitals.settings`` that are feature flags, e.g.
+#: ``feature.ai.slot_recommendation``. Read-only to a hospital admin.
+_FEATURE_FLAG_PREFIX = "feature."
+
 #: Pragmatic RFC 5322 subset, identical to the one in
 #: :mod:`app.schemas.department` (no new dependencies — CLAUDE.md).
 _EMAIL_PATTERN = r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$"
@@ -89,7 +93,12 @@ class UpdateHospitalSettingsRequest(BaseModel):
     )
     logo_url: str | None = Field(default=None, max_length=500)
     settings: dict[str, Any] | None = Field(
-        default=None, description="Working hours / policies object (replaces the current one)."
+        default=None,
+        description=(
+            "Working hours / policies. **Merged** into the stored object key by "
+            "key: keys not sent are kept, and a key sent as null is removed. "
+            "Feature flags (`feature.*`) cannot be set here."
+        ),
     )
 
     @field_validator("address")
@@ -108,6 +117,28 @@ class UpdateHospitalSettingsRequest(BaseModel):
             if len(item) > 300:
                 msg = f"Address field '{key}' is too long."
                 raise ValueError(msg)
+        return value
+
+    @field_validator("settings")
+    @classmethod
+    def _no_feature_flags(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Refuse feature flags in a hospital admin's settings update.
+
+        Module spec §4 rule 8 and §10: flags are toggled only by the platform
+        Superadmin (``platform.feature_flags.toggle``), and the Settings page
+        shows them read-only to a hospital admin. They live in the same JSONB
+        object as the editable policies, so without this check an admin could
+        switch on a gated feature for their own hospital with one PATCH.
+        """
+        if value is None:
+            return None
+        flags = sorted(key for key in value if key.startswith(_FEATURE_FLAG_PREFIX))
+        if flags:
+            msg = (
+                f"Feature flags can only be changed by a platform administrator: "
+                f"{', '.join(flags)}."
+            )
+            raise ValueError(msg)
         return value
 
     @model_validator(mode="after")

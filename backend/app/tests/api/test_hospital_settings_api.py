@@ -11,7 +11,7 @@ fields are refused, and that every write lands in the audit trail.
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
@@ -311,3 +311,99 @@ class TestUpdateSettings:
     async def test_missing_auth_is_401(self, api: AsyncClient) -> None:
         response = await api.patch("/api/v1/hospitals/current", json={"name": "Nope Hospital"})
         assert response.status_code == 401
+
+
+class TestSettingsObjectIsShared:
+    """``hospitals.settings`` is read by several modules, so a PATCH must not
+    replace it wholesale, and must not let an admin set a feature flag
+    (PR #29 re-review; module spec §4 rule 8, §10).
+    """
+
+    async def _settings(self, api: AsyncClient, headers: dict[str, str]) -> dict[str, Any]:
+        response = await api.get("/api/v1/hospitals/current/full", headers=headers)
+        return dict(response.json()["data"]["settings"])
+
+    async def _preload(
+        self, db_session: AsyncSession, hospital_id: uuid.UUID, settings: dict[str, Any]
+    ) -> None:
+        from app.models.hospital import Hospital
+
+        hospital = await db_session.get(Hospital, hospital_id)
+        assert hospital is not None
+        hospital.settings = settings
+        await db_session.flush()
+
+    async def test_patch_merges_and_keeps_keys_it_was_not_sent(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        admin: dict[str, str],
+    ) -> None:
+        # Keys owned by other modules: appointments' grace period, a platform
+        # feature flag, and billing's tax rate.
+        await self._preload(
+            db_session,
+            hospital_id,
+            {
+                "no_show_grace_minutes": 45,
+                "feature.ai.slot_recommendation": True,
+                "billing": {"default_tax_rate": "18"},
+            },
+        )
+
+        response = await api.patch(
+            "/api/v1/hospitals/current",
+            headers=admin,
+            json={"settings": {"working_hours": {"mon": "09:00-17:00"}}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert await self._settings(api, admin) == {
+            "no_show_grace_minutes": 45,
+            "feature.ai.slot_recommendation": True,
+            "billing": {"default_tax_rate": "18"},
+            "working_hours": {"mon": "09:00-17:00"},
+        }
+
+    async def test_a_key_sent_as_null_is_removed(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        admin: dict[str, str],
+    ) -> None:
+        await self._preload(
+            db_session, hospital_id, {"no_show_grace_minutes": 45, "working_hours": {"mon": "x"}}
+        )
+
+        response = await api.patch(
+            "/api/v1/hospitals/current", headers=admin, json={"settings": {"working_hours": None}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert await self._settings(api, admin) == {"no_show_grace_minutes": 45}
+
+    @pytest.mark.parametrize("value", [True, False, None])
+    async def test_an_admin_cannot_set_or_remove_a_feature_flag(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        admin: dict[str, str],
+        value: bool | None,
+    ) -> None:
+        await self._preload(db_session, hospital_id, {"feature.ai.slot_recommendation": False})
+
+        response = await api.patch(
+            "/api/v1/hospitals/current",
+            headers=admin,
+            json={
+                "settings": {"feature.ai.slot_recommendation": value, "no_show_grace_minutes": 10}
+            },
+        )
+
+        assert response.status_code == 422
+        assert "platform administrator" in response.text
+        # Nothing in the request was applied, including the legitimate key.
+        assert await self._settings(api, admin) == {"feature.ai.slot_recommendation": False}
