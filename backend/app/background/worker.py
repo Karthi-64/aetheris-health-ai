@@ -68,13 +68,15 @@ async def sweep_no_shows(ctx: dict[str, Any]) -> int:
     :param ctx: Arq job context.
     :returns: How many appointments were marked.
     """
-    from app.core.audit import StructlogAuditSink
     from app.database import create_session_factory
     from app.repositories.appointment_repository import AppointmentRepository
+    from app.repositories.audit_log_repository import AuditLogRepository
     from app.repositories.doctor_repository import DoctorRepository
     from app.repositories.hospital_repository import HospitalRepository
     from app.repositories.patient_repository import PatientRepository
+    from app.repositories.user_repository import UserRepository
     from app.services.appointment_service import AppointmentService, NullInvoiceDraftSink
+    from app.services.audit_service import AuditService
 
     factory = create_session_factory()
     async with factory() as session:
@@ -84,7 +86,10 @@ async def sweep_no_shows(ctx: dict[str, Any]) -> int:
             DoctorRepository(session),
             HospitalRepository(session),
             session,
-            StructlogAuditSink(),
+            # The durable sink, same as the API: a status change made by the
+            # system is exactly the kind of action the audit trail must hold.
+            # It is recorded with no actor, i.e. as `system`.
+            AuditService(session, AuditLogRepository(session), UserRepository(session)),
             NullInvoiceDraftSink(),
         )
         swept = await service.sweep_no_shows()

@@ -13,9 +13,14 @@ These read the class exactly the way arq does. They deliberately do not call
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from arq.connections import RedisSettings
 
 from app.background.worker import WorkerSettings, sweep_no_shows
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _as_arq_sees_it() -> dict[str, object]:
@@ -45,3 +50,40 @@ def test_the_no_show_sweeper_is_registered_and_scheduled() -> None:
     assert sweep_no_shows in functions
     assert isinstance(cron_jobs, list)
     assert any(job.coroutine is sweep_no_shows for job in cron_jobs)
+
+
+async def test_the_sweeper_records_to_the_durable_audit_trail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status change made by the system belongs in ``audit_logs``.
+
+    The sweeper used to be wired to the log-only sink, so the no-shows it
+    marked never reached the compliance trail even after every API path did
+    (PR #29 re-review).
+    """
+    from app.services import appointment_service
+    from app.services.audit_service import AuditService
+
+    captured: dict[str, object] = {}
+
+    class _FakeSession:
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class _RecordingService:
+        def __init__(self, *args: object) -> None:
+            captured["audit"] = args[5]
+
+        async def sweep_no_shows(self) -> int:
+            return 3
+
+    monkeypatch.setattr("app.database.create_session_factory", lambda: _FakeSession)
+    monkeypatch.setattr(appointment_service, "AppointmentService", _RecordingService)
+
+    swept = await sweep_no_shows({})
+
+    assert swept == 3
+    assert isinstance(captured["audit"], AuditService)
