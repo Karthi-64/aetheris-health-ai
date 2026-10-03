@@ -17,6 +17,21 @@ from app.tests.factories.appointment import (
     build_reschedule_request,
     future_window,
 )
+from app.tests.factories.billing import (
+    build_create_invoice_request,
+    build_create_service_request,
+    build_invoice_item_model,
+    build_invoice_model,
+    build_invoice_payload,
+    build_payment_model,
+    build_payment_payload,
+    build_record_payment_request,
+    build_service_model,
+    build_service_payload,
+    build_update_invoice_request,
+    build_update_service_request,
+    build_void_request,
+)
 from app.tests.factories.department import (
     build_create_department_request,
     build_department_model,
@@ -42,6 +57,19 @@ from app.tests.factories.patient import (
 )
 
 __all__ = [
+    "build_create_invoice_request",
+    "build_create_service_request",
+    "build_invoice_item_model",
+    "build_invoice_model",
+    "build_invoice_payload",
+    "build_payment_model",
+    "build_payment_payload",
+    "build_record_payment_request",
+    "build_service_model",
+    "build_service_payload",
+    "build_update_invoice_request",
+    "build_update_service_request",
+    "build_void_request",
     "build_appointment_model",
     "build_appointment_payload",
     "build_availability_model",
