@@ -10,7 +10,7 @@ Module spec §16 calls out idempotency and no-overlap logic specifically.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -435,3 +435,66 @@ class TestSlotRecommendation:
         )
 
         assert result.recommendations == []
+
+
+class TestLocalDayBounds:
+    """``date`` filters are the hospital's calendar day (PR #29 review finding 7)."""
+
+    async def _bounds(self, repo: AsyncMock, hospital: AsyncMock | None, on: Any) -> Any:
+        hospitals = AsyncMock()
+        hospitals.get_by_id.return_value = hospital
+        service, _, _ = _make_service(repo, hospitals=hospitals)
+        return await service._local_day_bounds(HOSPITAL_ID, on)
+
+    async def test_a_half_hour_zone_is_bounded_exactly(self, repo: AsyncMock) -> None:
+        hospital = _hospital()
+        hospital.timezone = "Asia/Kolkata"
+
+        start, end = await self._bounds(repo, hospital, date(2030, 1, 7))
+
+        # Local midnight in India is 18:30 UTC the day before — not 18:00.
+        assert start.astimezone(UTC) == datetime(2030, 1, 6, 18, 30, tzinfo=UTC)
+        assert end.astimezone(UTC) == datetime(2030, 1, 7, 18, 30, tzinfo=UTC)
+
+    async def test_a_dst_change_day_is_not_assumed_to_be_24_hours(self, repo: AsyncMock) -> None:
+        hospital = _hospital()
+        hospital.timezone = "America/New_York"
+
+        # Clocks go forward on 10 March 2030, so the local day is 23 hours long.
+        start, end = await self._bounds(repo, hospital, date(2030, 3, 10))
+
+        assert end.astimezone(UTC) - start.astimezone(UTC) == timedelta(hours=23)
+
+    async def test_an_unknown_timezone_falls_back_to_utc(self, repo: AsyncMock) -> None:
+        hospital = _hospital()
+        hospital.timezone = "Mars/Olympus_Mons"
+
+        start, end = await self._bounds(repo, hospital, date(2030, 1, 7))
+
+        assert start == datetime(2030, 1, 7, tzinfo=UTC)
+        assert end == datetime(2030, 1, 8, tzinfo=UTC)
+
+    async def test_a_missing_hospital_falls_back_to_utc(self, repo: AsyncMock) -> None:
+        start, _ = await self._bounds(repo, None, date(2030, 1, 7))
+
+        assert start == datetime(2030, 1, 7, tzinfo=UTC)
+
+    async def test_list_passes_the_local_window_to_list_and_count(self, repo: AsyncMock) -> None:
+        hospital = _hospital()
+        hospital.timezone = "Asia/Kolkata"
+        hospitals = AsyncMock()
+        hospitals.get_by_id.return_value = hospital
+        repo.list_appointments.return_value = []
+        repo.count_appointments.return_value = 0
+        service, _, _ = _make_service(repo, hospitals=hospitals)
+
+        await service.list_appointments(HOSPITAL_ID, on_date=date(2030, 1, 7))
+
+        window = {
+            "starts_on_or_after": datetime(2030, 1, 6, 18, 30, tzinfo=UTC),
+            "starts_before": datetime(2030, 1, 7, 18, 30, tzinfo=UTC),
+        }
+        listed = repo.list_appointments.await_args.kwargs
+        counted = repo.count_appointments.await_args.kwargs
+        assert {k: listed[k].astimezone(UTC) for k in window} == window
+        assert {k: counted[k].astimezone(UTC) for k in window} == window

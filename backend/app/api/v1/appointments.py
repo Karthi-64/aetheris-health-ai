@@ -19,7 +19,7 @@ and ``200`` rather than creating a second booking.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import date
 
 from fastapi import APIRouter, Depends, Header, Path, Query, Response, status
 
@@ -106,21 +106,6 @@ def _has_permission(user: User, code: str) -> bool:
     return False
 
 
-def _day_bounds(on: date, tz_offset_hours: int = 0) -> tuple[datetime, datetime]:
-    """Convert a calendar date into the UTC instants bounding it.
-
-    A naive date filter would silently mean "UTC day", which is the wrong day
-    for most of the world. The offset lets a caller ask for their local day
-    until hospital-timezone resolution moves into a shared helper.
-
-    :param on: The calendar date requested.
-    :param tz_offset_hours: Offset of the caller's day from UTC.
-    :returns: ``(start, end)`` as a half-open UTC interval.
-    """
-    start = datetime.combine(on, time(0, 0), tzinfo=UTC) - timedelta(hours=tz_offset_hours)
-    return start, start + timedelta(days=1)
-
-
 # ── Booking ─────────────────────────────────────────────────────────────────
 
 
@@ -186,8 +171,10 @@ async def book_appointment(
     description=(
         "Return a page of appointments, earliest first.\n\n"
         "Filters: `patient_id`, `doctor_id`, `date`, `status`, `type`. `date` "
-        "selects a single calendar day; pass `tz_offset_hours` to interpret it "
-        "in the clinic's local day rather than UTC."
+        "selects a single calendar day **in the hospital's own timezone** — "
+        "send the clinic's local date and nothing else. The earlier "
+        "`tz_offset_hours` parameter is gone; it could only express whole "
+        "hours, which is wrong for India (UTC+5:30)."
     ),
     responses={200: {"description": "Page of appointments returned."}, **_COMMON_RESPONSES},
 )
@@ -195,10 +182,9 @@ async def list_appointments(
     patient_id: uuid.UUID | None = Query(None, description="Filter by patient."),
     doctor_id: uuid.UUID | None = Query(None, description="Filter by doctor."),
     appointment_date: date | None = Query(
-        None, alias="date", description="Single calendar day, YYYY-MM-DD."
-    ),
-    tz_offset_hours: int = Query(
-        0, ge=-14, le=14, description="Offset used to interpret `date` as a local day."
+        None,
+        alias="date",
+        description="Single calendar day in the hospital's timezone, YYYY-MM-DD.",
     ),
     appointment_status: AppointmentStatus | None = Query(
         None, alias="status", description="Filter by lifecycle status."
@@ -212,10 +198,6 @@ async def list_appointments(
     service: AppointmentService = Depends(get_appointment_service),
 ) -> PaginatedResponse[AppointmentSummaryResponse]:
     """List appointments with the module spec §9 filters."""
-    starts_on_or_after = starts_before = None
-    if appointment_date is not None:
-        starts_on_or_after, starts_before = _day_bounds(appointment_date, tz_offset_hours)
-
     page_result = await service.list_appointments(
         _tenant_of(current_user),
         pagination=PaginationParams(page=page, page_size=page_size),
@@ -223,8 +205,7 @@ async def list_appointments(
         doctor_id=doctor_id,
         status=appointment_status,
         appointment_type=appointment_type,
-        starts_on_or_after=starts_on_or_after,
-        starts_before=starts_before,
+        on_date=appointment_date,
     )
     return PaginatedResponse[AppointmentSummaryResponse](
         message="Appointments retrieved.",

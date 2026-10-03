@@ -509,17 +509,20 @@ Four things the client must get right:
 | Query param | Notes |
 |---|---|
 | `patient_id`, `doctor_id` | UUID |
-| `date` | Single calendar day, `YYYY-MM-DD` |
-| `tz_offset_hours` | Integer −14…14, default **0**. Without it, `date` means a *UTC* day. See the caveat below |
+| `date` | Single calendar day, `YYYY-MM-DD`, **in the hospital's own timezone** |
 | `status` | `booked \| checked_in \| in_progress \| completed \| cancelled \| no_show` |
 | `type` | `new \| follow_up \| walk_in \| emergency` |
 | `page`, `page_size` | As §1.6 |
 
-`tz_offset_hours` is an **integer**, so a half-hour zone like IST (+5:30) cannot be
-expressed exactly. Sending `5` covers 05:30–29:30 IST, which contains a normal clinic day
-but is not the exact local midnight boundary. For a precise IST day, filter client-side, or
-raise it with the backend before building a day view that depends on exact boundaries.
-Flagged as a known limitation, not something to work around silently.
+`date` means the clinic's calendar day: local midnight to the next local midnight in the
+hospital's configured timezone (`Asia/Kolkata` for the demo hospital). Send the local date
+and nothing else. There is **no `tz_offset_hours` parameter any more** — it could only
+express whole hours, which is wrong for India (UTC+5:30), so the server now resolves the
+day itself. A client that still sends it is not refused; the value is ignored.
+
+The names are `date`, `status` and `type` — not `appointment_date`, `appointment_status`
+or `appointment_type`. Unknown query parameters are ignored, so a wrong name does not fail:
+it returns every appointment, unfiltered.
 
 Order is earliest-first by `scheduled_start`.
 
@@ -1032,7 +1035,6 @@ Things the frontend will ask for that do not exist yet. Do not build against the
 - No patient documents, timeline, or AI summary endpoints — they need object storage.
 - No appointment token/queue-number field (§5.5).
 - No patient admission/clinical status (§2.2).
-- `tz_offset_hours` is integer-only, so exact IST day boundaries are not expressible (§5.3).
 - `metadata.request_id` is never populated on a success response (§1.2) — use the
   `X-Request-ID` header. Needs a team decision: populate it, or amend §5.1 of the
   standards doc.

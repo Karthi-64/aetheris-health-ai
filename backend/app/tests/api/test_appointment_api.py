@@ -118,6 +118,16 @@ async def _clinical_fixtures(
     return patient.id, doctor.id
 
 
+async def _set_timezone(session: AsyncSession, hospital_id: uuid.UUID, timezone: str) -> None:
+    """Put the test hospital in a specific IANA timezone."""
+    from app.models.hospital import Hospital
+
+    hospital = await session.get(Hospital, hospital_id)
+    assert hospital is not None
+    hospital.timezone = timezone
+    await session.flush()
+
+
 @pytest_asyncio.fixture
 async def api(db_session: AsyncSession) -> AsyncGenerator[AsyncClient]:
     """An HTTP client sharing the test's rolled-back session."""
@@ -573,6 +583,79 @@ class TestReadEndpoints:
 
         assert hit.json()["metadata"]["pagination"]["total_records"] == 1
         assert miss.json()["metadata"]["pagination"]["total_records"] == 0
+
+    async def test_date_is_the_hospitals_local_day_in_a_half_hour_zone(
+        self,
+        api: AsyncClient,
+        full_access: dict[str, str],
+        clinical: tuple[uuid.UUID, uuid.UUID],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        # PR #29 review finding 7. India is UTC+5:30, which a whole-hour offset
+        # cannot express: the client used to round it to +6 and the day window
+        # slid thirty minutes. Two appointments either side of local midnight:
+        #   18:15 UTC = 23:45 IST on the 7th
+        #   18:45 UTC = 00:15 IST on the 8th
+        await _set_timezone(db_session, hospital_id, "Asia/Kolkata")
+        late = await _book(api, full_access, *clinical, offset_minutes=555)
+        after_midnight = await _book(api, full_access, *clinical, offset_minutes=585)
+
+        seventh = await api.get(
+            "/api/v1/appointments", params={"date": "2030-01-07"}, headers=full_access
+        )
+        eighth = await api.get(
+            "/api/v1/appointments", params={"date": "2030-01-08"}, headers=full_access
+        )
+
+        assert [a["id"] for a in seventh.json()["data"]] == [late["id"]]
+        assert [a["id"] for a in eighth.json()["data"]] == [after_midnight["id"]]
+
+    async def test_date_follows_the_hospitals_timezone_not_the_callers(
+        self,
+        api: AsyncClient,
+        full_access: dict[str, str],
+        clinical: tuple[uuid.UUID, uuid.UUID],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        # The same two instants are both early afternoon on the 7th in New York.
+        await _set_timezone(db_session, hospital_id, "America/New_York")
+        await _book(api, full_access, *clinical, offset_minutes=555)
+        await _book(api, full_access, *clinical, offset_minutes=585)
+
+        seventh = await api.get(
+            "/api/v1/appointments", params={"date": "2030-01-07"}, headers=full_access
+        )
+        eighth = await api.get(
+            "/api/v1/appointments", params={"date": "2030-01-08"}, headers=full_access
+        )
+
+        assert seventh.json()["metadata"]["pagination"]["total_records"] == 2
+        assert eighth.json()["metadata"]["pagination"]["total_records"] == 0
+
+    async def test_the_retired_tz_offset_hours_parameter_changes_nothing(
+        self,
+        api: AsyncClient,
+        full_access: dict[str, str],
+        clinical: tuple[uuid.UUID, uuid.UUID],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        # An older client that still sends it must get the correct local day,
+        # not a 422 and not a shifted window.
+        await _set_timezone(db_session, hospital_id, "Asia/Kolkata")
+        late = await _book(api, full_access, *clinical, offset_minutes=555)
+        await _book(api, full_access, *clinical, offset_minutes=585)
+
+        response = await api.get(
+            "/api/v1/appointments",
+            params={"date": "2030-01-07", "tz_offset_hours": 6},
+            headers=full_access,
+        )
+
+        assert response.status_code == 200
+        assert [a["id"] for a in response.json()["data"]] == [late["id"]]
 
     async def test_list_does_not_leak_another_tenant(
         self,

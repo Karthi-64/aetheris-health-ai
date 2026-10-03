@@ -24,7 +24,7 @@ use. Notification delivery is explicitly out of scope (§2).
 from __future__ import annotations
 
 import uuid  # noqa: TC003 — needed at runtime for type hints
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from sqlalchemy.exc import IntegrityError
@@ -746,17 +746,31 @@ class AppointmentService:
         hospital_id: uuid.UUID,
         *,
         pagination: PaginationParams | None = None,
+        on_date: date | None = None,
         **filters: Any,
     ) -> Page[AppointmentSummaryResponse]:
         """List appointments (module spec §9).
 
+        ``on_date`` is a calendar day in the **hospital's own timezone**. A
+        receptionist asking for "today's appointments" means the clinic's
+        today, and only the server knows the clinic's zone exactly: a client
+        can send a whole-hour offset at best, which is wrong by thirty minutes
+        for India (UTC+5:30) and put appointments near midnight on the wrong
+        day.
+
         :param hospital_id: The hospital to list.
         :param pagination: Page and page size. Defaults to page 1.
+        :param on_date: Only appointments starting on this local calendar day.
         :param filters: patient_id, doctor_id, status, appointment_type, and the
             ``starts_on_or_after`` / ``starts_before`` window.
         :returns: One page of summaries plus the total count.
         """
         page_params = pagination or PaginationParams()
+
+        if on_date is not None:
+            starts_on_or_after, starts_before = await self._local_day_bounds(hospital_id, on_date)
+            filters["starts_on_or_after"] = starts_on_or_after
+            filters["starts_before"] = starts_before
 
         rows = await self._appointments.list_appointments(
             hospital_id, skip=page_params.offset, limit=page_params.limit, **filters
@@ -1120,6 +1134,40 @@ class AppointmentService:
                 return
 
         raise OutsideAvailabilityError(doctor_id)
+
+    async def _local_day_bounds(
+        self, hospital_id: uuid.UUID, on: date
+    ) -> tuple[datetime, datetime]:
+        """Return the instants bounding a calendar day in the hospital's timezone.
+
+        Built from local midnight to the next local midnight rather than by
+        adding 24 hours, so a day that is 23 or 25 hours long across a DST
+        change is still bounded correctly.
+
+        An unknown or missing timezone falls back to UTC rather than failing
+        the read: a misconfigured hospital should still be able to see its
+        schedule.
+
+        :param hospital_id: The tenant whose timezone applies.
+        :param on: The local calendar day.
+        :returns: ``(start, end)`` as a half-open interval of aware datetimes.
+        """
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        hospital = await self._hospitals.get_by_id(hospital_id)
+        try:
+            zone = ZoneInfo(hospital.timezone if hospital else "UTC")
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "appointment.hospital_timezone_invalid",
+                hospital_id=str(hospital_id),
+                timezone=hospital.timezone if hospital else None,
+            )
+            zone = ZoneInfo("UTC")
+
+        start = datetime.combine(on, time.min, tzinfo=zone)
+        end = datetime.combine(on + timedelta(days=1), time.min, tzinfo=zone)
+        return start, end
 
     async def _no_show_grace_minutes(self, hospital_id: uuid.UUID) -> int:
         """Return a hospital's no-show grace period in minutes (module spec §5.7).

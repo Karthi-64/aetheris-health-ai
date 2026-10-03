@@ -57,17 +57,16 @@ export interface BookAppointmentInput {
 export interface AppointmentListParams {
   patient_id?: string
   doctor_id?: string
-  /** Local calendar day (YYYY-MM-DD); interpreted with `tz_offset_hours`. */
+  /**
+   * Calendar day (YYYY-MM-DD). The server interprets it in the hospital's own
+   * timezone, so no offset is sent — a client can only express whole hours,
+   * which is wrong for India (UTC+5:30).
+   */
   appointment_date?: string
   appointment_status?: AppointmentStatus
   appointment_type?: AppointmentType
   page?: number
   page_size?: number
-}
-
-/** Whole-hour offset from UTC for the viewer, e.g. UTC+5 -> 5 (the API takes an int). */
-export function localTzOffsetHours(): number {
-  return Math.round(-new Date().getTimezoneOffset() / 60)
 }
 
 export const appointmentKeys = {
@@ -76,12 +75,27 @@ export const appointmentKeys = {
   detail: (id: string) => [...appointmentKeys.all, 'detail', id] as const,
 }
 
+/**
+ * Translate the hook's parameter names into the query names the API reads.
+ *
+ * The server's filters are `date`, `status` and `type`
+ * (docs/18-API_CONTRACTS.md §5.3). It ignores unknown query parameters, so
+ * sending `appointment_date` or `appointment_status` does not fail — it
+ * silently returns every appointment, unfiltered.
+ */
+export function toAppointmentQuery(params: AppointmentListParams): Record<string, unknown> {
+  const { appointment_date, appointment_status, appointment_type, ...rest } = params
+  return { ...rest, date: appointment_date, status: appointment_status, type: appointment_type }
+}
+
 /** List appointments. For the day queue, pass `appointment_date`. */
 export function useAppointments(params: AppointmentListParams = {}) {
-  const withTz = { ...params, tz_offset_hours: localTzOffsetHours() }
   return useQuery<Paginated<AppointmentSummary>>({
     queryKey: appointmentKeys.list(params),
-    queryFn: () => http.getPaginated<AppointmentSummary>('/appointments', { params: withTz }),
+    queryFn: () =>
+      http.getPaginated<AppointmentSummary>('/appointments', {
+        params: toAppointmentQuery(params),
+      }),
     staleTime: 15_000,
     placeholderData: keepPreviousData,
   })
