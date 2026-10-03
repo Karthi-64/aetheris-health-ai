@@ -50,3 +50,8 @@ export class ApiError extends Error {
     this.details = details
   }
 }
+
+/** `enabled: false` skips the request — for callers whose user may not read this. */
+export interface ListQueryOptions {
+  enabled?: boolean
+}

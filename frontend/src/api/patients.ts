@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { http } from '@/api/http'
-import type { Paginated } from '@/api/types'
+import type { Paginated, ListQueryOptions } from '@/api/types'
 
 /**
  * Patient API client. Shapes here mirror the wire format exactly — see
@@ -111,8 +111,9 @@ function createPatient(input: CreatePatientInput): Promise<Patient> {
 // Hooks — the only way components touch patient data (CLAUDE.md).
 // ---------------------------------------------------------------------------
 
-export function usePatients(params: PatientListParams = {}) {
+export function usePatients(params: PatientListParams = {}, options: ListQueryOptions = {}) {
   return useQuery({
+    enabled: options.enabled ?? true,
     queryKey: patientKeys.list(params),
     queryFn: () => fetchPatients(params),
     staleTime: 30_000,

@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { http } from '@/api/http'
-import type { Paginated } from '@/api/types'
+import type { Paginated, ListQueryOptions } from '@/api/types'
 
 /**
  * Doctor module API — typed hooks over the real backend contract
@@ -50,8 +50,9 @@ export const doctorKeys = {
 }
 
 /** List / search doctors. Supports `q`, `specialization`, `department`, page/size. */
-export function useDoctors(params: DoctorListParams = {}) {
+export function useDoctors(params: DoctorListParams = {}, options: ListQueryOptions = {}) {
   return useQuery<Paginated<DoctorSummary>>({
+    enabled: options.enabled ?? true,
     queryKey: doctorKeys.list(params),
     queryFn: () => http.getPaginated<DoctorSummary>('/doctors', { params }),
     staleTime: 30_000,

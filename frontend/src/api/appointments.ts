@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { http } from '@/api/http'
-import type { Paginated } from '@/api/types'
+import type { Paginated, ListQueryOptions } from '@/api/types'
 
 /**
  * Appointment module API — typed hooks over the real backend contract
@@ -89,8 +89,12 @@ export function toAppointmentQuery(params: AppointmentListParams): Record<string
 }
 
 /** List appointments. For the day queue, pass `appointment_date`. */
-export function useAppointments(params: AppointmentListParams = {}) {
+export function useAppointments(
+  params: AppointmentListParams = {},
+  options: ListQueryOptions = {},
+) {
   return useQuery<Paginated<AppointmentSummary>>({
+    enabled: options.enabled ?? true,
     queryKey: appointmentKeys.list(params),
     queryFn: () =>
       http.getPaginated<AppointmentSummary>('/appointments', {
