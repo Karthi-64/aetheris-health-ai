@@ -5,8 +5,9 @@ This module is called via ``make seed`` to populate a fresh database with:
 1. The permissions catalog (global, read-only in MVP)
 2. System roles with their permission mappings
 3. A demo hospital with demo users (for development)
-4. Realistic clinical demo data — departments, doctors, patients and
-   appointments — from :mod:`app.seeds.demo_data`
+4. Realistic demo data — departments, doctors, patients, appointments, and a
+   services catalog with invoices and payments — from
+   :mod:`app.seeds.demo_data` and :mod:`app.seeds.demo_billing`
 
 All operations are idempotent — safe to run multiple times. Every entity is
 looked up by a stable natural key before it is created, so a second run adds
@@ -65,11 +66,29 @@ PERMISSION_DEFINITIONS: list[tuple[str, str, str]] = [
     ("appointment.book_override", "appointment", "Book outside doctor availability"),
     ("appointment.recommend_slot", "appointment", "Request AI slot recommendations"),
     # Billing
-    ("billing.read", "billing", "View invoices and payments"),
-    ("billing.create", "billing", "Create invoices"),
-    ("billing.void", "billing", "Void invoices"),
-    ("billing.approve_discount", "billing", "Approve discounts above threshold"),
-    ("billing.record_payment", "billing", "Record payments"),
+    # docs/modules/06-billing.md §10. The earlier `billing.*` placeholders are
+    # replaced by the spec's names, as was done for appointments: they were
+    # seeded before the module existed and no backend code ever checked them.
+    # The whole §10 catalog is seeded; the endpoints behind approve_discount,
+    # refund, pdf.download and ai_explain are not built yet.
+    ("service.read", "billing", "View the services catalog"),
+    ("service.create", "billing", "Add services to the catalog"),
+    ("service.update", "billing", "Edit and retire catalog services"),
+    ("invoice.read", "billing", "View invoices and payments"),
+    ("invoice.read.own", "billing", "View invoices for own appointments only"),
+    ("invoice.create", "billing", "Create draft invoices"),
+    ("invoice.update", "billing", "Edit draft invoices"),
+    ("invoice.issue", "billing", "Issue invoices"),
+    ("invoice.void", "billing", "Void invoices"),
+    ("invoice.approve_discount", "billing", "Approve discounts above threshold"),
+    ("invoice.payment.record", "billing", "Record payments"),
+    # Not in §10. §3 limits a receptionist to cash, and the spec names no code
+    # to express that; this is the narrow sibling of the one above, in the same
+    # way `invoice.read.own` is the narrow sibling of `invoice.read`.
+    ("invoice.payment.record.cash", "billing", "Record cash payments only"),
+    ("invoice.refund", "billing", "Refund payments"),
+    ("invoice.pdf.download", "billing", "Download invoice PDFs"),
+    ("invoice.ai_explain", "billing", "Request an AI explanation of an invoice"),
     # Laboratory
     ("lab.read", "lab", "View lab orders and results"),
     ("lab.create", "lab", "Create lab orders"),
@@ -132,11 +151,21 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "appointment.complete",
             "appointment.book_override",
             "appointment.recommend_slot",
-            "billing.read",
-            "billing.create",
-            "billing.void",
-            "billing.approve_discount",
-            "billing.record_payment",
+            "service.read",
+            "service.create",
+            "service.update",
+            "invoice.read",
+            "invoice.read.own",
+            "invoice.create",
+            "invoice.update",
+            "invoice.issue",
+            "invoice.void",
+            "invoice.approve_discount",
+            "invoice.payment.record",
+            "invoice.payment.record.cash",
+            "invoice.refund",
+            "invoice.pdf.download",
+            "invoice.ai_explain",
             "lab.read",
             "lab.create",
             "lab.update",
@@ -188,11 +217,21 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "appointment.complete",
             "appointment.book_override",
             "appointment.recommend_slot",
-            "billing.read",
-            "billing.create",
-            "billing.void",
-            "billing.approve_discount",
-            "billing.record_payment",
+            "service.read",
+            "service.create",
+            "service.update",
+            "invoice.read",
+            "invoice.read.own",
+            "invoice.create",
+            "invoice.update",
+            "invoice.issue",
+            "invoice.void",
+            "invoice.approve_discount",
+            "invoice.payment.record",
+            "invoice.payment.record.cash",
+            "invoice.refund",
+            "invoice.pdf.download",
+            "invoice.ai_explain",
             "lab.read",
             # The Hospital Admin is "full access within a single hospital", so
             # its grant must cover every hospital-scoped role. Role assignment
@@ -236,6 +275,9 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "appointment.start",
             "appointment.complete",
             "appointment.check_in",
+            # docs/modules/06-billing.md §3: "view invoices for their patients",
+            # scoped to appointments where they are the doctor.
+            "invoice.read.own",
             "lab.read",
             "lab.create",
             "report.read",
@@ -273,6 +315,11 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
             "appointment.cancel",
             "appointment.check_in",
             "appointment.recommend_slot",
+            # docs/modules/06-billing.md §3: view invoices, record cash
+            # payments. The `.cash` code is what limits the method.
+            "service.read",
+            "invoice.read",
+            "invoice.payment.record.cash",
             "department.read",
             "doctor.read",
             "doctor.availability.read",
@@ -283,10 +330,14 @@ SYSTEM_ROLES: list[tuple[str, str, list[str]]] = [
         "Financial operations — invoices, payments, insurance.",
         [
             "patient.read",
-            "billing.read",
-            "billing.create",
-            "billing.void",
-            "billing.record_payment",
+            # docs/modules/06-billing.md §3. No `invoice.void`: business rule 4
+            # makes voiding an admin action.
+            "service.read",
+            "invoice.read",
+            "invoice.create",
+            "invoice.update",
+            "invoice.issue",
+            "invoice.payment.record",
             "report.read",
             "department.read",
             "doctor.read",
@@ -521,8 +572,9 @@ async def seed_database(database_url: str | None = None) -> None:
             logger.info("demo_receptionist_exists", email=receptionist_email)
 
         # ── 7. Demo Clinical Data ────────────────────────────────────────────
-        # Departments, doctors, patients and appointments, so the frontend has
-        # real data to build against. Same transaction, same idempotency rules.
+        # Departments, doctors, patients, appointments and billing, so the
+        # frontend has real data to build against. Same transaction, same
+        # idempotency rules.
         await seed_demo_data(session, hospital, role_map, actor_id=admin_user.id)
 
         # ── Commit ──────────────────────────────────────────────────────────

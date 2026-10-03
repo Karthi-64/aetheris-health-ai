@@ -61,9 +61,18 @@ export type Permission =
   // Appointments
   | 'appointment.read'
   | 'appointment.write'
-  // Billing
-  | 'billing.read'
-  | 'billing.write'
+  // Billing (docs/modules/06-billing.md §10)
+  | 'service.read'
+  | 'service.create'
+  | 'service.update'
+  | 'invoice.read'
+  | 'invoice.read.own'
+  | 'invoice.create'
+  | 'invoice.update'
+  | 'invoice.issue'
+  | 'invoice.void'
+  | 'invoice.payment.record'
+  | 'invoice.payment.record.cash'
   // Reports
   | 'report.read'
   // Settings
@@ -82,26 +91,40 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
     'user.read', 'user.create', 'user.update', 'user.deactivate', 'user.reset_password',
     'role.read', 'role.assign', 'dashboard.view',
     'patient.read', 'patient.write', 'doctor.read', 'doctor.write',
-    'appointment.read', 'appointment.write', 'billing.read', 'billing.write',
+    'appointment.read', 'appointment.write',
+    'service.read', 'service.create', 'service.update',
+    'invoice.read', 'invoice.read.own', 'invoice.create', 'invoice.update', 'invoice.issue',
+    'invoice.void', 'invoice.payment.record', 'invoice.payment.record.cash',
     'report.read', 'settings.read', 'settings.update', 'settings.manage',
   ],
   hospital_admin: [
     'user.read', 'user.create', 'user.update', 'user.deactivate', 'user.reset_password',
     'role.read', 'role.assign', 'dashboard.view',
     'patient.read', 'patient.write', 'doctor.read', 'doctor.write',
-    'appointment.read', 'appointment.write', 'billing.read', 'billing.write',
+    'appointment.read', 'appointment.write',
+    'service.read', 'service.create', 'service.update',
+    'invoice.read', 'invoice.read.own', 'invoice.create', 'invoice.update', 'invoice.issue',
+    'invoice.void', 'invoice.payment.record', 'invoice.payment.record.cash',
     'report.read', 'settings.read', 'settings.update', 'settings.manage',
   ],
   receptionist: [
     'dashboard.view', 'patient.read', 'patient.write', 'doctor.read',
-    'appointment.read', 'appointment.write', 'billing.read',
+    'appointment.read', 'appointment.write',
+    // Module spec §3: a receptionist views invoices and records cash payments.
+    'service.read', 'invoice.read', 'invoice.payment.record.cash',
   ],
   doctor: [
     'dashboard.view', 'patient.read', 'patient.write', 'doctor.read', 'appointment.read',
-    'appointment.write', 'billing.read', 'report.read',
+    // Module spec §3: a doctor sees the invoices for their own visits only.
+    // The server applies that scope; the client just shows what it returns.
+    'appointment.write', 'invoice.read.own', 'report.read',
   ],
   nurse: ['dashboard.view', 'patient.read', 'patient.write', 'doctor.read', 'appointment.read'],
-  billing_staff: ['dashboard.view', 'billing.read', 'billing.write', 'report.read'],
+  // No `invoice.void`: voiding is an admin action (module spec §4, rule 4).
+  billing_staff: [
+    'dashboard.view', 'service.read', 'invoice.read', 'invoice.create', 'invoice.update',
+    'invoice.issue', 'invoice.payment.record', 'report.read',
+  ],
   lab_technician: ['dashboard.view', 'patient.read'],
 }
 
@@ -111,7 +134,7 @@ export type PermissionGroup =
   | 'patient.read'
   | 'doctor.read'
   | 'appointment.read'
-  | 'billing.read'
+  | 'invoice.read'
   | 'report.read'
   | 'user.read'
   | 'settings.read'
@@ -130,7 +153,7 @@ export const NAV: NavItem[] = [
   { to: '/patients', label: 'Patients', icon: Users, permission: 'patient.read' },
   { to: '/doctors', label: 'Doctors', icon: Stethoscope, permission: 'doctor.read' },
   { to: '/appointments', label: 'Appointments', icon: CalendarDays, permission: 'appointment.read' },
-  { to: '/billing', label: 'Billing', icon: Receipt, permission: 'billing.read' },
+  { to: '/billing', label: 'Billing', icon: Receipt, permission: 'invoice.read' },
   { to: '/reports', label: 'Reports', icon: BarChart3, permission: 'report.read' },
   { to: '/users', label: 'Users & Roles', icon: UserCog, permission: 'user.read' },
   { to: '/settings', label: 'Settings', icon: SettingsIcon, permission: 'settings.read' },
@@ -146,7 +169,9 @@ const GROUP_ALIASES: Record<PermissionGroup, Permission[]> = {
   'patient.read': ['patient.read', 'patient.write'],
   'doctor.read': ['doctor.read', 'doctor.write'],
   'appointment.read': ['appointment.read', 'appointment.write'],
-  'billing.read': ['billing.read', 'billing.write'],
+  // Either read code opens the Billing module: every billing screen starts
+  // from the invoice list, and the server narrows that list for `.own`.
+  'invoice.read': ['invoice.read', 'invoice.read.own'],
   'report.read': ['report.read'],
   'user.read': ['user.read'],
   'settings.read': ['settings.read', 'settings.update', 'settings.manage'],

@@ -26,7 +26,7 @@ function renderBilling() {
         <Route
           path="/billing"
           element={
-            <RequirePermission permission="billing.read">
+            <RequirePermission permission="invoice.read">
               <div>Billing page</div>
             </RequirePermission>
           }
@@ -46,7 +46,7 @@ describe('RequirePermission', () => {
   })
 
   it('redirects to /dashboard when the user lacks the permission', () => {
-    login('lab_technician') // no billing.read
+    login('lab_technician') // no invoice.read
     renderBilling()
     expect(screen.queryByText('Billing page')).not.toBeInTheDocument()
     expect(screen.getByText('Dashboard')).toBeInTheDocument()
