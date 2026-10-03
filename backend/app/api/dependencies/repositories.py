@@ -35,12 +35,15 @@ from app.repositories import (
     DepartmentRepository,
     DoctorRepository,
     HospitalRepository,
+    InvoiceNumberSequenceRepository,
+    InvoiceRepository,
     MrnSequenceRepository,
     PasswordResetTokenRepository,
     PatientRepository,
     PermissionRepository,
     RefreshTokenRepository,
     RoleRepository,
+    ServiceCatalogRepository,
     UserRepository,
 )
 
@@ -106,3 +109,20 @@ def get_doctor_repository(session: DbSession) -> DoctorRepository:
 def get_appointment_repository(session: DbSession) -> AppointmentRepository:
     """Provide an :class:`AppointmentRepository` bound to the request session."""
     return AppointmentRepository(session)
+
+
+def get_service_catalog_repository(session: DbSession) -> ServiceCatalogRepository:
+    """Provide a :class:`ServiceCatalogRepository` bound to the request session."""
+    return ServiceCatalogRepository(session)
+
+
+def get_invoice_repository(session: DbSession) -> InvoiceRepository:
+    """Provide an :class:`InvoiceRepository` bound to the request session."""
+    return InvoiceRepository(session)
+
+
+def get_invoice_number_sequence_repository(
+    session: DbSession,
+) -> InvoiceNumberSequenceRepository:
+    """Provide an :class:`InvoiceNumberSequenceRepository` bound to the request session."""
+    return InvoiceNumberSequenceRepository(session)

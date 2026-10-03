@@ -14,6 +14,7 @@ permissions/roles half of the seed is already exercised by the identity tests.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -135,6 +136,7 @@ class TestSeededData:
         # but never appeared as `booked` in the slots read model, which is the
         # join the frontend most needs to see working.
         await seed_demo_data(db_session, hospital, {})
+        today = datetime.now(UTC).astimezone(CLINIC_TZ).date()
 
         result = await db_session.execute(
             select(Appointment.scheduled_start).where(
@@ -142,8 +144,19 @@ class TestSeededData:
                 Appointment.status == AppointmentStatus.BOOKED,
             )
         )
-        for start in result.scalars().all():
-            assert start.astimezone(CLINIC_TZ).weekday() < 5
+        future = [
+            local
+            for start in result.scalars().all()
+            if (local := start.astimezone(CLINIC_TZ)).date() > today
+        ]
+
+        # Only the *future* bookings. The seed also books one appointment on
+        # its own "today" — the real date, or the previous Friday when seeded
+        # on a weekend — which is not a future booking and is not what this
+        # test is about.
+        assert future
+        for local in future:
+            assert local.weekday() < 5
 
     async def test_patients_get_unique_sequential_mrns(
         self, db_session: AsyncSession, hospital: Hospital

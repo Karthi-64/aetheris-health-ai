@@ -80,12 +80,22 @@ export type Permission =
   | 'appointment.complete'
   | 'appointment.book_override'
   | 'appointment.recommend_slot'
-  // Billing
-  | 'billing.read'
-  | 'billing.create'
-  | 'billing.void'
-  | 'billing.approve_discount'
-  | 'billing.record_payment'
+  // Billing (docs/modules/06-billing.md §10)
+  | 'service.read'
+  | 'service.create'
+  | 'service.update'
+  | 'invoice.read'
+  | 'invoice.read.own'
+  | 'invoice.create'
+  | 'invoice.update'
+  | 'invoice.issue'
+  | 'invoice.void'
+  | 'invoice.approve_discount'
+  | 'invoice.payment.record'
+  | 'invoice.payment.record.cash'
+  | 'invoice.refund'
+  | 'invoice.pdf.download'
+  | 'invoice.ai_explain'
   // Laboratory
   | 'lab.read'
   | 'lab.create'
@@ -131,8 +141,10 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
     'appointment.read', 'appointment.read.own', 'appointment.book', 'appointment.reschedule',
     'appointment.cancel', 'appointment.check_in', 'appointment.start', 'appointment.complete',
     'appointment.book_override', 'appointment.recommend_slot',
-    'billing.read', 'billing.create', 'billing.void', 'billing.approve_discount',
-    'billing.record_payment',
+    'service.read', 'service.create', 'service.update',
+    'invoice.read', 'invoice.read.own', 'invoice.create', 'invoice.update', 'invoice.issue',
+    'invoice.void', 'invoice.approve_discount', 'invoice.payment.record',
+    'invoice.payment.record.cash', 'invoice.refund', 'invoice.pdf.download', 'invoice.ai_explain',
     'lab.read', 'lab.create', 'lab.update',
     'pharmacy.read', 'pharmacy.dispense',
     'inventory.read', 'inventory.create', 'inventory.update',
@@ -151,8 +163,10 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
     'appointment.read', 'appointment.read.own', 'appointment.book', 'appointment.reschedule',
     'appointment.cancel', 'appointment.check_in', 'appointment.start', 'appointment.complete',
     'appointment.book_override', 'appointment.recommend_slot',
-    'billing.read', 'billing.create', 'billing.void', 'billing.approve_discount',
-    'billing.record_payment',
+    'service.read', 'service.create', 'service.update',
+    'invoice.read', 'invoice.read.own', 'invoice.create', 'invoice.update', 'invoice.issue',
+    'invoice.void', 'invoice.approve_discount', 'invoice.payment.record',
+    'invoice.payment.record.cash', 'invoice.refund', 'invoice.pdf.download', 'invoice.ai_explain',
     'lab.read', 'lab.create', 'lab.update',
     'pharmacy.read', 'pharmacy.dispense',
     'inventory.read', 'inventory.create', 'inventory.update',
@@ -166,6 +180,8 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
     'patient.read', 'patient.create',
     'appointment.read', 'appointment.book', 'appointment.reschedule', 'appointment.cancel',
     'appointment.check_in', 'appointment.recommend_slot',
+    // Module spec 06 §3: a receptionist views invoices and records cash payments.
+    'service.read', 'invoice.read', 'invoice.payment.record.cash',
     'department.read', 'doctor.read', 'doctor.availability.read',
   ],
   doctor: [
@@ -173,6 +189,9 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
     'patient.read', 'patient.create', 'patient.update',
     'appointment.read', 'appointment.read.own', 'appointment.start', 'appointment.complete',
     'appointment.check_in',
+    // Module spec 06 §3: a doctor sees the invoices for their own visits only.
+    // The server applies that scope; the client just shows what it returns.
+    'invoice.read.own',
     'lab.read', 'lab.create', 'report.read',
     'department.read', 'doctor.read', 'doctor.availability.read', 'doctor.availability.update',
     'doctor.leave.create', 'doctor.leave.delete',
@@ -186,7 +205,9 @@ export const MOCK_PERMISSIONS_BY_ROLE: Record<Role, Permission[]> = {
   billing_staff: [
     'dashboard.view',
     'patient.read',
-    'billing.read', 'billing.create', 'billing.void', 'billing.record_payment',
+    // No `invoice.void`: voiding is an admin action (module spec 06 §4, rule 4).
+    'service.read', 'invoice.read', 'invoice.create', 'invoice.update', 'invoice.issue',
+    'invoice.payment.record',
     'report.read', 'department.read', 'doctor.read',
   ],
   lab_technician: [
@@ -201,7 +222,7 @@ export type PermissionGroup =
   | 'patient.read'
   | 'doctor.read'
   | 'appointment.read'
-  | 'billing.read'
+  | 'invoice.read'
   | 'report.read'
   | 'user.read'
   | 'settings.read'
@@ -220,7 +241,7 @@ export const NAV: NavItem[] = [
   { to: '/patients', label: 'Patients', icon: Users, permission: 'patient.read' },
   { to: '/doctors', label: 'Doctors', icon: Stethoscope, permission: 'doctor.read' },
   { to: '/appointments', label: 'Appointments', icon: CalendarDays, permission: 'appointment.read' },
-  { to: '/billing', label: 'Billing', icon: Receipt, permission: 'billing.read' },
+  { to: '/billing', label: 'Billing', icon: Receipt, permission: 'invoice.read' },
   { to: '/reports', label: 'Reports', icon: BarChart3, permission: 'report.read' },
   { to: '/users', label: 'Users & Roles', icon: UserCog, permission: 'user.read' },
   { to: '/settings', label: 'Settings', icon: SettingsIcon, permission: 'settings.read' },
@@ -236,7 +257,9 @@ const GROUP_ALIASES: Record<PermissionGroup, Permission[]> = {
   'patient.read': ['patient.read'],
   'doctor.read': ['doctor.read'],
   'appointment.read': ['appointment.read'],
-  'billing.read': ['billing.read'],
+  // Either read code opens the Billing module: every billing screen starts
+  // from the invoice list, and the server narrows that list for `.own`.
+  'invoice.read': ['invoice.read', 'invoice.read.own'],
   'report.read': ['report.read'],
   'user.read': ['user.read'],
   'settings.read': ['settings.read'],

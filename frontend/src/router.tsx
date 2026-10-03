@@ -102,7 +102,7 @@ export const router = createBrowserRouter([
           {
             path: '/billing',
             element: (
-              <RequirePermission permission="billing.read">
+              <RequirePermission permission="invoice.read">
                 <BillingPage />
               </RequirePermission>
             ),

@@ -12,7 +12,7 @@ describe('rbac', () => {
   it('hasPermission checks membership in the permission set', () => {
     const perms: Permission[] = ['dashboard.view', 'patient.read']
     expect(hasPermission(perms, 'patient.read')).toBe(true)
-    expect(hasPermission(perms, 'billing.read')).toBe(false)
+    expect(hasPermission(perms, 'invoice.read')).toBe(false)
     expect(hasPermission(undefined, 'dashboard.view')).toBe(false)
   })
 
@@ -58,6 +58,25 @@ describe('rbac', () => {
     expect(paths).toEqual(expect.arrayContaining(['/dashboard', '/billing', '/reports', '/patients']))
     expect(paths).not.toContain('/settings')
     expect(paths).not.toContain('/users')
+  })
+
+  it('billing is opened by either invoice read code', () => {
+    // Mirrors the seeded roles: docs/modules/06-billing.md §3 and §10.
+    expect(hasAnyPermission(['invoice.read'], 'invoice.read')).toBe(true)
+    // A doctor holds only the narrow code; the server scopes what they see.
+    expect(hasAnyPermission(['invoice.read.own'], 'invoice.read')).toBe(true)
+    // Recording payments alone does not open the module — there is no list to open.
+    expect(hasAnyPermission(['invoice.payment.record.cash'], 'invoice.read')).toBe(false)
+    expect(navForPermissions(MOCK_PERMISSIONS_BY_ROLE.receptionist).map((n) => n.to)).toContain('/billing')
+    expect(navForPermissions(MOCK_PERMISSIONS_BY_ROLE.doctor).map((n) => n.to)).toContain('/billing')
+    expect(navForPermissions(MOCK_PERMISSIONS_BY_ROLE.nurse).map((n) => n.to)).not.toContain('/billing')
+  })
+
+  it('a receptionist holds the cash-only payment code, not the full one', () => {
+    const perms = MOCK_PERMISSIONS_BY_ROLE.receptionist
+    expect(hasPermission(perms, 'invoice.payment.record.cash')).toBe(true)
+    expect(hasPermission(perms, 'invoice.payment.record')).toBe(false)
+    expect(hasPermission(MOCK_PERMISSIONS_BY_ROLE.billing_staff, 'invoice.payment.record')).toBe(true)
   })
 
   it('an empty permission set sees no nav', () => {

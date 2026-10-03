@@ -24,6 +24,15 @@ from app.models.base import (
     TimestampMixin,
     UUIDPrimaryKeyMixin,
 )
+from app.models.billing import (
+    Invoice,
+    InvoiceItem,
+    InvoiceNumberSequence,
+    InvoiceStatus,
+    Payment,
+    PaymentMethod,
+    Service,
+)
 from app.models.department import Department, DepartmentStatus
 from app.models.doctor import (
     Doctor,
@@ -71,6 +80,14 @@ __all__ = [
     "AppointmentStatus",
     "AppointmentStatusHistory",
     "AppointmentType",
+    # Billing
+    "Invoice",
+    "InvoiceItem",
+    "InvoiceNumberSequence",
+    "InvoiceStatus",
+    "Payment",
+    "PaymentMethod",
+    "Service",
     # Department
     "Department",
     "DepartmentStatus",

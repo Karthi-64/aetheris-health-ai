@@ -2,7 +2,7 @@
 
 The audit trail is append-only (``docs/modules/12-audit-logs.md``): this
 repository deliberately exposes no update or delete methods, and migration
-0009 revokes UPDATE/DELETE from the application role. Reads are always scoped
+0010 revokes UPDATE/DELETE from the application role. Reads are always scoped
 to one hospital (CLAUDE.md rule 5).
 """
 

@@ -25,12 +25,15 @@ from app.repositories.base import BaseRepository
 from app.repositories.department_repository import DepartmentRepository
 from app.repositories.doctor_repository import DoctorRepository
 from app.repositories.hospital_repository import HospitalRepository
+from app.repositories.invoice_number_sequence_repository import InvoiceNumberSequenceRepository
+from app.repositories.invoice_repository import InvoiceRepository
 from app.repositories.mrn_sequence_repository import MrnSequenceRepository
 from app.repositories.password_reset_token_repository import PasswordResetTokenRepository
 from app.repositories.patient_repository import PatientRepository
 from app.repositories.permission_repository import PermissionRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.role_repository import RoleRepository
+from app.repositories.service_catalog_repository import ServiceCatalogRepository
 from app.repositories.user_repository import UserRepository
 
 __all__ = [
@@ -40,11 +43,14 @@ __all__ = [
     "DepartmentRepository",
     "DoctorRepository",
     "HospitalRepository",
+    "InvoiceNumberSequenceRepository",
+    "InvoiceRepository",
     "MrnSequenceRepository",
     "PatientRepository",
     "PasswordResetTokenRepository",
     "PermissionRepository",
     "RefreshTokenRepository",
     "RoleRepository",
+    "ServiceCatalogRepository",
     "UserRepository",
 ]

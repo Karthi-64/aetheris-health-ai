@@ -1,8 +1,8 @@
 # 18 — Frontend API Contract Reference
 
 The exact request/response contracts for the endpoints the frontend consumes today:
-**Patients, Departments, Doctors, Appointments**. Written so a frontend module can be
-built without reading backend code or guessing a shape.
+**Patients, Departments, Doctors, Appointments, Billing**. Written so a frontend module
+can be built without reading backend code or guessing a shape.
 
 **Source of truth.** Every contract below was read out of the implementation, not the
 design docs — routers in `backend/app/api/v1/`, DTOs in `backend/app/schemas/`, and the
@@ -119,7 +119,7 @@ refresh itself fails the session is cleared and route guards send the user to `/
 Keep that shape if you touch it, and give any second client the same single-flight guard.
 
 > **Diverges from `CLAUDE.md`,** which specifies the refresh token as an HTTP-only cookie.
-> That is the intended design; what ships is the body-based flow above. See §8.
+> That is the intended design; what ships is the body-based flow above. See §9.
 
 ### 1.5 Tenancy
 
@@ -578,7 +578,368 @@ preferred_window_start?, preferred_window_end?, limit? }` returns
 
 ---
 
-## 6. Frontend ↔ backend mapping (mismatch resolution)
+## 6. Billing
+
+`backend/app/api/v1/services.py` · `backend/app/api/v1/invoices.py` ·
+`backend/app/schemas/billing.py`
+
+The core money path of [modules/06-billing.md](modules/06-billing.md): a services
+catalog, draft invoices, issue, payments, void. **Discounts, refunds, PDF and AI explain
+are not built** — see §6.10.
+
+### 6.1 Endpoints
+
+| Method | Path | Permission | Success |
+|---|---|---|---|
+| GET | `/api/v1/services` | `service.read` | 200 (paginated) |
+| POST | `/api/v1/services` | `service.create` | 201 |
+| GET | `/api/v1/services/{service_id}` | `service.read` | 200 |
+| PATCH | `/api/v1/services/{service_id}` | `service.update` | 200 |
+| GET | `/api/v1/invoices` | `invoice.read` or `invoice.read.own` | 200 (paginated) |
+| POST | `/api/v1/invoices` | `invoice.create` | 201 |
+| GET | `/api/v1/invoices/{invoice_id}` | `invoice.read` or `invoice.read.own` | 200 |
+| PATCH | `/api/v1/invoices/{invoice_id}` | `invoice.update` | 200 — drafts only |
+| POST | `/api/v1/invoices/{invoice_id}/issue` | `invoice.issue` | 200 |
+| POST | `/api/v1/invoices/{invoice_id}/void` | `invoice.void` | 200 |
+| POST | `/api/v1/invoices/{invoice_id}/payments` | `invoice.payment.record` or `invoice.payment.record.cash` | 201, or 200 on a replay. **Requires `Idempotency-Key`** |
+| GET | `/api/v1/invoices/{invoice_id}/payments` | `invoice.read` or `invoice.read.own` | 200 (plain list) |
+
+Two of these codes are **narrow** versions of a wider one, and the server applies the
+limit — see §6.9. A user holding both the wide and the narrow code is not limited.
+
+### 6.2 Money
+
+- **Every amount is a decimal string** — `"1200.00"`, never a JSON number. Send them as
+  strings too. Do not run them through `parseFloat` for anything but display.
+- **The server computes every total.** No request body has `total`, `subtotal`,
+  `tax_amount`, `line_total` or `tax_rate`; sending one is a `422`. To preview a total
+  while editing, compute it for display only and trust the response.
+- Per line: `net = unit_price × quantity`, `tax = net × tax_rate ÷ 100`, each rounded
+  **half-to-even** to two places; `line_total = net + tax`. The invoice `subtotal` is the
+  sum of the nets, `tax_amount` the sum of the taxes, and
+  `total = subtotal + tax_amount − discount_amount`.
+- `tax_rate` is a percentage (`"18.00"` = 18%). It is the hospital's configured rate for
+  a taxable line and `"0.00"` otherwise. The demo hospital configures none, so every
+  seeded line is untaxed.
+- `currency` (ISO 4217, `"INR"` for the demo hospital) is on every invoice shape. It is
+  the hospital's and cannot be set per invoice.
+- `discount_amount` is always `"0.00"` today — discounts are not built.
+
+### 6.3 Services catalog
+
+`ServiceResponse` (list rows and detail are the same shape):
+
+```json
+{
+  "id": "…",
+  "code": "ECG",
+  "name": "ECG (12-lead)",
+  "category": "Diagnostics",
+  "price": "450.00",
+  "taxable": false,
+  "is_active": true,
+  "created_at": "2026-10-01T14:17:10Z",
+  "updated_at": "2026-10-01T14:17:10Z"
+}
+```
+
+`GET /services` query params:
+
+| Query param | Notes |
+|---|---|
+| `q` | **Prefix** match on name (case-insensitive), **exact** match on code |
+| `category` | Exact string match |
+| `is_active` | `true` / `false`. Omit for both — inactive services are **included** by default, unlike the other lists |
+| `page`, `page_size` | As §1.6 |
+
+Order is fixed: `name`, then `id`.
+
+`POST /services` — required: `code`, `name`, `price`. Optional: `category`, `taxable`
+(default `true`).
+
+| Field | Rule |
+|---|---|
+| `code` | 1–50 chars, letters/digits/`-`/`_`, uppercased automatically, unique per hospital (duplicate → `409`) |
+| `name` | 1–200 chars, not blank |
+| `price` | ≥ 0, at most 2 decimal places |
+
+`PATCH /services/{id}` takes any of `name`, `category`, `price`, `taxable`, `is_active`.
+**`code` cannot be changed** (`422`). There is no delete: retire a service with
+`"is_active": false`. Changing `price` never alters an existing invoice — lines keep the
+price they were written with.
+
+### 6.4 Invoices
+
+```
+draft ──issue──> issued ──payment──> partially_paid ──payment──> paid
+                   │   └──────────────payment in full──────────────┘
+                   └──void──> void
+```
+
+`status` is `draft | issued | partially_paid | paid | void | refunded`. Nothing produces
+`refunded` yet. `paid` and `void` are terminal. Drive the action buttons off `status`:
+
+| Status | Edit | Issue | Record payment | Void |
+|---|:--:|:--:|:--:|:--:|
+| `draft` | ✅ | ✅ | — | — |
+| `issued` | — | — | ✅ | ✅ |
+| `partially_paid` | — | — | ✅ | — |
+| `paid`, `void` | — | — | — | — |
+
+A disallowed action is `400 BUSINESS_RULE_VIOLATION`.
+
+**`POST /invoices`** creates a **draft**. Required: `patient_id`. Optional:
+`appointment_id`, `items[]` (max 200, may be empty), `notes` (≤ 2000).
+
+```json
+{
+  "patient_id": "…",
+  "appointment_id": "…",
+  "items": [
+    { "service_id": "…", "quantity": "1" },
+    { "description": "Crepe bandage", "quantity": "2", "unit_price": "75.00" }
+  ],
+  "notes": "Counter items"
+}
+```
+
+A line is one of two shapes, and nothing in between:
+
+| | Catalog line | Ad-hoc line |
+|---|---|---|
+| `service_id` | required | omit |
+| `description` | optional — overrides the service name on this invoice | **required** |
+| `unit_price` | **must be omitted** — comes from the catalog | **required**, ≥ 0 |
+| `taxable` | **must be omitted** — comes from the catalog | optional, default `false` |
+| `quantity` | optional, default `"1"`, > 0, ≤ 2 decimals | same |
+
+An inactive service, or one from another hospital, is a `422` naming the line
+(`items.1.service_id`). An `appointment_id` must belong to the same patient (`422`
+otherwise), and **an appointment can have only one live invoice** — a second is
+`409 RESOURCE_CONFLICT`. Void invoices do not count, so void-and-re-raise works.
+
+**`InvoiceResponse`** (create / get / patch / issue / void):
+
+```json
+{
+  "id": "…",
+  "hospital_id": "…",
+  "invoice_number": "INV-2026-000003",
+  "patient_id": "…",
+  "patient_name": "Thomas George",
+  "appointment_id": "…",
+  "status": "partially_paid",
+  "currency": "INR",
+  "items": [
+    {
+      "id": "…",
+      "service_id": "…",
+      "description": "Follow-up consultation",
+      "quantity": "1.00",
+      "unit_price": "300.00",
+      "tax_rate": "0.00",
+      "line_total": "300.00",
+      "position": 0
+    },
+    {
+      "id": "…",
+      "service_id": "…",
+      "description": "ECG (12-lead)",
+      "quantity": "1.00",
+      "unit_price": "450.00",
+      "tax_rate": "0.00",
+      "line_total": "450.00",
+      "position": 1
+    }
+  ],
+  "subtotal": "750.00",
+  "tax_amount": "0.00",
+  "discount_amount": "0.00",
+  "total": "750.00",
+  "amount_paid": "300.00",
+  "balance_due": "450.00",
+  "notes": null,
+  "issued_at": "2026-09-30T05:05:00Z",
+  "voided_at": null,
+  "void_reason": null,
+  "created_at": "2026-10-01T14:17:11Z",
+  "updated_at": "2026-10-01T14:17:11Z"
+}
+```
+
+`invoice_number` and `issued_at` are `null` on a draft. `items` come back in `position`
+order. `patient_name` is denormalized in.
+
+**`PATCH /invoices/{id}`** — drafts only. Body is `items` and/or `notes`; at least one is
+required. **`items` replaces the whole line set**, it is not merged — send every line you
+want to keep. `patient_id` and `appointment_id` cannot be changed.
+
+**`GET /invoices`**
+
+| Query param | Notes |
+|---|---|
+| `patient_id` | UUID |
+| `status` | One of the six status values |
+| `issued_from`, `issued_to` | `YYYY-MM-DD`, both **inclusive**, interpreted in the **hospital's timezone** — no offset parameter needed. Drafts have no issue date and never match. `issued_from` after `issued_to` is a `422` |
+| `page`, `page_size` | As §1.6 |
+
+Order is newest first by `created_at`. `data[]` is `InvoiceSummaryResponse` — no lines:
+
+```json
+{
+  "id": "…",
+  "invoice_number": "INV-2026-000003",
+  "patient_id": "…",
+  "patient_name": "Thomas George",
+  "appointment_id": "…",
+  "status": "partially_paid",
+  "currency": "INR",
+  "total": "750.00",
+  "amount_paid": "300.00",
+  "balance_due": "450.00",
+  "issued_at": "2026-09-30T05:05:00Z",
+  "created_at": "2026-10-01T14:17:11Z"
+}
+```
+
+### 6.5 Issue
+
+`POST /invoices/{id}/issue` — no body. Recomputes and freezes the totals, stamps
+`issued_at`, and assigns the next number.
+
+- Numbers are `INV-{year}-{seq:06d}`, **sequential and gap-free per hospital**. The
+  sequence does not reset each year; `{year}` is the issue year in the hospital's
+  timezone.
+- A draft with no lines cannot be issued (`400`).
+- A zero-total invoice goes straight to `paid`.
+- After issue the invoice is immutable. A correction is a void plus a new invoice.
+
+### 6.6 Payments
+
+```
+POST /api/v1/invoices/{invoice_id}/payments
+Idempotency-Key: 9f1c4b2a-7d3e-4c1a-9b2f-0a1b2c3d4e5f
+```
+
+```json
+{ "amount": "300.00", "method": "card", "reference": "CARD-TXN-8899", "notes": "Paid at the desk" }
+```
+
+`method` is `cash | card | upi | bank_transfer | insurance`. `amount` must be > 0 with at
+most 2 decimals. `reference` (≤ 100) and `notes` (≤ 2000) are optional.
+
+Response `data` is the payment **and** the invoice as it now stands, so the balance and
+status can be updated without a second request:
+
+```json
+{
+  "payment": {
+    "id": "…",
+    "invoice_id": "…",
+    "amount": "300.00",
+    "method": "card",
+    "reference": "CARD-TXN-8899",
+    "notes": "Paid at the desk",
+    "received_by": "…",
+    "received_at": "2026-09-30T05:10:00Z"
+  },
+  "invoice": { "…": "InvoiceSummaryResponse, as §6.4" }
+}
+```
+
+Four things the client must get right:
+
+1. **`Idempotency-Key` is required**, 16–100 chars (a UUID fits). Generate one per
+   payment attempt and reuse it across retries of that attempt. A replay returns **200**
+   with the original payment and the message "Payment already recorded with this key." —
+   not 201, and not a second payment. Treat 200 and 201 as the same success path.
+2. **Reusing a key for a different payment is `409`** — a different invoice, amount or
+   method. Generate a fresh key for every new payment, including a second payment on the
+   same invoice.
+3. **Overpayment is `400`.** The amount cannot exceed `balance_due`. Two cashiers paying
+   the same invoice at once are serialized by the server, so the second sees the reduced
+   balance. On a `400`, re-fetch the invoice and show the current balance; do not retry
+   blind.
+4. Only `issued` and `partially_paid` invoices take payments. The invoice becomes
+   `partially_paid`, or `paid` once `balance_due` reaches `"0.00"`.
+5. **A cash-only user gets `403` for any other method.** A receptionist holds
+   `invoice.payment.record.cash`, not `invoice.payment.record`. For them, offer only
+   `cash` in the method selector rather than letting `card` or `upi` fail.
+
+`GET /invoices/{id}/payments` returns the payments oldest-first as a plain list — **no
+pagination metadata**, so use `http.get`, not `http.getPaginated`.
+
+### 6.7 Void
+
+`POST /invoices/{id}/void` with `{ "reason": "…" }` — required, 1–500 chars, not blank.
+
+Allowed only while the invoice is `issued` **and has taken no payment**. An invoice with
+any payment cannot be voided (`400`, "must be refunded first") — and refunds are not
+built, so today a part-paid invoice cannot be undone through the API. The voided invoice
+keeps its `invoice_number`; `voided_at` and `void_reason` are set. A draft cannot be
+voided, and there is no way to delete one.
+
+### 6.8 Invoices drafted from appointments
+
+`POST /appointments/{id}/complete` now drafts an invoice automatically: one ad-hoc line,
+`Consultation — Dr. {first} {last}`, at the doctor's `consultation_fee`, untaxed, linked
+by `appointment_id`. Find it with `GET /invoices?patient_id=…&status=draft`.
+
+- If the appointment already has a live invoice, nothing is drafted.
+- The draft is created after the appointment is committed. A billing failure does not
+  fail the completion — the response is still `200` and the invoice can be raised by hand.
+- The complete response does **not** include the invoice id.
+
+### 6.9 Roles → permissions
+
+Which seeded role can call what. Hide controls per permission rather than letting the
+call 403.
+
+| Permission | Hospital Admin | Billing Staff | Receptionist | Doctor | Nurse |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `service.read` | ✅ | ✅ | ✅ | — | — |
+| `service.create` / `service.update` | ✅ | — | — | — | — |
+| `invoice.read` | ✅ | ✅ | ✅ | — | — |
+| `invoice.read.own` | ✅ | — | — | ✅ | — |
+| `invoice.create` / `invoice.update` | ✅ | ✅ | — | — | — |
+| `invoice.issue` | ✅ | ✅ | — | — | — |
+| `invoice.void` | ✅ | — | — | — | — |
+| `invoice.payment.record` | ✅ | ✅ | — | — | — |
+| `invoice.payment.record.cash` | ✅ | — | ✅ | — | — |
+
+**Two narrow codes, both enforced by the server:**
+
+- **`invoice.read.own` — a doctor sees the invoices for their own visits only.** That
+  means invoices linked to an appointment where they are the doctor. Another doctor's
+  invoice for the same patient, and any invoice with no appointment, are not theirs. The
+  list and its `total_records` contain only their invoices, and asking for any other
+  invoice by id is a `404` identical to a missing one — so the client needs no special
+  handling: call the same endpoints and render what comes back. A user with this code
+  but no doctor profile gets an empty list.
+- **`invoice.payment.record.cash` — a receptionist records cash only.** Any other
+  `method` is `403 PERMISSION_DENIED`.
+
+Things worth designing around: **only an admin can void**; a **receptionist can take a
+cash payment but cannot create or issue** an invoice; and a **doctor is read-only**, with
+no access to the services catalog — hide every billing action for them.
+
+Either read code opens the Billing module. These replace the earlier `billing.read` /
+`billing.write` placeholders, which the backend never issued. `invoice.approve_discount`,
+`invoice.refund`, `invoice.pdf.download` and `invoice.ai_explain` are in the catalog but
+guard nothing yet.
+
+### 6.10 Not built yet
+
+These paths from the module spec return `404`. Do not build against them:
+
+- `POST /invoices/{id}/approve-discount` — and there is no way to set a discount at all
+- `POST /invoices/{id}/refund`
+- `GET /invoices/{id}/pdf`
+- `POST /invoices/{id}/ai-explain`
+
+---
+
+## 7. Frontend ↔ backend mapping (mismatch resolution)
 
 The audit flagged the patient contract as mismatched. It was investigated against
 `API_CONTRACTS`/`05-DATABASE_DESIGN.md`, the module spec, the schemas and 944 passing
@@ -603,7 +964,7 @@ faked.
 
 ---
 
-## 7. Demo data
+## 8. Demo data
 
 `make -C backend seed` — idempotent, safe to re-run; see
 [10-DEVELOPMENT_GUIDE.md](10-DEVELOPMENT_GUIDE.md).
@@ -621,6 +982,17 @@ Seeded for the demo hospital (`demo-hospital`, timezone `Asia/Kolkata`):
 - **14 appointments** covering all six statuses and all four types, spread across
   yesterday, today and the next two days, including two checked-in walk-ins for the
   queue. Each carries its full status history.
+- **10 catalog services** across six categories — eight untaxed clinical services, one of
+  them retired (`LAB-ESR`) so `is_active` is demonstrable, and two taxable non-clinical
+  ones.
+- **5 invoices**, one per state the UI has to render: `paid` (settled by cash and UPI),
+  `void`, `partially_paid` (the re-issue of the voided visit, part-paid by card), `issued`
+  (nothing paid), and a `draft` not tied to any appointment. They are numbered
+  `INV-{year}-000001` to `000004`; the void invoice keeps its number.
+- **3 payments** across three methods.
+
+The in-flight appointments are deliberately left unbilled, so completing one in a demo
+drafts its invoice live (§6.8).
 
 Appointment times land on the doctors' published slot boundaries, so a seeded booking
 shows up as `booked` in `GET /doctors/{id}/slots`. `doctor@demohospital.com` is Priya
@@ -639,10 +1011,23 @@ All seeded people are fictional. No real patient data exists in this repository.
 
 ---
 
-## 8. Known gaps
+## 9. Known gaps
 
 Things the frontend will ask for that do not exist yet. Do not build against them:
 
+- **Billing:** no discounts, refunds, invoice PDF or AI explain (§6.10). No way to delete
+  or discard a draft invoice. A part-paid invoice cannot be voided or refunded (§6.7).
+- **Billing roles:** "a doctor views invoices for their patients" is implemented as *their
+  own visits* — not every invoice of a patient they have seen (§6.9). And
+  `invoice.payment.record.cash` is a code the module spec's §10 does not list; it was
+  added to express the spec's own cash-only rule for receptionists.
+- **Billing tax:** there is no endpoint to set the hospital's tax rate, so every taxable
+  line is taxed at 0% until one exists (§6.2).
+- **Two shapes of `422`.** A request-validation error (wrong type, missing field) puts a
+  list in `errors`, as §1.2 shows. A rule checked by the service — an unknown
+  `patient_id`, an inactive service — puts an *object* there, with the list one level
+  down at `errors.errors`. This is true of every module, not only billing. Read
+  `message` for display; handle both shapes if you map errors to fields.
 - No `sort` parameter on any of these endpoints (§1.8).
 - No patient documents, timeline, or AI summary endpoints — they need object storage.
 - No appointment token/queue-number field (§5.5).
@@ -658,8 +1043,13 @@ Things the frontend will ask for that do not exist yet. Do not build against the
 
 ---
 
-_Last updated: 2026-09-22. Re-verified against the implementation at commit `e3927e2`:
-every endpoint, permission, query parameter, enum and response shape in §2–5 was checked
-against the running app, the §1.9 table against the seeded roles, and §7 against a
-freshly seeded database. §1.4 was corrected — it previously described a refresh-token
-cookie that the backend has never set._
+_Last updated: 2026-10-01. §6 (Billing) added with the module, and checked against the
+running app and a freshly seeded database: every endpoint, permission, status code and
+response shape in §6, the §6.9 table against the seeded roles, and the billing rows of §8.
+Sections 6–8 of the previous revision are now §7–9._
+
+_§2–5 were last re-verified on 2026-09-22 at commit `e3927e2`: every endpoint, permission,
+query parameter, enum and response shape was checked against the running app, the §1.9
+table against the seeded roles, and the demo data against a freshly seeded database. §1.4
+was corrected then — it previously described a refresh-token cookie that the backend has
+never set._

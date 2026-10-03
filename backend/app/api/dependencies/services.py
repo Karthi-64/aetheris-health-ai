@@ -44,12 +44,15 @@ from app.api.dependencies.repositories import (  # noqa: F401
     get_department_repository,
     get_doctor_repository,
     get_hospital_repository,
+    get_invoice_number_sequence_repository,
+    get_invoice_repository,
     get_mrn_sequence_repository,
     get_password_reset_token_repository,
     get_patient_repository,
     get_permission_repository,
     get_refresh_token_repository,
     get_role_repository,
+    get_service_catalog_repository,
     get_user_repository,
 )
 from app.core.audit import AuditSink
@@ -60,23 +63,26 @@ from app.repositories import (
     DepartmentRepository,
     DoctorRepository,
     HospitalRepository,
+    InvoiceNumberSequenceRepository,
+    InvoiceRepository,
     MrnSequenceRepository,
     PasswordResetTokenRepository,
     PatientRepository,
     PermissionRepository,
     RefreshTokenRepository,
     RoleRepository,
+    ServiceCatalogRepository,
     UserRepository,
 )
 from app.services.appointment_service import (
     AppointmentBookedIntervalSource,
     AppointmentService,
     InvoiceDraftSink,
-    NullInvoiceDraftSink,
     SlotRanker,
 )
 from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
+from app.services.billing_service import BillingInvoiceDraftSink, BillingService
 from app.services.department_service import DepartmentService, DepartmentUsageSource
 from app.services.doctor_service import (
     BookedIntervalSource,
@@ -87,6 +93,7 @@ from app.services.hospital_service import HospitalService
 from app.services.mrn_service import MRNService
 from app.services.patient_service import PatientService
 from app.services.role_service import RoleService
+from app.services.service_catalog_service import ServiceCatalogService
 from app.services.user_service import UserService
 
 # ── Dependency type aliases ──────────────────────────────────────────────────
@@ -284,15 +291,51 @@ def get_doctor_service(
     return DoctorService(doctors, users, departments, hospitals, session, audit, booked)
 
 
+# ── Billing module ──────────────────────────────────────────────────────────
+def get_service_catalog_service(
+    services: ServiceCatalogRepository = Depends(get_service_catalog_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> ServiceCatalogService:
+    """Provide a :class:`ServiceCatalogService` bound to the request session."""
+    return ServiceCatalogService(services, session, audit)
+
+
+def get_billing_service(
+    invoices: InvoiceRepository = Depends(get_invoice_repository),
+    sequences: InvoiceNumberSequenceRepository = Depends(get_invoice_number_sequence_repository),
+    catalog: ServiceCatalogRepository = Depends(get_service_catalog_repository),
+    patients: PatientRepository = Depends(get_patient_repository),
+    appointments: AppointmentRepository = Depends(get_appointment_repository),
+    doctors: DoctorRepository = Depends(get_doctor_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> BillingService:
+    """Provide a :class:`BillingService` bound to the request session.
+
+    Every repository shares the request-scoped session, so the service's
+    ``commit()`` covers a payment row and the invoice balance it changes
+    together, and the invoice-number counter advances in the same transaction
+    as the issue it numbers — which is what keeps the series gap-free.
+    """
+    return BillingService(
+        invoices, sequences, catalog, patients, appointments, doctors, hospitals, session, audit
+    )
+
+
 # ── Appointment module ──────────────────────────────────────────────────────
-def get_invoice_draft_sink() -> InvoiceDraftSink:
+def get_invoice_draft_sink(
+    billing: BillingService = Depends(get_billing_service),
+) -> InvoiceDraftSink:
     """Provide the sink completed appointments are handed to for invoicing.
 
-    Returns the interim null implementation, which logs rather than drafts,
-    because ``docs/modules/06-billing.md`` has not shipped. Billing swaps this
-    one provider and :class:`AppointmentService` does not change.
+    Backed by :class:`BillingService` now that ``docs/modules/06-billing.md``
+    has shipped. This provider is the only thing that changed:
+    :class:`AppointmentService` still depends on the ``InvoiceDraftSink``
+    protocol and knows nothing about Billing.
     """
-    return NullInvoiceDraftSink()
+    return BillingInvoiceDraftSink(billing)
 
 
 def get_slot_ranker() -> SlotRanker | None:
@@ -369,6 +412,9 @@ __all__ = [
     # Department module
     "get_department_service",
     "get_department_usage_source",
+    # Billing module
+    "get_billing_service",
+    "get_service_catalog_service",
     # Appointment module
     "get_appointment_service",
     "get_invoice_draft_sink",

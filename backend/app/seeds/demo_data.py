@@ -25,6 +25,8 @@ Patient          ``(hospital_id, first_name, last_name, date_of_birth)``
 Appointment      ``(hospital_id, idempotency_key)`` — the partial unique index
                  from migration 0008, i.e. the mechanism the booking API
                  already uses for retries
+Billing          services, invoices and payments — see
+                 :mod:`app.seeds.demo_billing`, which documents its own keys
 ===============  ==========================================================
 
 So a second run creates nothing, allocates no further MRNs, and leaves every
@@ -62,6 +64,7 @@ from app.models.doctor import Doctor, DoctorAvailability, DoctorLeave
 from app.models.patient import BloodGroup, Gender, Patient
 from app.models.user import User, UserRole, UserStatus
 from app.repositories.mrn_sequence_repository import MrnSequenceRepository
+from app.seeds.demo_billing import seed_demo_billing
 from app.services.mrn_service import MRNService
 
 if TYPE_CHECKING:
@@ -1197,7 +1200,7 @@ async def seed_demo_data(
     *,
     actor_id: uuid.UUID | None = None,
 ) -> None:
-    """Seed departments, doctors, patients and appointments for the demo hospital.
+    """Seed departments, doctors, patients, appointments and billing for the demo hospital.
 
     Safe to run repeatedly: see the module docstring for the natural key used
     per entity. The caller owns the transaction and commits.
@@ -1205,7 +1208,7 @@ async def seed_demo_data(
     :param session: An open session inside a transaction.
     :param hospital: The demo hospital every row is scoped to.
     :param role_map: Seeded system roles by name, for the Doctor role.
-    :param actor_id: User recorded as the author of seeded appointments.
+    :param actor_id: User recorded as the author of seeded appointments and invoices.
     """
     today = datetime.now(UTC).astimezone(CLINIC_TZ).date()
     # The demo assumes a Mon–Fri clinic. Seeding on a weekend would place the
@@ -1223,5 +1226,7 @@ async def seed_demo_data(
     )
     patients = await _seed_patients(session, hospital, today=today)
     await _seed_appointments(session, hospital, doctors, patients, today=today, actor_id=actor_id)
+    # After the appointments: seeded invoices bill the completed ones.
+    await seed_demo_billing(session, hospital, patients, zone=CLINIC_TZ, actor_id=actor_id)
 
     logger.info("demo_data_seeded")
