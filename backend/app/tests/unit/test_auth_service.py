@@ -287,6 +287,37 @@ class TestRefreshToken:
 
         mock_refresh_token_repo.revoke_all_for_user.assert_called_once_with(user_id)
 
+    async def test_refresh_reuse_revocation_is_committed_before_the_error(
+        self: Any,
+        auth_service: Any,
+        mock_refresh_token_repo: Any,
+        mock_uow: Any,
+    ) -> None:
+        """The revocation must be durable, not undone when the request ends.
+
+        The reuse branch ends in an exception, and the request-scoped session
+        rolls back anything uncommitted when it closes. Without a commit before
+        the raise, every session of the compromised account stayed alive and
+        the audit row vanished (PR #29 re-review).
+        """
+        from app.models.refresh_token import RefreshToken
+
+        calls: list[str] = []
+        mock_refresh_token_repo.revoke_all_for_user.side_effect = lambda *_: calls.append("revoke")
+        mock_uow.commit.side_effect = lambda: calls.append("commit")
+
+        token = MagicMock(spec=RefreshToken)
+        token.id = uuid.uuid4()
+        token.user_id = uuid.uuid4()
+        token.is_revoked = True
+        token.is_expired = False
+        mock_refresh_token_repo.get_by_token_hash.return_value = token
+
+        with pytest.raises(AuthenticationError, match="has been revoked"):
+            await auth_service.refresh_token(raw_token="stolen-token")
+
+        assert calls == ["revoke", "commit"]
+
 
 # ── Password Reset Tests ───────────────────────────────────────────────────
 

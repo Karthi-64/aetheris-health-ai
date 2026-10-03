@@ -278,6 +278,11 @@ class AuthService:
                     )
                 )
             await self._refresh_token_repo.revoke_all_for_user(stored_token.user_id)
+            # Commit before raising. The error below ends the request, and the
+            # request-scoped session rolls back whatever is uncommitted when it
+            # closes — which used to undo both the revocation and its audit
+            # row, leaving every stolen session alive and no trace of the reuse.
+            await self._uow.commit()
             raise AuthenticationError("Refresh token has been revoked. All sessions invalidated.")
 
         # ── Expiry Check ───────────────────────────────────────────────
