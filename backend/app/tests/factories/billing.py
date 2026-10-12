@@ -15,11 +15,20 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
 
-from app.models.billing import Invoice, InvoiceItem, InvoiceStatus, Payment, PaymentMethod, Service
+from app.models.billing import (
+    Invoice,
+    InvoiceItem,
+    InvoiceStatus,
+    Payment,
+    PaymentMethod,
+    Refund,
+    Service,
+)
 from app.schemas.billing import (
     CreateInvoiceRequest,
     CreateServiceRequest,
     RecordPaymentRequest,
+    RecordRefundRequest,
     UpdateInvoiceRequest,
     UpdateServiceRequest,
     VoidInvoiceRequest,
@@ -34,6 +43,8 @@ __all__ = [
     "build_payment_model",
     "build_payment_payload",
     "build_record_payment_request",
+    "build_record_refund_request",
+    "build_refund_model",
     "build_service_model",
     "build_service_payload",
     "build_update_invoice_request",
@@ -183,8 +194,11 @@ def build_invoice_model(**overrides: Any) -> Invoice:
         "discount_amount": Decimal("0.00"),
         "discount_reason": None,
         "discount_approved_by": None,
+        "discount_pending_approval": False,
         "total": Decimal("500.00"),
         "amount_paid": Decimal("0.00"),
+        "amount_refunded": Decimal("0.00"),
+        "consultation_fee_pending": False,
         "status": InvoiceStatus.DRAFT,
         "notes": None,
         "issued_at": None,
@@ -249,3 +263,42 @@ def build_payment_model(**overrides: Any) -> Payment:
     }
     values.update(overrides)
     return Payment(**values)
+
+
+# ── Refunds ─────────────────────────────────────────────────────────────────
+
+
+def build_record_refund_request(**overrides: Any) -> RecordRefundRequest:
+    """Build a validated :class:`RecordRefundRequest`."""
+    payload: dict[str, Any] = {
+        "amount": "100.00",
+        "method": "upi",
+        "reason": "ECG was not performed.",
+    }
+    payload.update(overrides)
+    return RecordRefundRequest.model_validate(payload)
+
+
+def build_refund_model(**overrides: Any) -> Refund:
+    """Build an unattached :class:`~app.models.billing.Refund`.
+
+    :param overrides: Column values to replace.
+    :returns: A detached Refund suitable for unit tests.
+    """
+    values: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "hospital_id": uuid.uuid4(),
+        "invoice_id": uuid.uuid4(),
+        "amount": Decimal("100.00"),
+        "method": PaymentMethod.UPI,
+        "reason": "ECG was not performed.",
+        "reference": None,
+        "refunded_by": uuid.uuid4(),
+        "refunded_at": _NOW,
+        "idempotency_key": "refund-key-00000001",
+        "created_at": _NOW,
+        "updated_at": _NOW,
+        "deleted_at": None,
+    }
+    values.update(overrides)
+    return Refund(**values)

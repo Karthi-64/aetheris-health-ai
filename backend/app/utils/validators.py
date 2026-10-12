@@ -113,3 +113,19 @@ __all__ = [
     "is_valid_uuid",
     "password_errors",
 ]
+
+
+def normalize_email(email: str) -> str:
+    """Return the canonical form of a staff email address.
+
+    Staff identity is the lower-cased address: ``Asha@Hospital.in`` and
+    ``asha@hospital.in`` are the same account. Applied at every boundary where
+    an address identifies a staff user — login, invite, password reset — and
+    on every write to ``users.email``.
+
+    Patient identity is separate and does not use this.
+
+    :param email: An address as typed or stored.
+    :returns: The address stripped of surrounding whitespace and lower-cased.
+    """
+    return email.strip().lower()

@@ -1,0 +1,12 @@
+{
+  "name": "@atheris/api-core",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "axios": "^1.19.0"
+  }
+}

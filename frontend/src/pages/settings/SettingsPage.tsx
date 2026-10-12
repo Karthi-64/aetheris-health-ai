@@ -23,7 +23,7 @@ export default function SettingsPage() {
     <div className="w-full">
       <PageHeader
         title="Settings"
-        subtitle="Hospital configuration, departments and the security audit trail."
+        subtitle="Hospital configuration and the audit log."
       />
 
       {!showHospital && !showAudit ? (

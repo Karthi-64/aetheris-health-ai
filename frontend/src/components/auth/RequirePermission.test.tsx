@@ -51,4 +51,46 @@ describe('RequirePermission', () => {
     expect(screen.queryByText('Billing page')).not.toBeInTheDocument()
     expect(screen.getByText('Dashboard')).toBeInTheDocument()
   })
+
+  it('admits either code of a permission group', () => {
+    // A doctor holds invoice.read.own, not invoice.read. The nav shows Billing
+    // for either, so the route has to as well.
+    login('doctor')
+    render(
+      <MemoryRouter initialEntries={['/billing']}>
+        <Routes>
+          <Route path="/dashboard" element={<div>Dashboard</div>} />
+          <Route
+            path="/billing"
+            element={
+              <RequirePermission group="invoice.read">
+                <div>Billing page</div>
+              </RequirePermission>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    )
+    expect(screen.getByText('Billing page')).toBeInTheDocument()
+  })
+
+  it('redirects when the user holds no code in the group', () => {
+    login('lab_technician')
+    render(
+      <MemoryRouter initialEntries={['/billing']}>
+        <Routes>
+          <Route path="/dashboard" element={<div>Dashboard</div>} />
+          <Route
+            path="/billing"
+            element={
+              <RequirePermission group="invoice.read">
+                <div>Billing page</div>
+              </RequirePermission>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    )
+    expect(screen.getByText('Dashboard')).toBeInTheDocument()
+  })
 })

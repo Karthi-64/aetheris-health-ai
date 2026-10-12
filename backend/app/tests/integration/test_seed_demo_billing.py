@@ -27,6 +27,7 @@ from app.models.billing import (
     InvoiceNumberSequence,
     InvoiceStatus,
     Payment,
+    Refund,
     Service,
 )
 from app.models.hospital import Hospital
@@ -45,6 +46,7 @@ BILLING_MODELS: dict[str, type[Any]] = {
     "invoices": Invoice,
     "invoice_items": InvoiceItem,
     "payments": Payment,
+    "refunds": Refund,
 }
 
 
@@ -104,8 +106,6 @@ class TestSeededBilling:
     async def test_every_reachable_invoice_state_is_represented(
         self, db_session: AsyncSession, hospital: Hospital
     ) -> None:
-        # `refunded` is absent on purpose: refunds are not built this sprint,
-        # so nothing — seed included — can produce that state.
         await seed_demo_data(db_session, hospital, {})
 
         statuses = {invoice.status for invoice in await _invoices(db_session, hospital.id)}
@@ -116,6 +116,7 @@ class TestSeededBilling:
             InvoiceStatus.PARTIALLY_PAID,
             InvoiceStatus.PAID,
             InvoiceStatus.VOID,
+            InvoiceStatus.REFUNDED,
         }
 
     async def test_invoice_numbers_are_a_gap_free_series(
@@ -133,8 +134,8 @@ class TestSeededBilling:
         assert sequence == list(range(1, len(numbered) + 1))
         # The counter agrees with the series, so the next API issue continues it.
         assert await _sequence_value(db_session, hospital.id) == len(numbered)
-        # Only the draft is unnumbered, and the void invoice kept its number.
-        assert [i.status for i in invoices if i.invoice_number is None] == [InvoiceStatus.DRAFT]
+        # Only the drafts are unnumbered, and the void invoice kept its number.
+        assert {i.status for i in invoices if i.invoice_number is None} == {InvoiceStatus.DRAFT}
         assert all(i.invoice_number for i in invoices if i.status is InvoiceStatus.VOID)
 
     async def test_stored_totals_match_the_lines(
@@ -148,29 +149,83 @@ class TestSeededBilling:
                 assert item.hospital_id == hospital.id
                 assert item.line_total == item.unit_price * item.quantity
             assert invoice.subtotal == sum((item.line_total for item in invoice.items), Decimal(0))
+            assert invoice.discount_amount <= invoice.subtotal
             assert invoice.total == invoice.subtotal + invoice.tax_amount - invoice.discount_amount
 
-    async def test_amount_paid_matches_the_payments(
+    async def test_amount_paid_and_refunded_match_the_rows(
         self, db_session: AsyncSession, hospital: Hospital
     ) -> None:
         await seed_demo_data(db_session, hospital, {})
+        invoices = await _invoices(db_session, hospital.id)
+        methods_per_paid_invoice = []
 
-        for invoice in await _invoices(db_session, hospital.id):
-            result = await db_session.execute(
-                select(Payment).where(Payment.invoice_id == invoice.id)
+        for invoice in invoices:
+            payments = list(
+                (await db_session.execute(select(Payment).where(Payment.invoice_id == invoice.id)))
+                .unique()
+                .scalars()
+                .all()
             )
-            payments = list(result.unique().scalars().all())
+            refunds = list(
+                (await db_session.execute(select(Refund).where(Refund.invoice_id == invoice.id)))
+                .unique()
+                .scalars()
+                .all()
+            )
             paid = sum((payment.amount for payment in payments), Decimal(0))
+            refunded = sum((refund.amount for refund in refunds), Decimal(0))
 
             assert invoice.amount_paid == paid
+            assert invoice.amount_refunded == refunded
+            assert refunded <= paid
             if invoice.status is InvoiceStatus.PAID:
                 assert paid == invoice.total
-                # Settled across two methods, so the payment list has variety.
-                assert len({payment.method for payment in payments}) == 2
+                assert refunded < paid
+                methods_per_paid_invoice.append({payment.method for payment in payments})
+            elif invoice.status is InvoiceStatus.REFUNDED:
+                assert refunded == paid > 0
             elif invoice.status is InvoiceStatus.PARTIALLY_PAID:
                 assert Decimal(0) < paid < invoice.total
             else:
                 assert payments == []
+                assert refunds == []
+
+        # One paid invoice is settled across two methods, for variety in the list.
+        assert any(len(methods) == 2 for methods in methods_per_paid_invoice)
+        # And one paid invoice carries a partial refund.
+        assert any(i.status is InvoiceStatus.PAID and i.amount_refunded > 0 for i in invoices)
+
+    async def test_one_draft_is_held_for_discount_approval(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        await seed_demo_data(db_session, hospital, {})
+
+        held = [i for i in await _invoices(db_session, hospital.id) if i.discount_pending_approval]
+
+        assert len(held) == 1
+        invoice = held[0]
+        assert invoice.status is InvoiceStatus.DRAFT
+        assert invoice.discount_reason
+        # Above the demo hospital's 10% threshold, which is why it is held.
+        assert invoice.discount_amount > invoice.subtotal * Decimal("0.10")
+        assert invoice.total == invoice.subtotal + invoice.tax_amount - invoice.discount_amount
+        assert hospital.settings["billing"]["discount_approval_threshold_percent"] == "10"
+
+    async def test_an_existing_threshold_is_not_overwritten(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        hospital.settings = {
+            "no_show_grace_minutes": 45,
+            "billing": {"discount_approval_threshold_percent": "25", "default_tax_rate": "5"},
+        }
+        await db_session.flush()
+
+        await seed_demo_data(db_session, hospital, {})
+
+        assert hospital.settings == {
+            "no_show_grace_minutes": 45,
+            "billing": {"discount_approval_threshold_percent": "25", "default_tax_rate": "5"},
+        }
 
 
 class TestRelationships:
@@ -242,9 +297,10 @@ class TestIdempotency:
         assert second == first
         assert first == {
             "services": len(SERVICES),
-            "invoices": 5,
-            "invoice_items": 10,
-            "payments": 3,
+            "invoices": 8,
+            "invoice_items": 14,
+            "payments": 5,
+            "refunds": 2,
         }
 
     async def test_second_run_does_not_advance_the_invoice_counter(

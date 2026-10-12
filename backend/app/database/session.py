@@ -71,6 +71,11 @@ def get_async_engine() -> AsyncEngine:
         pool_size=settings.DATABASE_POOL_SIZE,
         max_overflow=settings.DATABASE_MAX_OVERFLOW,
         echo=settings.DATABASE_ECHO,
+        # Bound parameters are kept out of SQL logging and out of the text of
+        # database errors. They carry password hashes, token hashes, email
+        # bodies with one-time links, and patient data; an error message that
+        # prints them puts all of that in the application log.
+        hide_parameters=True,
         pool_pre_ping=True,
         pool_recycle=3600,
         connect_args={
@@ -106,6 +111,7 @@ def create_session_factory(
             pool_size=pool_size or settings.DATABASE_POOL_SIZE,
             max_overflow=max_overflow or settings.DATABASE_MAX_OVERFLOW,
             echo=echo if echo is not None else settings.DATABASE_ECHO,
+            hide_parameters=True,
             pool_pre_ping=True,
             pool_recycle=3600,
         )

@@ -4,13 +4,20 @@ Drives the real running backend (uvicorn on :8000) over HTTP:
   1. Login as the seeded Hospital Admin — assert the payload now carries
      `permissions` and `name` (the SPA's RBAC inputs).
   2. GET /users — list renders with pagination metadata.
-  3. POST /users — invite a new user with a role.
+  3. POST /users — invite a new user with a role. The response must NOT
+     contain the activation token (it is a credential for the new account and
+     goes only to the invited mailbox); it reports `invitation.delivery`.
+     POST /users/{id}/invitation — sending it again returns no token either.
   4. GET /roles — the assignable catalog.
   5. POST /users/{id}/roles — assign another role.
   6. DELETE /users/{id}/roles/{role_id} — remove it again.
   7. Login as the seeded Receptionist — assert the *denied* path: no
      user-management permissions, and /users returns 403.
-  8. Deactivate + reactivate the invited user.
+  8. Deactivate + reactivate the invited user. The user never activated the
+     account, so reactivation returns it to `invited`, not `active`.
+
+This script never activates the invited user, so it needs no access to the
+queued email and no database connection.
 """
 
 from __future__ import annotations
@@ -57,6 +64,20 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail and not ok else ""))
     if not ok:
         failures.append(name)
+
+
+def token_like_keys(value: object) -> list[str]:
+    """Every key, at any depth, whose name suggests a credential."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            if "token" in str(key).lower():
+                found.append(str(key))
+            found.extend(token_like_keys(inner))
+    elif isinstance(value, list):
+        for inner in value:
+            found.extend(token_like_keys(inner))
+    return found
 
 
 def main() -> int:
@@ -115,7 +136,17 @@ def main() -> int:
     invite_id = invited.get("id", "")
     check("invited user status is invited", invited.get("status") == "invited",
           f"status={invited.get('status')}")
-    check("invite returns single-use token", bool(invited.get("invite_token")))
+    # The activation link is a credential for the invited account. It is
+    # emailed to the invited address and must never come back to the caller.
+    check("invite response has NO invite_token", "invite_token" not in invited,
+          "the API returned an activation token to the inviter")
+    check("invite response has no token-like key anywhere",
+          token_like_keys(body) == [], str(token_like_keys(body)))
+    check("invite response does not carry an activation link",
+          "token=" not in json.dumps(body) and "reset-password" not in json.dumps(body))
+    delivery = (invited.get("invitation") or {}).get("delivery")
+    check("invite reports invitation.delivery",
+          delivery in ("queued", "unavailable"), f"invitation={invited.get('invitation')!r}")
     check("invited user carries assigned role",
           any(r["name"] == "Nurse" for r in invited.get("roles", [])),
           str(invited.get("roles")))
@@ -125,6 +156,16 @@ def main() -> int:
         "email": invite_email, "first_name": "E2E", "last_name": "Nurse",
     })
     check("duplicate invite 409", status == 409, f"status={status}")
+
+    # Sending the invitation again: same rule, no token for the caller.
+    status, body = call("POST", f"/users/{invite_id}/invitation", token=admin_token)
+    check("resend invitation 200", status == 200, str(body)[:300])
+    check("resend reports the same delivery state",
+          body.get("data") == {"delivery": delivery}, str(body.get("data")))
+    check("resend response has no token-like key", token_like_keys(body) == [],
+          str(token_like_keys(body)))
+    check("resend response does not carry an activation link",
+          "token=" not in json.dumps(body) and "reset-password" not in json.dumps(body))
 
     # ── 5. Assign another role ────────────────────────────────────────────
     status, body = call("POST", f"/users/{invite_id}/roles", token=admin_token,
@@ -150,6 +191,8 @@ def main() -> int:
     check("receptionist login 200", status == 200, str(body)[:300])
     rec_token = body.get("data", {}).get("access_token", "")
     rec_perms = body.get("data", {}).get("user", {}).get("permissions", [])
+    status, _ = call("POST", f"/users/{invite_id}/invitation", token=rec_token)
+    check("receptionist cannot resend an invitation (403)", status == 403, f"status={status}")
     check("receptionist lacks user.read", "user.read" not in rec_perms, str(rec_perms))
     check("receptionist lacks role.assign", "role.assign" not in rec_perms)
 
@@ -168,8 +211,13 @@ def main() -> int:
 
     status, body = call("POST", f"/users/{invite_id}/reactivate", token=admin_token)
     check("reactivate 200", status == 200, str(body)[:300])
-    check("status back to active", body.get("data", {}).get("status") == "active",
+    # Nobody ever set a password on this account, so it goes back to waiting
+    # for its invitation. "active" here would be an account with no owner.
+    check("never-activated user returns to invited (not active)",
+          body.get("data", {}).get("status") == "invited",
           str(body.get("data", {}).get("status")))
+    check("reactivate response has no token-like key", token_like_keys(body) == [],
+          str(token_like_keys(body)))
 
     # Admin cannot deactivate themselves (module spec rule 7)
     admin_id = user.get("id", "")

@@ -45,6 +45,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from app.core.client_ip import client_ip, source_of
 from app.core.config import settings
 from app.core.envelope import error_envelope
 from app.core.error_codes import ErrorCode
@@ -58,6 +59,12 @@ WINDOW_SECONDS = 60
 #: request (``docs/06-API_STANDARDS.md`` §15, "cost control"), so they get a
 #: lower ceiling than ordinary reads.
 _AI_PATH_MARKERS: tuple[str, ...] = ("/recommend-slot", "/ai/")
+
+
+#: Where a patient token is billed to its account, and the public part of
+#: that namespace where it is not.
+_PATIENT_PATH_PREFIX = "/api/v1/patient/"
+_PATIENT_OTP_PATH_PREFIX = "/api/v1/patient/auth/otp/"
 
 
 class _Decision(Protocol):
@@ -185,29 +192,41 @@ def reset_limiter_state() -> None:
 def _client_ip(request: Request) -> str:
     """Resolve the caller's IP, honouring proxy headers only when configured.
 
-    ``X-Forwarded-For`` is attacker-controlled unless a trusted proxy overwrites
-    it, so it is consulted only when ``RATE_LIMIT_TRUST_PROXY_HEADER`` is on.
-    Without that flag, every user behind a load balancer shares the balancer's
-    address and therefore a single anonymous bucket; with it wrongly enabled,
-    any client can forge a fresh identity per request. Both failure modes are
-    silent, which is why this is explicit configuration rather than a guess.
+    The decision is made in :mod:`app.core.client_ip`, shared with the
+    authentication throttle, so the two can never disagree about who a caller
+    is. ``X-Forwarded-For`` is consulted only when
+    ``RATE_LIMIT_TRUST_PROXY_HEADER`` is on, and then only the entries our own
+    proxies appended. Without that flag, every user behind a load balancer
+    shares the balancer's address and therefore a single anonymous bucket.
+
+    An IPv6 caller is counted by its /64, the unit such addresses are handed
+    out in; counting single addresses would give one machine a limit per
+    address it cares to use.
 
     :param request: The incoming request.
-    :returns: The client IP, or ``"unknown"`` when it cannot be determined.
+    :returns: The source to count under, or ``"unknown"`` when there is none.
     """
-    if settings.RATE_LIMIT_TRUST_PROXY_HEADER:
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            # Left-most entry is the original client; the rest are proxy hops.
-            client = forwarded.split(",")[0].strip()
-            if client:
-                return client
-    return request.client.host if request.client else "unknown"
+    return source_of(client_ip(request))
 
 
 def _is_ai_path(path: str) -> bool:
     """Return whether *path* should be billed against the AI tier."""
     return any(marker in path for marker in _AI_PATH_MARKERS)
+
+
+def _is_patient_account_path(path: str) -> bool:
+    """Return whether a patient token may move *path* onto the per-account tier.
+
+    A patient token is self-service — anybody with a phone can obtain one —
+    so it lifts a caller off the per-source limit only where it is the
+    credential the endpoint asks for: under the Patient App namespace. The
+    two public one-time-code endpoints are left out even there: they are
+    anonymous by design, and a token attached to them must not buy a larger
+    allowance of attempts than the caller's address has.
+
+    :param path: The request path.
+    """
+    return path.startswith(_PATIENT_PATH_PREFIX) and not path.startswith(_PATIENT_OTP_PATH_PREFIX)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -261,13 +280,27 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         """Build the ``(key, limit)`` pairs this request must satisfy.
 
         :param request: The incoming request, after ``AuthMiddleware`` has run.
-        :returns: One pair for an anonymous caller; two for an authenticated one
-            (user and hospital), so a single user cannot exhaust a tenant's
-            budget unnoticed.
+        :returns: One pair for an anonymous caller; one for a patient account
+            on a Patient App endpoint (anywhere else its token is ignored);
+            two for an authenticated staff user (user and hospital), so a
+            single user cannot exhaust a tenant's budget unnoticed.
         """
         user_id = getattr(request.state, "user_id", None)
         hospital_id = getattr(request.state, "hospital_id", None)
+        patient_account_id = getattr(request.state, "patient_account_id", None)
         is_ai = _is_ai_path(request.url.path)
+
+        if (
+            user_id is None
+            and patient_account_id is not None
+            and _is_patient_account_path(request.url.path)
+        ):
+            # A Patient App principal on a Patient App endpoint: billed to its
+            # own account, never to a staff user or a hospital, and never to
+            # the address it shares with everyone else on the same network.
+            # Everywhere else a patient token changes nothing: the request is
+            # anonymous, and counted against its source below.
+            return [(f"patient:{patient_account_id}", settings.RATE_LIMIT_USER_PER_MIN)]
 
         if user_id is None:
             ip = _client_ip(request)

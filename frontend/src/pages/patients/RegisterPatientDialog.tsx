@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from 'react'
+import { type ReactNode, useRef, useState } from 'react'
 import { Controller, useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -17,8 +17,19 @@ import { Field } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
-import { ApiError } from '@/api/types'
-import { GENDER_LABELS, useCreatePatient, type Gender } from '@/api/patients'
+import { Alert } from '@/components/ui/alert'
+import { apiErrorMessage, splitFieldErrors } from '@/lib/apiErrors'
+import { GENDER_LABELS, useCreatePatient } from '@/api/patients'
+import {
+  BLOOD_GROUPS,
+  GENDERS,
+  birthDateField,
+  emailField,
+  firstNameField,
+  genderField,
+  lastNameField,
+  phoneField,
+} from './patientForm'
 
 /**
  * Registers a patient against `POST /api/v1/patients`
@@ -30,43 +41,13 @@ import { GENDER_LABELS, useCreatePatient, type Gender } from '@/api/patients'
  * one. The MRN is generated server-side and cannot be supplied.
  */
 
-const GENDERS: Gender[] = ['male', 'female', 'other', 'unspecified']
-
-const BLOOD_GROUPS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'] as const
-
-/** Backend rule: date of birth cannot be in the future, and age cannot exceed 130. */
-const MAX_AGE_YEARS = 130
-
-function isPlausibleBirthDate(value: string): boolean {
-  const dob = new Date(value)
-  if (Number.isNaN(dob.getTime())) return false
-  const today = new Date()
-  if (dob > today) return false
-  const oldest = new Date()
-  oldest.setFullYear(oldest.getFullYear() - MAX_AGE_YEARS)
-  return dob >= oldest
-}
-
 const schema = z.object({
-  first_name: z.string().trim().min(1, 'First name is required').max(100),
-  last_name: z.string().trim().min(1, 'Last name is required').max(100),
-  date_of_birth: z
-    .string()
-    .min(1, 'Date of birth is required')
-    .refine(isPlausibleBirthDate, 'Enter a date in the past, within the last 130 years'),
-  gender: z.enum(['male', 'female', 'other', 'unspecified'], { message: 'Select a gender' }),
-  // Optional, but must be E.164-able if given — the backend normalizes
-  // `9876543210` to `+919876543210` and rejects anything it cannot parse.
-  phone: z
-    .string()
-    .trim()
-    .refine((v) => v === '' || /^\+?[0-9\s-]{7,20}$/.test(v), 'Enter a valid phone number')
-    .optional(),
-  email: z
-    .string()
-    .trim()
-    .refine((v) => v === '' || /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(v), 'Enter a valid email')
-    .optional(),
+  first_name: firstNameField,
+  last_name: lastNameField,
+  date_of_birth: birthDateField,
+  gender: genderField,
+  phone: phoneField.optional(),
+  email: emailField.optional(),
   blood_group: z.string().optional(),
 })
 
@@ -74,6 +55,11 @@ type FormValues = z.input<typeof schema>
 
 export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
   const [open, setOpen] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  // `isPending` only disables the button after a re-render; this also stops a
+  // second submit (double click, Enter held down) fired before that happens —
+  // each one would otherwise create its own patient record and MRN.
+  const submitting = useRef(false)
   const createPatient = useCreatePatient()
 
   const {
@@ -81,6 +67,7 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
     control,
     handleSubmit,
     reset,
+    setError,
     formState: { errors },
   } = useForm<FormValues>({
     resolver: zodResolver(schema),
@@ -95,8 +82,12 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
   })
 
   async function onSubmit(values: FormValues) {
-    const parsed = schema.parse(values)
+    if (submitting.current) return
+    submitting.current = true
+    setNotice(null)
     try {
+      // Inside the try so that a throw here still releases the guard below.
+      const parsed = schema.parse(values)
       const created = await createPatient.mutateAsync({
         first_name: parsed.first_name,
         last_name: parsed.last_name,
@@ -112,11 +103,21 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
       reset()
       setOpen(false)
     } catch (err) {
-      // The backend's message is written for end users, so show it rather than
-      // replacing it with a generic failure.
-      toast.error(
-        err instanceof ApiError ? err.message : 'Could not register the patient. Please try again.',
+      // A 422 names the fields it rejects: each goes under its input, and one
+      // this form does not collect goes above the form rather than being lost.
+      const { onFields, other } = splitFieldErrors(err, (field) => field in schema.shape)
+      onFields.forEach((fe, index) =>
+        setError(fe.field as keyof FormValues, { message: fe.message }, { shouldFocus: index === 0 }),
       )
+      if (other.length > 0) setNotice(other.join(' '))
+      if (onFields.length > 0 || other.length > 0) {
+        toast.error("Couldn't register the patient. Check the highlighted fields.")
+        return
+      }
+      // The API's sentence for a refusal it explains; never transport text.
+      toast.error(apiErrorMessage(err, 'Could not register the patient. Please try again.'))
+    } finally {
+      submitting.current = false
     }
   }
 
@@ -125,6 +126,7 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
       open={open}
       onOpenChange={(next) => {
         setOpen(next)
+        setNotice(null)
         if (!next) reset()
       }}
     >
@@ -137,7 +139,12 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
           </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4" noValidate>
+        <form onSubmit={(e) => handleSubmit(onSubmit)(e)} className="space-y-4" noValidate>
+          {notice && (
+            <Alert variant="error" title="Couldn't register the patient">
+              {notice}
+            </Alert>
+          )}
           <div className="grid grid-cols-2 gap-4">
             <Field label="First name" required error={errors.first_name?.message}>
               {(p) => <Input placeholder="e.g. Ananya" {...p} {...register('first_name')} />}
@@ -213,10 +220,17 @@ export function RegisterPatientDialog({ trigger }: { trigger: ReactNode }) {
           </Field>
 
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setOpen(false)
+                setNotice(null)
+              }}
+            >
               Cancel
             </Button>
-            <Button type="submit" disabled={createPatient.isPending}>
+            <Button type="submit" disabled={createPatient.isPending} aria-busy={createPatient.isPending}>
               {createPatient.isPending && <Loader2 className="size-4 animate-spin" />}
               Register
             </Button>

@@ -605,3 +605,101 @@ class TestDoctorScope:
             await repository.get_invoice_by_id(other_hospital_id, invoice_a.id, doctor_id=doctor_a)
             is None
         )
+
+
+class TestDiscountQueueAndRefunds:
+    """Persistence behind the approval queue and refunds (module spec §5.2, §5.5)."""
+
+    async def test_discount_pending_filter_is_the_approval_queue(
+        self,
+        repository: InvoiceRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+    ) -> None:
+        waiting = await _draft(repository, db_session, hospital_id)
+        await repository.update_invoice(
+            waiting, discount_amount=Decimal("200.00"), discount_pending_approval=True
+        )
+        await _draft(repository, db_session, hospital_id)
+        theirs = await _draft(repository, db_session, other_hospital_id)
+        await repository.update_invoice(theirs, discount_pending_approval=True)
+
+        queue = await repository.list_invoices(hospital_id, discount_pending=True)
+        settled = await repository.list_invoices(hospital_id, discount_pending=False)
+
+        assert [invoice.id for invoice in queue] == [waiting.id]
+        assert waiting.id not in {invoice.id for invoice in settled}
+        assert await repository.count_invoices(hospital_id, discount_pending=True) == 1
+
+    async def test_refunds_are_persisted_listed_and_tenant_scoped(
+        self,
+        repository: InvoiceRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+    ) -> None:
+        invoice = await _issued(repository, db_session, hospital_id, "INV-2026-000001")
+        refund = await repository.create_refund(
+            invoice=invoice,
+            amount=Decimal("100.00"),
+            method=PaymentMethod.UPI,
+            reason="ECG not performed",
+            refunded_by=actor_id,
+            refunded_at=NOW,
+            idempotency_key="refund-key-00000001",
+        )
+
+        assert refund.hospital_id == hospital_id
+        assert refund.reason == "ECG not performed"
+        assert [r.id for r in await repository.list_refunds(hospital_id, invoice.id)] == [refund.id]
+        assert await repository.list_refunds(other_hospital_id, invoice.id) == []
+        assert (
+            await repository.get_refund_by_idempotency_key(hospital_id, "refund-key-00000001")
+        ) is not None
+        assert (
+            await repository.get_refund_by_idempotency_key(other_hospital_id, "refund-key-00000001")
+        ) is None
+
+    async def test_database_refuses_refunding_more_than_was_paid(
+        self, repository: InvoiceRepository, db_session: AsyncSession, hospital_id: uuid.UUID
+    ) -> None:
+        # Business rule 10, enforced by Postgres.
+        invoice = await _issued(repository, db_session, hospital_id, "INV-2026-000001")
+        await repository.update_invoice(
+            invoice, amount_paid=Decimal("300.00"), status=InvoiceStatus.PARTIALLY_PAID
+        )
+
+        with pytest.raises(IntegrityError, match="refunded_within_paid"):
+            async with db_session.begin_nested():
+                await repository.update_invoice(invoice, amount_refunded=Decimal("300.01"))
+
+    async def test_refund_amount_must_be_positive_and_keys_unique_per_hospital(
+        self,
+        repository: InvoiceRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+    ) -> None:
+        invoice = await _issued(repository, db_session, hospital_id, "INV-2026-000001")
+
+        async def refund(amount: str) -> None:
+            await repository.create_refund(
+                invoice=invoice,
+                amount=Decimal(amount),
+                method=PaymentMethod.CASH,
+                reason="Test",
+                refunded_by=actor_id,
+                refunded_at=NOW,
+                idempotency_key="refund-key-00000001",
+            )
+
+        with pytest.raises(IntegrityError, match="amount_positive"):
+            async with db_session.begin_nested():
+                await refund("0.00")
+
+        await refund("10.00")
+        with pytest.raises(IntegrityError, match="uq_refunds_hospital_idempotency_key"):
+            async with db_session.begin_nested():
+                await refund("10.00")

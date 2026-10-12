@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Download, UserPlus, Users } from 'lucide-react'
+import { UserPlus, Users } from 'lucide-react'
 import PageHeader from '@/components/layout/PageHeader'
 import { DataTable } from '@/components/ui/data-table'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
 import { usePatients } from '@/api/patients'
 import { patientColumns } from './columns'
+import { usePermissions } from '@/hooks/usePermissions'
 import { RegisterPatientDialog } from './RegisterPatientDialog'
 
 /** Rows per request. The backend caps `page_size` at 100. */
@@ -39,6 +40,9 @@ export default function PatientsPage() {
   const patients = data?.items ?? []
   const totalPages = data?.pagination.totalPages ?? 0
 
+  const { can } = usePermissions()
+  const canRegister = can('patient.create')
+
   const registerButton = (
     <Button className="rounded-full">
       <UserPlus className="size-4" /> Register Patient
@@ -49,15 +53,10 @@ export default function PatientsPage() {
     <div className="w-full">
       <PageHeader
         title="Patients"
-        subtitle="Patient registry, admissions and AI-assisted summaries."
-        actions={
-          <>
-            <Button variant="outline" className="rounded-full">
-              <Download className="size-4" /> Export
-            </Button>
-            <RegisterPatientDialog trigger={registerButton} />
-          </>
-        }
+        subtitle="The patient registry — find a record or register a new patient."
+        // Offered only to those the API will let register; for anyone else the
+        // dialog could only end in a 403.
+        actions={canRegister ? <RegisterPatientDialog trigger={registerButton} /> : undefined}
       />
 
       {isError ? (
@@ -82,14 +81,18 @@ export default function PatientsPage() {
               <EmptyState
                 icon={Users}
                 title="No matching patients"
-                description="Names match from the start, and MRN or phone must match exactly."
+                description="Search by first name or last name on its own — a full name will not match. An MRN or phone number must be entered in full."
               />
             ) : (
               <EmptyState
                 icon={Users}
                 title="No patients yet"
-                description="Register your first patient to start building the registry."
-                action={<RegisterPatientDialog trigger={registerButton} />}
+                description={
+                  canRegister
+                    ? 'Register your first patient to start building the registry.'
+                    : 'Patients registered at this hospital will appear here.'
+                }
+                action={canRegister ? <RegisterPatientDialog trigger={registerButton} /> : undefined}
               />
             )
           }

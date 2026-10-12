@@ -106,7 +106,7 @@ class TestGetCurrentUser:
         }
         expired = pyjwt.encode(
             payload,
-            settings.APP_SECRET_KEY,
+            settings.APP_SECRET_KEY.get_secret_value(),
             algorithm="HS256",
         )
 

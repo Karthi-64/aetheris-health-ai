@@ -40,6 +40,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.api.dependencies.repositories import get_user_repository
 from app.core.error_codes import ErrorCode
 from app.core.security import verify_access_token
+from app.core.tenancy import bind_tenant_scope, cross_tenant, scope_for_principal
 from app.models.user import User, UserStatus
 from app.repositories import UserRepository
 
@@ -112,8 +113,12 @@ async def get_current_user(
         )
 
     # Look up the user
+    # Identity resolution is tenant-less by nature: the hospital is not known
+    # until the row named by the verified token has been read.
     user_id = uuid.UUID(payload["sub"])
-    user = await user_repo.get_by_id(user_id)
+    user = await user_repo.get_by_id(
+        user_id, cross_tenant("resolve the principal named by a verified access token")
+    )
 
     if user is None:
         raise HTTPException(
@@ -124,7 +129,11 @@ async def get_current_user(
             },
         )
 
-    if user.status != UserStatus.ACTIVE:
+    # A deactivated hospital is treated exactly like a deactivated account:
+    # its staff stop authenticating on their very next request, without
+    # waiting for the access token to expire. `hospital_is_active` fails
+    # closed and costs no query (the hospital is loaded with the user).
+    if user.status != UserStatus.ACTIVE or not user.hospital_is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -132,6 +141,13 @@ async def get_current_user(
                 "error_code": ErrorCode.PERMISSION_DENIED,
             },
         )
+
+    # From here on the request is confined to the principal's own hospital:
+    # every ORM statement is filtered by it and a write to another hospital's
+    # row is refused, whatever hospital id a later call happens to pass
+    # (app/core/tenancy.py, Layer 2). The hospital comes from the user row,
+    # never from the request.
+    bind_tenant_scope(scope_for_principal(user.hospital_id))
 
     return user
 

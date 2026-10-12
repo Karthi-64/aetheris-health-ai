@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from app.ai.constants import DEFAULT_HINT_MAPPING, ModelHint
+from app.ai.constants import DEFAULT_HINT_MAPPING, ModelHint, providers_serving
 from app.core.exceptions import ServiceUnavailableError
 
 if TYPE_CHECKING:
@@ -146,6 +146,29 @@ class AIProviderRegistry:
                 return provider, fallback_model
 
         raise AllProvidersFailedError(str(hint))
+
+    def resolve_model(self, model: str) -> tuple[AIProvider, str]:
+        """Resolve a concrete model id to the registered provider that serves it.
+
+        A model is served by a provider when a hint is currently mapped to
+        that pair — which covers a per-environment override such as
+        ``AI_FAST_MODEL`` — or when the model catalog lists it for that
+        provider. Pricing plays no part: a model with no recorded price
+        still resolves.
+
+        :param model: Concrete model identifier.
+        :returns: A (provider instance, model name) pair.
+        :raises ServiceUnavailableError: If no registered provider serves it.
+        """
+        candidates = [name for name, mapped in self._hint_mapping.values() if mapped == model]
+        candidates.extend(providers_serving(model))
+        for provider_name in candidates:
+            provider = self._providers.get(provider_name)
+            if provider is not None:
+                return provider, model
+
+        msg = f"No registered provider can serve model '{model}'."
+        raise ServiceUnavailableError(message=msg)
 
     def get_provider(self, name: str) -> AIProvider | None:
         """Retrieve a registered provider by name.

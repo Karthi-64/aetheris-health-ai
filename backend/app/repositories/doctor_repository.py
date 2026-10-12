@@ -15,18 +15,64 @@ consistency boundary.
 from __future__ import annotations
 
 import uuid  # noqa: TC003 — needed at runtime for type hints
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Select, delete, func, or_, select
+from sqlalchemy import Select, and_, delete, exists, func, or_, select
 
+from app.models.department import Department
 from app.models.doctor import Doctor, DoctorAvailability, DoctorLeave
-from app.models.user import User
+from app.models.user import User, UserStatus
 from app.repositories.base import BaseRepository
 
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from sqlalchemy import Row
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql import ColumnElement
+
+
+@dataclass(frozen=True, slots=True)
+class DoctorDirectoryEntry:
+    """A doctor as a directory may describe one: columns, not the entity.
+
+    No user id, e-mail, phone, licence number, fee or audit column is read.
+
+    :param id: The doctor's UUID.
+    :param first_name: Given name, from the doctor's user row.
+    :param last_name: Family name, from the doctor's user row.
+    :param specialization: Clinical specialization.
+    :param qualifications: The stored qualifications value, as stored.
+    :param languages: The stored languages value, as stored.
+    :param bio: The stored biography, if any.
+    :param department_id: The doctor's active department, if any.
+    :param department_name: That department's name.
+    """
+
+    id: uuid.UUID
+    first_name: str
+    last_name: str
+    specialization: str
+    qualifications: Any
+    languages: Any
+    bio: str | None
+    department_id: uuid.UUID | None
+    department_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryDepartment:
+    """A department that has a doctor in the directory.
+
+    :param id: The department's UUID.
+    :param name: Its name.
+    :param description: Its description, if any.
+    """
+
+    id: uuid.UUID
+    name: str
+    description: str | None
 
 
 class DoctorRepository(BaseRepository[Doctor]):
@@ -102,6 +148,160 @@ class DoctorRepository(BaseRepository[Doctor]):
         one twice and skipping another.
         """
         return stmt.order_by(Doctor.specialization.asc(), Doctor.id.asc())
+
+    # ── Directory ────────────────────────────────────────────────────────────
+    # The doctors of one hospital that may be shown to somebody outside it: not
+    # deactivated, backed by an active user of that same hospital, and with at
+    # least one availability window. Read as columns, so nothing but what a
+    # directory shows ever leaves the database.
+
+    @staticmethod
+    def _in_directory(hospital_id: uuid.UUID) -> tuple[ColumnElement[bool], ...]:
+        """The predicates of the directory, over ``doctors`` joined to ``users``."""
+        return (
+            Doctor.hospital_id == hospital_id,
+            Doctor.deleted_at.is_(None),
+            User.hospital_id == hospital_id,
+            User.deleted_at.is_(None),
+            User.status == UserStatus.ACTIVE,
+            exists().where(
+                DoctorAvailability.doctor_id == Doctor.id,
+                DoctorAvailability.hospital_id == hospital_id,
+            ),
+        )
+
+    @staticmethod
+    def _directory_select(hospital_id: uuid.UUID) -> Select[Any]:
+        """The directory's columns, with the doctor's department if it is active."""
+        return (
+            select(
+                Doctor.id,
+                User.first_name,
+                User.last_name,
+                Doctor.specialization,
+                Doctor.qualifications,
+                Doctor.languages,
+                Doctor.bio,
+                Department.id.label("department_id"),
+                Department.name.label("department_name"),
+            )
+            .select_from(Doctor)
+            .join(User, User.id == Doctor.user_id)
+            .outerjoin(
+                Department,
+                and_(
+                    Department.id == Doctor.department_id,
+                    Department.hospital_id == hospital_id,
+                    Department.deleted_at.is_(None),
+                ),
+            )
+            .where(*DoctorRepository._in_directory(hospital_id))
+        )
+
+    @staticmethod
+    def _directory_entry(row: Row[Any]) -> DoctorDirectoryEntry:
+        """Build an entry from a row of :meth:`_directory_select`."""
+        return DoctorDirectoryEntry(
+            id=row.id,
+            first_name=row.first_name,
+            last_name=row.last_name,
+            specialization=row.specialization,
+            qualifications=row.qualifications,
+            languages=row.languages,
+            bio=row.bio,
+            department_id=row.department_id,
+            department_name=row.department_name,
+        )
+
+    async def list_directory(
+        self,
+        hospital_id: uuid.UUID,
+        *,
+        search: str | None = None,
+        department_id: uuid.UUID | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[DoctorDirectoryEntry], int]:
+        """One page of the doctors of a hospital that a directory may show.
+
+        Ordered by family name then given name without regard to case, then by
+        id — which is unique, so a page never repeats or skips a doctor.
+
+        :param hospital_id: The tenant to scope to.
+        :param search: Text the full name or the specialization must contain,
+            case-insensitively. Matched literally: ``%``, ``_`` and ``\\`` are
+            not wildcards.
+        :param department_id: The active department the doctor must be in.
+        :param skip: Number of rows to skip.
+        :param limit: Maximum rows to return.
+        :returns: The page, and how many doctors match in all.
+        """
+        stmt = self._directory_select(hospital_id)
+        if search:
+            literal = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{literal}%"
+            full_name = User.first_name + " " + User.last_name
+            stmt = stmt.where(
+                or_(
+                    full_name.ilike(pattern, escape="\\"),
+                    Doctor.specialization.ilike(pattern, escape="\\"),
+                )
+            )
+        if department_id is not None:
+            stmt = stmt.where(Department.id == department_id)
+
+        total = await self._session.execute(select(func.count()).select_from(stmt.subquery()))
+        rows = await self._session.execute(
+            stmt.order_by(func.lower(User.last_name), func.lower(User.first_name), Doctor.id)
+            .offset(skip)
+            .limit(limit)
+        )
+        return [self._directory_entry(row) for row in rows], total.scalar_one()
+
+    async def get_directory_entry(
+        self, hospital_id: uuid.UUID, doctor_id: uuid.UUID
+    ) -> DoctorDirectoryEntry | None:
+        """Read one doctor of a hospital, if a directory may show them.
+
+        :param hospital_id: The tenant to scope to.
+        :param doctor_id: The doctor's UUID.
+        :returns: The entry, or ``None`` — also for a doctor of another hospital.
+        """
+        row = (
+            await self._session.execute(
+                self._directory_select(hospital_id).where(Doctor.id == doctor_id)
+            )
+        ).one_or_none()
+        return None if row is None else self._directory_entry(row)
+
+    async def list_directory_departments(
+        self, hospital_id: uuid.UUID, *, limit: int
+    ) -> list[DirectoryDepartment]:
+        """The active departments of a hospital that have a doctor in the directory.
+
+        :param hospital_id: The tenant to scope to.
+        :param limit: Maximum number of departments to return.
+        :returns: The departments, by name then id.
+        """
+        has_listed_doctor = (
+            exists()
+            .where(Doctor.department_id == Department.id, User.id == Doctor.user_id)
+            .where(*self._in_directory(hospital_id))
+        )
+        rows = await self._session.execute(
+            select(Department.id, Department.name, Department.description)
+            .where(
+                Department.hospital_id == hospital_id,
+                Department.deleted_at.is_(None),
+                has_listed_doctor,
+            )
+            .order_by(func.lower(Department.name), Department.id)
+            .limit(limit)
+        )
+        return [
+            DirectoryDepartment(id=row.id, name=row.name, description=row.description)
+            for row in rows
+        ]
 
     # ── Doctor commands ───────────────────────────────────────────────────────
 

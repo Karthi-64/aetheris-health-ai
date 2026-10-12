@@ -10,7 +10,7 @@ import uuid  # noqa: TC003 — needed at runtime for type hints
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 from app.models.password_reset_token import PasswordResetToken
 from app.repositories.base import BaseRepository
@@ -83,13 +83,66 @@ class PasswordResetTokenRepository(BaseRepository[PasswordResetToken]):
         result = await self._session.execute(stmt)
         return result.unique().scalar_one_or_none()
 
-    async def invalidate_all_for_user(self, user_id: uuid.UUID) -> int:
+    async def consume(self, token_hash: str) -> PasswordResetToken | None:
+        """Spend a token: find it, check it is usable, and mark it used — atomically.
+
+        One ``UPDATE ... RETURNING``. Two requests presenting the same token at
+        the same moment cannot both succeed: the second waits for the first,
+        then finds ``used_at`` set and matches nothing. A token is single-use
+        because of this statement, not because callers check first.
+
+        :param token_hash: SHA-256 hash of the token presented.
+        :returns: The token, now marked used, or ``None`` if it is unknown,
+            already used or expired.
+        """
+        now = datetime.now(UTC)
+        result = await self._session.execute(
+            update(PasswordResetToken)
+            .where(
+                PasswordResetToken.token_hash == token_hash,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            )
+            .values(used_at=now)
+            .returning(PasswordResetToken)
+            .execution_options(populate_existing=True)
+        )
+        return result.unique().scalar_one_or_none()
+
+    async def count_issued_since(self, user_id: uuid.UUID, since: datetime) -> int:
+        """Count the tokens issued to a user since a moment that still work.
+
+        Only links that can still be redeemed are counted — unused and
+        unexpired. A limit built on this therefore never refuses a new link
+        unless working ones are already in the user's mailbox.
+
+        :param user_id: The user's UUID.
+        :param since: Only tokens created at or after this are counted.
+        :returns: The number of tokens.
+        """
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(PasswordResetToken)
+            .where(
+                PasswordResetToken.user_id == user_id,
+                PasswordResetToken.created_at >= since,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > datetime.now(UTC),
+            )
+        )
+        return int(result.scalar_one())
+
+    async def invalidate_all_for_user(
+        self, user_id: uuid.UUID, *, keep: uuid.UUID | None = None
+    ) -> int:
         """Mark all unused tokens for a user as consumed.
 
         Called when a password is successfully changed, to invalidate
         any outstanding reset requests.
 
         :param user_id: The user's UUID.
+        :param keep: A token id to leave alone — the one just issued, when an
+            invitation is sent again and only the older links are to die.
         :returns: The number of tokens invalidated.
         """
         now = datetime.now(UTC)
@@ -97,6 +150,8 @@ class PasswordResetTokenRepository(BaseRepository[PasswordResetToken]):
             PasswordResetToken.user_id == user_id,
             PasswordResetToken.used_at.is_(None),
         )
+        if keep is not None:
+            stmt = stmt.where(PasswordResetToken.id != keep)
         result = await self._session.execute(stmt)
         tokens = list(result.unique().scalars().all())
         for token in tokens:

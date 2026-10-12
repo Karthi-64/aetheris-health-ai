@@ -87,3 +87,63 @@ async def test_the_sweeper_records_to_the_durable_audit_trail(
 
     assert swept == 3
     assert isinstance(captured["audit"], AuditService)
+
+
+def test_the_email_queue_job_is_registered_and_polled() -> None:
+    """Queued notification emails are only ever sent by this cron job."""
+    from app.background.jobs.send_notifications import (
+        EMAIL_QUEUE_POLL_SECONDS,
+        deliver_notification_emails,
+    )
+
+    settings = _as_arq_sees_it()
+    functions = settings["functions"]
+    cron_jobs = settings["cron_jobs"]
+
+    assert isinstance(functions, list)
+    assert deliver_notification_emails in functions
+    assert isinstance(cron_jobs, list)
+    [job] = [job for job in cron_jobs if job.coroutine is deliver_notification_emails]
+    assert job.second == set(range(0, 60, EMAIL_QUEUE_POLL_SECONDS))
+    # A queue left over from an outage is drained as soon as the worker is back.
+    assert job.run_at_startup is True
+
+
+async def test_the_email_job_drains_the_queue_with_the_configured_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job hands the service whatever transport the settings describe."""
+    from app import database
+    from app.background.jobs.send_notifications import deliver_notification_emails
+    from app.core import email
+    from app.services import notification_service
+    from app.services.audit_service import AuditService
+    from app.services.notification_service import DeliveryReport
+
+    captured: dict[str, object] = {}
+    transport = object()
+
+    class _FakeSession:
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class _RecordingService:
+        def __init__(self, *args: object) -> None:
+            captured["audit"] = args[4]
+
+        async def deliver_due_emails(self, sender: object) -> DeliveryReport:
+            captured["sender"] = sender
+            return DeliveryReport(sent=2, retrying=1, failed=0)
+
+    monkeypatch.setattr(database, "create_session_factory", lambda: _FakeSession)
+    monkeypatch.setattr(email, "get_email_sender", lambda: transport)
+    monkeypatch.setattr(notification_service, "NotificationService", _RecordingService)
+
+    handled = await deliver_notification_emails({})
+
+    assert handled == 3
+    assert captured["sender"] is transport
+    assert isinstance(captured["audit"], AuditService)

@@ -5,12 +5,15 @@ See ``docs/modules/01-authentication.md`` §9 for the full API contract.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.api.dependencies.auth import get_current_user
 from app.api.dependencies.services import get_auth_service
+from app.core.client_ip import client_ip
+from app.core.config import settings
 from app.core.envelope import success_envelope
 from app.models.user import User
 from app.schemas.auth import (
@@ -25,7 +28,7 @@ from app.schemas.auth import (
     RefreshTokenRequest,
     ResetPasswordRequest,
 )
-from app.services.auth_service import AuthService
+from app.services.auth_service import DEVICE_TOKENS_PER_COOKIE, AuthService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -36,11 +39,73 @@ def _get_device_info(request: Request) -> str | None:
 
 
 def _get_ip_address(request: Request) -> str | None:
-    """Extract client IP from the request."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
+    """The caller's address, from the one shared resolver (never the caller's own claim)."""
+    return client_ip(request)
+
+
+# ── Trusted-device cookie ────────────────────────────────────────────────────
+# The cookie marks a browser that has completed a sign-in. It is not a
+# credential: it only decides which throttle counters an attempt draws on
+# (app/services/auth_throttle.py). It is HttpOnly, SameSite=Strict, and — with
+# the ``__Host-`` prefix — Secure, host-only and immune to being shadowed by a
+# cookie set from a sibling domain. It is written only on the success response
+# of a completed sign-in, emailed link or password change, and never touched
+# on any refusal, so its presence or absence says nothing about an account.
+
+#: One device token: what ``secrets.token_urlsafe(32)`` produces.
+_DEVICE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
+_DEVICE_COOKIE_MAX_AGE = 180 * 24 * 60 * 60
+#: The most tokens read from one request: a bound on the work one request can
+#: ask for. A browser holds at most eight under this name, and with the
+#: ``__Host-`` prefix nothing but this host can write the cookie, so only a
+#: caller composing its own request can exceed it — and then only hides a
+#: token from itself.
+_DEVICE_TOKENS_READ = 8 * DEVICE_TOKENS_PER_COOKIE
+
+
+def _device_cookie_name() -> str:
+    """The cookie's name: ``__Host-`` prefixed whenever it is sent as Secure."""
+    return "__Host-aetheris-device" if settings.AUTH_DEVICE_COOKIE_SECURE else "aetheris-device"
+
+
+def _get_device_tokens(request: Request) -> tuple[str, ...]:
+    """Read the trusted-device tokens a browser presented.
+
+    Every cookie of the right name is read from the raw header, not only the
+    one a cookie parser would keep, so a second cookie of the same name cannot
+    hide the real one. Anything that does not look like a token is dropped.
+
+    :param request: The incoming request.
+    :returns: The well-formed tokens, in order, up to a bound on the work
+        one request can ask for.
+    """
+    name = _device_cookie_name()
+    tokens: list[str] = []
+    for header in request.headers.getlist("cookie"):
+        for pair in header.split(";"):
+            key, _, value = pair.strip().partition("=")
+            if key != name:
+                continue
+            for token in value.strip().strip('"').split("."):
+                if _DEVICE_TOKEN.fullmatch(token) and token not in tokens:
+                    tokens.append(token)
+    return tuple(tokens[:_DEVICE_TOKENS_READ])
+
+
+def _set_device_cookie(response: Response, value: str | None) -> None:
+    """Give the browser its trusted-device cookie, if there is one to give."""
+    if not value:
+        return
+    secure = settings.AUTH_DEVICE_COOKIE_SECURE
+    response.set_cookie(
+        key=_device_cookie_name(),
+        value=value,
+        max_age=_DEVICE_COOKIE_MAX_AGE,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="strict",
+    )
 
 
 @router.post(
@@ -56,6 +121,7 @@ def _get_ip_address(request: Request) -> str | None:
 async def login(
     payload: LoginRequest,
     request: Request,
+    response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Authenticate with email and password."""
@@ -64,6 +130,7 @@ async def login(
         password=payload.password,
         device_info=_get_device_info(request),
         ip_address=_get_ip_address(request),
+        device_tokens=_get_device_tokens(request),
     )
 
     if "mfa_ticket" in result:
@@ -75,6 +142,7 @@ async def login(
             },
         )
 
+    _set_device_cookie(response, result.get("device_cookie"))
     return success_envelope(
         "Logged in.",
         data={
@@ -98,6 +166,7 @@ async def login(
 async def verify_mfa(
     payload: MfaVerifyRequest,
     request: Request,
+    response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Complete MFA verification after login."""
@@ -106,8 +175,10 @@ async def verify_mfa(
         code=payload.code,
         device_info=_get_device_info(request),
         ip_address=_get_ip_address(request),
+        device_tokens=_get_device_tokens(request),
     )
 
+    _set_device_cookie(response, result.get("device_cookie"))
     return success_envelope(
         "MFA verified. Logged in.",
         data={
@@ -131,6 +202,7 @@ async def verify_mfa(
 async def refresh(
     payload: RefreshTokenRequest,
     request: Request,
+    response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Refresh an access token using a refresh token (rotation pattern)."""
@@ -138,8 +210,10 @@ async def refresh(
         raw_token=payload.refresh_token,
         device_info=_get_device_info(request),
         ip_address=_get_ip_address(request),
+        device_tokens=_get_device_tokens(request),
     )
 
+    _set_device_cookie(response, result.get("device_cookie"))
     return success_envelope(
         "Token refreshed.",
         data={
@@ -209,13 +283,17 @@ async def forgot_password(
 )
 async def reset_password(
     payload: ResetPasswordRequest,
+    request: Request,
+    response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Complete a password reset using a reset token."""
-    await auth_service.reset_password(
+    device_cookie = await auth_service.reset_password(
         raw_token=payload.token,
         new_password=payload.new_password,
+        device_tokens=_get_device_tokens(request),
     )
+    _set_device_cookie(response, device_cookie)
     return success_envelope("Password has been reset successfully.")
 
 
@@ -231,15 +309,19 @@ async def reset_password(
 )
 async def change_password(
     payload: ChangePasswordRequest,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Change the current user's password."""
-    await auth_service.change_password(
+    device_cookie = await auth_service.change_password(
         user_id=current_user.id,
         current_password=payload.current_password,
         new_password=payload.new_password,
+        device_tokens=_get_device_tokens(request),
     )
+    _set_device_cookie(response, device_cookie)
     return success_envelope("Password changed successfully.")
 
 
@@ -278,6 +360,7 @@ async def enroll_mfa(
     description="Confirm MFA enrollment by verifying a TOTP code.",
     responses={
         200: {"description": "MFA has been enabled."},
+        400: {"description": "MFA is already enabled, or no enrollment is in progress."},
         401: {"description": "Invalid MFA code."},
     },
 )
@@ -287,9 +370,11 @@ async def confirm_mfa(
     auth_service: AuthService = Depends(get_auth_service),
 ) -> dict[str, Any]:
     """Confirm MFA enrollment by verifying a TOTP code."""
+    # `payload.secret` is deliberately not passed on: the server confirms
+    # against the pending secret it stored at enrolment, never one from the
+    # client (see AuthService.confirm_mfa).
     await auth_service.confirm_mfa(
         user_id=current_user.id,
-        secret=payload.secret,
         code=payload.code,
     )
     return success_envelope("MFA has been enabled successfully.")

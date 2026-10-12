@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { CalendarClock, CalendarPlus, RotateCw } from 'lucide-react'
 import PageHeader from '@/components/layout/PageHeader'
-import { BookAppointmentDialog } from './BookAppointmentDialog'
+import { BookAppointmentDialog } from '@/components/appointments/BookAppointmentDialog'
 import { DataTable } from '@/components/ui/data-table'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Button } from '@/components/ui/button'
@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useAppointments, type AppointmentStatus } from '@/api/appointments'
 import { usePermissions } from '@/hooks/usePermissions'
 import { todayISODate } from '@/lib/format'
-import { appointmentColumns } from './columns'
+import { appointmentQueueColumns } from './columns'
 
 const PAGE_SIZE = 25
 const ALL = 'all'
@@ -116,7 +116,7 @@ export default function AppointmentsPage() {
         </Alert>
       ) : (
         <DataTable
-          columns={appointmentColumns}
+          columns={appointmentQueueColumns}
           data={appointments}
           isLoading={isPending}
           emptyState={

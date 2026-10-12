@@ -61,6 +61,22 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class ResponseSchema:
+    """A JSON Schema the model's reply must satisfy, passed through to adapters.
+
+    An adapter uses it however its provider supports structured output (a
+    strict schema, a JSON mode, or not at all). The caller still validates the
+    reply itself: the schema narrows what a model can say, it is not the check.
+
+    :param name: Short identifier for the schema (``^[A-Za-z0-9_-]{1,64}$``).
+    :param schema: The JSON Schema object.
+    """
+
+    name: str
+    schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class AIResponse:
     """Normalised response from an AI provider.
 
@@ -71,6 +87,8 @@ class AIResponse:
     :param output_tokens: Token count of the response.
     :param model: The model that produced this response.
     :param cost_estimate_usd: Estimated cost in USD.
+    :param provider: Name of the provider that answered. Filled in by
+        :class:`~app.ai.services.ai_service.AIService`, not by adapters.
     """
 
     content: str
@@ -80,6 +98,7 @@ class AIResponse:
     output_tokens: int = 0
     model: str = ""
     cost_estimate_usd: Decimal = Decimal("0")
+    provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,9 @@ class AIProvider(ABC):
         temperature: float = 0.3,
         tools: list[ToolDefinition] | None = None,
         stream: bool = False,
+        *,
+        response_schema: ResponseSchema | None = None,
+        timeout_seconds: float | None = None,
     ) -> AIResponse | AsyncIterator[AIChunk]:
         """Send a completion request and return the response.
 
@@ -128,6 +150,8 @@ class AIProvider(ABC):
         :param temperature: Sampling temperature (0.0–1.0).
         :param tools: Tool definitions the model may call.
         :param stream: If ``True``, returns an async iterator of chunks.
+        :param response_schema: JSON Schema the reply must satisfy, if any.
+        :param timeout_seconds: Deadline for this call. ``None`` = adapter default.
         :returns: A complete response, or an async iterator of chunks for streaming.
         """
         ...
@@ -178,6 +202,7 @@ __all__ = [
     "AIProvider",
     "AIResponse",
     "Message",
+    "ResponseSchema",
     "ToolCall",
     "ToolDefinition",
 ]

@@ -4,16 +4,19 @@ import {
   Users,
   CalendarDays,
   Receipt,
+  Building2,
+  FlaskConical,
+  Boxes,
+  Hourglass,
   Pill,
-  BarChart3,
-  Sparkles,
+  UserCog,
   ShieldCheck,
   Lock,
   BadgeCheck,
   Server,
   UserPlus,
   Stethoscope,
-  FlaskConical,
+  LogIn,
 } from 'lucide-react'
 import MarketingNav from '@/components/layout/MarketingNav'
 import MarketingFooter from '@/components/layout/MarketingFooter'
@@ -24,31 +27,31 @@ import {
   AccordionContent,
 } from '@/components/ui/accordion'
 
-// Compliance standards (not customer logos — honest signals for a healthcare buyer).
-const COMPLIANCE = [
-  { icon: ShieldCheck, label: 'HIPAA aligned' },
-  { icon: BadgeCheck, label: 'SOC 2 Type II' },
-  { icon: Lock, label: 'End-to-end encryption' },
-  { icon: Server, label: 'Cloud or on-premise' },
+// Controls the application actually implements — not certifications, which it does not hold.
+const SAFEGUARDS = [
+  { icon: ShieldCheck, label: 'Role-based access' },
+  { icon: Server, label: 'Per-hospital data separation' },
+  { icon: Lock, label: 'Hashed passwords, optional MFA' },
+  { icon: BadgeCheck, label: 'Append-only audit log' },
 ]
 
-// The clinical journey the platform runs end to end (Spec 2A workflow).
+// The visit the platform carries end to end today.
 const WORKFLOW = [
-  { icon: UserPlus, title: 'Register', body: 'Admit a patient and open their record in seconds.' },
-  { icon: CalendarDays, title: 'Schedule', body: 'Book the right doctor into an open slot.' },
-  { icon: Stethoscope, title: 'Diagnose', body: 'Chart vitals and history in one clinical view.' },
-  { icon: FlaskConical, title: 'Treat', body: 'Order labs and prescriptions, track results.' },
-  { icon: Receipt, title: 'Bill', body: 'Generate the invoice and reconcile payment.' },
+  { icon: UserPlus, title: 'Register', body: 'Create the patient record, or find it by name, phone, or MRN.' },
+  { icon: CalendarDays, title: 'Schedule', body: "Book the patient into one of the doctor's open slots." },
+  { icon: LogIn, title: 'Check in', body: 'Mark the arrival, or reschedule, cancel, or record a no-show.' },
+  { icon: Stethoscope, title: 'Consult', body: 'The doctor starts and completes the consultation from the queue.' },
+  { icon: Receipt, title: 'Bill', body: 'Issue the invoice and record payments and refunds against it.' },
 ]
 
 const OUTCOMES = [
   {
     title: 'Less time hunting for context',
-    body: 'One record holds every result, note, and medication, so staff stop switching between systems.',
+    body: "A patient's details, medical history, appointments, and invoices sit on one record.",
   },
   {
     title: 'Fewer things slip through',
-    body: 'The AI Copilot flags risks and pending work for review, backing up a long clinical shift.',
+    body: "The day's queue and the invoices awaiting payment sit on one dashboard, and every change is written to the audit log.",
   },
   {
     title: 'Faster front desk',
@@ -58,24 +61,20 @@ const OUTCOMES = [
 
 const FAQ = [
   {
-    q: 'Is patient data secure and HIPAA aligned?',
-    a: 'Every record is encrypted in transit and at rest, access is scoped by role, and every change is written to an immutable audit log. We operate to HIPAA and SOC 2 Type II controls.',
+    q: 'How is patient data protected?',
+    a: "Access is scoped by role and permission, each hospital's data is kept separate, passwords are hashed and accounts can add a second factor, and changes are written to an append-only audit log. Aetheris has not been independently audited and does not currently claim HIPAA compliance or a SOC 2 report.",
   },
   {
-    q: 'Does the AI make clinical decisions on its own?',
-    a: 'No. The AI Copilot surfaces findings, risks, and next steps as suggestions. A clinician reviews and approves every action. The platform is a decision-support tool, not an autonomous one.',
+    q: 'Which modules are available today?',
+    a: 'Patients, doctors and departments, appointments, billing, laboratory orders and results, pharmacy prescribing and dispensing with medicine stock, inventory of supplies by location, reports and role dashboards, notifications, user and role management, hospital settings, and the audit log.',
   },
   {
-    q: 'Can it run on our own infrastructure?',
-    a: 'Yes. Aetheris deploys to our managed cloud or to your own environment, so data can stay inside your network where policy requires it.',
+    q: 'Does Aetheris include AI features today?',
+    a: "One, and it is optional. When booking an appointment, staff can ask for an AI-suggested time slot, chosen from the doctor's open slots. It only suggests: a member of staff reviews it and books the appointment themselves. It is off unless it has been set up and enabled for your hospital, and it never makes a clinical decision.",
   },
   {
     q: 'Will it connect to our existing EHR and lab systems?',
-    a: 'The platform is built around standard integration seams for records, imaging, and lab results. Our team scopes the connections your hospital needs during onboarding.',
-  },
-  {
-    q: 'How long does implementation take?',
-    a: 'A single department can be live in a few weeks. A full multi-department rollout is phased with your team so day-to-day care is never interrupted.',
+    a: 'Not today. No integrations with other record, imaging, or lab systems have been built yet.',
   },
 ]
 
@@ -144,15 +143,16 @@ export default function LandingPage() {
           <div className="space-y-6 md:col-span-6">
             <div className="glassmorphism inline-block rounded-full px-4 py-2">
               <span className="font-label text-label-caps text-secondary font-bold tracking-wider">
-                AI HOSPITAL MANAGEMENT PLATFORM
+                HOSPITAL MANAGEMENT PLATFORM
               </span>
             </div>
             <h1 className="font-display text-gradient text-[2rem] leading-[1.1] font-extrabold tracking-tight sm:text-4xl md:text-headline-xl">
-              Run your whole hospital on one intelligent platform.
+              Run your whole hospital on one connected platform.
             </h1>
             <p className="font-body text-body-md text-on-surface-variant max-w-lg">
-              Patients, scheduling, billing, and clinical work in a single system, with an AI
-              Copilot that reviews the record alongside your team.
+              Patients, appointments, billing, laboratory, pharmacy, and inventory in a single
+              system that your front desk, doctors, lab, pharmacy, stores, and billing staff all
+              share.
             </p>
             <div className="flex flex-wrap gap-4 pt-2">
               <Link
@@ -176,13 +176,13 @@ export default function LandingPage() {
             <div className="from-secondary-fixed to-primary-fixed absolute -inset-4 z-0 rounded-[2rem] bg-gradient-to-tr opacity-20 blur-2xl" />
             <div className="glassmorphism relative z-10 rounded-[2rem] p-8">
               <p className="font-label text-label-caps text-outline mb-6">
-                HOW THE COPILOT ASSISTS
+                FROM ARRIVAL TO PAYMENT
               </p>
               <ol className="space-y-2">
                 {[
-                  { icon: Users, title: 'Connect', body: 'Records, vitals, and results land in one live view.' },
-                  { icon: Sparkles, title: 'Review', body: 'The AI reads the record and flags what needs attention.' },
-                  { icon: ShieldCheck, title: 'Approve', body: 'Your clinician confirms every recommended step.' },
+                  { icon: Users, title: 'Register', body: 'Open a patient record and find it again by name, phone, or MRN.' },
+                  { icon: CalendarDays, title: 'Schedule', body: "Book into a doctor's open slots and run the day's queue." },
+                  { icon: Receipt, title: 'Bill', body: 'Invoice the visit and record payments against it.' },
                 ].map((step, i, arr) => (
                   <li key={step.title} className="relative flex gap-4 pb-6 last:pb-0">
                     {i < arr.length - 1 && (
@@ -207,10 +207,10 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* ── Compliance band ────────────────────────────────────────────────── */}
+      {/* ── Safeguards band ────────────────────────────────────────────────── */}
       <section className="px-container-padding mx-auto max-w-7xl">
         <div className="neo-pressed bg-surface flex flex-wrap items-center justify-center gap-x-10 gap-y-4 rounded-2xl px-6 py-5">
-          {COMPLIANCE.map(({ icon: Icon, label }) => (
+          {SAFEGUARDS.map(({ icon: Icon, label }) => (
             <div key={label} className="text-on-surface-variant flex items-center gap-2">
               <Icon className="text-secondary size-5" />
               <span className="font-label text-label-caps">{label}</span>
@@ -223,32 +223,33 @@ export default function LandingPage() {
       <section id="modules" className="px-container-padding mx-auto mt-24 max-w-7xl scroll-mt-28">
         <div className="mb-10 max-w-2xl">
           <h2 className="font-display text-headline-lg text-primary">
-            Every hospital function, in one place.
+            The front desk, the consulting room, the lab, the pharmacy, stores, and billing in
+            one place.
           </h2>
           <p className="font-body text-body-md text-on-surface-variant mt-3">
-            Each department works in its own module and shares the same patient record, so nothing is
-            re-entered and nothing is lost between teams.
+            Each team works in its own module and shares the same patient record, so nothing is
+            re-entered between them.
           </p>
         </div>
 
-        {/* 3x3: tall AI feature (col 1) + 2x2 modules (cols 2-3) + full-width Reports footer */}
+        {/* Tall roadmap card (col 1) + 2x2 modules (cols 2-3), then Laboratory, Pharmacy, Inventory and a wide Administration card */}
         <div className="grid gap-5 md:grid-cols-3">
           <ModuleCard
             dark
-            icon={Sparkles}
-            title="AI Copilot"
-            body="A context-aware assistant that reads the record, drafts summaries, and flags risks for clinician review across every module."
+            icon={Hourglass}
+            title="On the roadmap"
+            body="More AI assistance is planned. Today the only AI feature is an optional slot suggestion when booking, where it has been enabled."
             className="md:row-span-2"
           />
           <ModuleCard
             icon={Users}
             title="Patients"
-            body="A searchable registry with full history, admissions, and documents per patient."
+            body="A searchable registry with each patient's details, medical history, appointments, and invoices."
           />
           <ModuleCard
             icon={CalendarDays}
             title="Appointments"
-            body="Doctor availability, booking, and the daily queue in one calendar."
+            body="Slot booking against doctor availability, rescheduling, and the daily queue from check-in to completion."
           />
           <ModuleCard
             icon={Receipt}
@@ -256,14 +257,29 @@ export default function LandingPage() {
             body="Invoices, payments, and refunds tied to each visit."
           />
           <ModuleCard
-            icon={Pill}
-            title="Pharmacy & Lab"
-            body="Prescriptions and lab orders tracked from request to result."
+            icon={Building2}
+            title="Doctors & departments"
+            body="Doctor profiles with specialty and consultation fee, listed by department. A doctor's open slots are offered when booking."
           />
           <ModuleCard
-            icon={BarChart3}
-            title="Reports & Analytics"
-            body="Revenue, occupancy, and clinical activity in live dashboards across the hospital."
+            icon={FlaskConical}
+            title="Laboratory"
+            body="Tests ordered from a visit, sample collection, result entry checked against the hospital's own reference ranges, release, and recorded corrections."
+          />
+          <ModuleCard
+            icon={Pill}
+            title="Pharmacy"
+            body="Medicines prescribed from a visit and dispensed from batch-tracked stock, with the charge added to the patient's invoice. A medicine catalog, vendors, and purchase orders for restocking."
+          />
+          <ModuleCard
+            icon={Boxes}
+            title="Inventory"
+            body="Supplies tracked by location and batch: recording what is used, transfers between locations, count corrections, a full movement ledger, low-stock flags against each item's reorder point, and purchase orders."
+          />
+          <ModuleCard
+            icon={UserCog}
+            title="Administration"
+            body="Users and roles with permission-based access, in-app notifications, hospital settings, and an audit log that can be exported."
             className="md:col-span-3"
           />
         </div>

@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+from app.core.charges import Charge, ChargeSink
 from app.core.exceptions import BusinessRuleError, ConfigurationError, ValidationError
 from app.models.billing import InvoiceStatus, PaymentMethod
 from app.services.appointment_service import InvoiceDraftSink
@@ -31,11 +32,14 @@ from app.services.billing_service import (
     BillingInvoiceDraftSink,
     BillingService,
     CashOnlyPaymentError,
+    DiscountAwaitingApprovalError,
     DuplicateAppointmentInvoiceError,
     IdempotencyKeyReuseError,
     InvalidInvoiceStateError,
     InvoiceNotFoundError,
+    NoDiscountToApproveError,
     OverpaymentError,
+    RefundExceedsPaidError,
 )
 from app.tests.conftest import FakeSession, RecordingAuditSink
 from app.tests.factories import (
@@ -44,6 +48,8 @@ from app.tests.factories import (
     build_invoice_model,
     build_payment_model,
     build_record_payment_request,
+    build_record_refund_request,
+    build_refund_model,
     build_service_model,
     build_update_invoice_request,
     build_void_request,
@@ -107,11 +113,30 @@ def _invoice_repo() -> AsyncMock:
     async def create_payment(*, invoice: Any, **fields: Any) -> Any:
         return build_payment_model(hospital_id=invoice.hospital_id, invoice_id=invoice.id, **fields)
 
+    async def append_items(invoice: Any, lines: list[dict[str, Any]]) -> None:
+        start = len(invoice.items)
+        invoice.items = [
+            *invoice.items,
+            *(
+                build_invoice_item_model(
+                    hospital_id=invoice.hospital_id, position=start + offset, **line
+                )
+                for offset, line in enumerate(lines)
+            ),
+        ]
+
+    repo.append_items.side_effect = append_items
     repo.create_invoice.side_effect = create_invoice
     repo.update_invoice.side_effect = update_invoice
     repo.replace_items.side_effect = replace_items
+
+    async def create_refund(*, invoice: Any, **fields: Any) -> Any:
+        return build_refund_model(hospital_id=invoice.hospital_id, invoice_id=invoice.id, **fields)
+
     repo.create_payment.side_effect = create_payment
+    repo.create_refund.side_effect = create_refund
     repo.get_payment_by_idempotency_key.return_value = None
+    repo.get_refund_by_idempotency_key.return_value = None
     repo.get_live_invoice_for_appointment.return_value = None
     return repo
 
@@ -125,6 +150,7 @@ def _make_service(
     appointments: AsyncMock | None = None,
     doctors: AsyncMock | None = None,
     hospitals: AsyncMock | None = None,
+    notifier: AsyncMock | None = None,
 ) -> tuple[BillingService, FakeSession, RecordingAuditSink]:
     """Assemble a service over mocked collaborators, defaulting to a valid world."""
     session = FakeSession()
@@ -157,6 +183,7 @@ def _make_service(
         hospitals,
         session,  # type: ignore[arg-type]
         audit,
+        notifier=notifier,
     )
     return service, session, audit
 
@@ -467,6 +494,112 @@ class TestDraftFromAppointment:
         repo.create_invoice.assert_not_awaited()
         assert session.commits == 0
         assert audit.events == []
+
+    async def _complete_with(
+        self, repo: AsyncMock, existing: Any, *, locked: Any = None
+    ) -> tuple[Any, FakeSession, RecordingAuditSink, uuid.UUID]:
+        """Complete a visit whose live invoice is ``existing``."""
+        appointment_id = existing.appointment_id
+        repo.get_live_invoice_for_appointment.return_value = existing
+        repo.get_invoice_for_update.return_value = existing if locked is None else locked
+        appointments = AsyncMock()
+        appointments.get_appointment_by_id.return_value = _appointment(fee="800.00")
+        service, session, audit = _make_service(repo, appointments=appointments)
+
+        result = await service.draft_from_appointment(
+            HOSPITAL_ID, appointment_id, actor_id=ACTOR_ID
+        )
+        return result, session, audit, appointment_id
+
+    async def test_the_fee_joins_a_draft_a_charge_raised_mid_visit(self, repo: AsyncMock) -> None:
+        # A lab test ordered during the consultation raised the visit's draft
+        # before the visit completed. The fee must not be lost to it.
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID, appointment_id=uuid.uuid4(), consultation_fee_pending=True
+        )
+
+        result, session, audit, _ = await self._complete_with(repo, draft)
+
+        assert result is not None
+        assert result.id == draft.id
+        assert [item.description for item in result.items][-1] == "Consultation — Dr. Priya Sharma"
+        # 500.00 already there, plus the 800.00 fee.
+        assert result.total == Decimal("1300.00")
+        assert draft.consultation_fee_pending is False
+        repo.create_invoice.assert_not_awaited()
+        assert session.commits == 1
+        assert audit.actions() == ["invoice.charges_added"]
+        assert audit.last().context["source"] == "appointment"
+
+    async def test_the_fee_is_added_to_a_charge_raised_draft_only_once(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID, appointment_id=uuid.uuid4(), consultation_fee_pending=True
+        )
+        await self._complete_with(repo, draft)
+
+        result, _, audit, _ = await self._complete_with(repo, draft)
+
+        assert result is None
+        assert draft.total == Decimal("1300.00")
+        assert audit.events == []
+
+    async def test_a_second_completion_that_waited_for_the_lock_adds_nothing(
+        self, repo: AsyncMock
+    ) -> None:
+        appointment_id = uuid.uuid4()
+        stale = build_invoice_model(
+            hospital_id=HOSPITAL_ID, appointment_id=appointment_id, consultation_fee_pending=True
+        )
+        settled = build_invoice_model(hospital_id=HOSPITAL_ID, appointment_id=appointment_id)
+
+        result, session, audit, _ = await self._complete_with(repo, stale, locked=settled)
+
+        assert result is None
+        repo.append_items.assert_not_awaited()
+        assert session.commits == 0
+        assert audit.events == []
+
+    async def test_a_charge_raised_invoice_already_issued_gets_the_fee_on_its_own_draft(
+        self, repo: AsyncMock
+    ) -> None:
+        # AC-1: an issued invoice's lines are frozen.
+        issued = _issued(appointment_id=uuid.uuid4(), consultation_fee_pending=True)
+
+        result, session, audit, _ = await self._complete_with(repo, issued)
+
+        assert result is not None
+        assert result.id != issued.id
+        # Only one live invoice may point at a visit.
+        assert result.appointment_id is None
+        assert result.total == Decimal("800.00")
+        assert issued.total == Decimal("500.00")
+        assert issued.consultation_fee_pending is False
+        repo.append_items.assert_not_awaited()
+        assert session.commits == 1
+        assert audit.actions() == ["invoice.drafted"]
+
+    async def test_a_charge_raised_draft_voided_meanwhile_is_replaced(
+        self, repo: AsyncMock
+    ) -> None:
+        appointment_id = uuid.uuid4()
+        stale = build_invoice_model(
+            hospital_id=HOSPITAL_ID, appointment_id=appointment_id, consultation_fee_pending=True
+        )
+        voided = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            appointment_id=appointment_id,
+            consultation_fee_pending=True,
+            status=InvoiceStatus.VOID,
+        )
+
+        result, _, audit, _ = await self._complete_with(repo, stale, locked=voided)
+
+        assert result is not None
+        assert result.appointment_id == appointment_id
+        assert result.total == Decimal("800.00")
+        assert audit.actions() == ["invoice.drafted"]
 
     async def test_losing_a_race_to_a_manual_draft_drafts_nothing(self, repo: AsyncMock) -> None:
         repo.create_invoice.side_effect = _integrity_error("uq_invoices_live_appointment")
@@ -1241,6 +1374,692 @@ class TestCashOnly:
         assert result.payment.method is PaymentMethod.UPI
 
 
+# ── Discounts (module spec §5.2, business rule 5, AC-4) ─────────────────────
+
+
+def _with_threshold(percent: Any) -> AsyncMock:
+    """A hospital repository whose hospital sets a discount approval threshold."""
+    hospitals = AsyncMock()
+    hospitals.get_by_id.return_value = _hospital(
+        {"billing": {"discount_approval_threshold_percent": percent}}
+    )
+    return hospitals
+
+
+class TestDiscount:
+    """Setting a discount on a draft. The default draft is one 500.00 line."""
+
+    async def _patch(self, repo: AsyncMock, draft: Any, hospitals: AsyncMock, **fields: Any) -> Any:
+        repo.get_invoice_for_update.return_value = draft
+        service, session, audit = _make_service(repo, hospitals=hospitals)
+        result = await service.update_invoice(
+            HOSPITAL_ID, draft.id, build_update_invoice_request(**fields), actor_id=ACTOR_ID
+        )
+        return result, session, audit
+
+    async def test_a_discount_within_the_threshold_needs_no_approval(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+
+        result, session, audit = await self._patch(
+            repo, draft, _with_threshold("10"), discount_amount="50.00", discount_reason="Staff"
+        )
+
+        # Exactly 10% of 500.00: "above the threshold" is strict.
+        assert result.discount_amount == Decimal("50.00")
+        assert result.discount_reason == "Staff"
+        assert result.discount_pending_approval is False
+        assert result.total == Decimal("450.00")
+        assert session.commits == 1
+        assert audit.last().context["changed"] == ["discount_amount", "discount_reason"]
+
+    async def test_a_discount_above_the_threshold_awaits_approval(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+
+        result, _, audit = await self._patch(
+            repo, draft, _with_threshold("10"), discount_amount="50.01", discount_reason="Hardship"
+        )
+
+        assert result.discount_pending_approval is True
+        assert result.discount_approved_by is None
+        # The total already reflects the discount; only the issue is blocked.
+        assert result.total == Decimal("449.99")
+        assert audit.last().context["discount_pending_approval"] is True
+
+    async def test_with_no_threshold_configured_every_discount_awaits_approval(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+        hospitals = AsyncMock()
+        hospitals.get_by_id.return_value = _hospital({})
+
+        result, _, _ = await self._patch(
+            repo, draft, hospitals, discount_amount="0.01", discount_reason="Rounding"
+        )
+
+        assert result.discount_pending_approval is True
+
+    async def test_tax_is_charged_on_the_undiscounted_lines(self, repo: AsyncMock) -> None:
+        # Business rule 7: total = subtotal + tax_amount - discount_amount.
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            subtotal=Decimal("1000.00"),
+            tax_amount=Decimal("180.00"),
+            total=Decimal("1180.00"),
+        )
+
+        result, _, _ = await self._patch(
+            repo, draft, _with_threshold("50"), discount_amount="100.00", discount_reason="Loyalty"
+        )
+
+        assert result.tax_amount == Decimal("180.00")
+        assert result.total == Decimal("1080.00")
+
+    async def test_a_discount_may_equal_the_subtotal_but_not_exceed_it(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+        result, _, _ = await self._patch(
+            repo, draft, _with_threshold("100"), discount_amount="500.00", discount_reason="Waived"
+        )
+        assert result.total == Decimal("0.00")
+
+        with pytest.raises(ValidationError) as excinfo:
+            await self._patch(
+                repo,
+                build_invoice_model(hospital_id=HOSPITAL_ID),
+                _with_threshold("100"),
+                discount_amount="500.01",
+                discount_reason="Waived",
+            )
+        assert excinfo.value.detail["errors"][0]["field"] == "discount_amount"
+
+    async def test_a_discount_needs_a_reason(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+        repo.get_invoice_for_update.return_value = draft
+        service, session, audit = _make_service(repo, hospitals=_with_threshold("10"))
+
+        with pytest.raises(ValidationError) as excinfo:
+            await service.update_invoice(
+                HOSPITAL_ID, draft.id, build_update_invoice_request(discount_amount="10.00")
+            )
+
+        assert excinfo.value.detail["errors"][0]["field"] == "discount_reason"
+        repo.update_invoice.assert_not_awaited()
+        assert session.commits == 0
+        assert audit.events == []
+
+    async def test_the_existing_reason_carries_over_when_only_the_amount_changes(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("20.00"),
+            discount_reason="Staff",
+            total=Decimal("480.00"),
+        )
+
+        result, _, audit = await self._patch(
+            repo, draft, _with_threshold("10"), discount_amount="30.00"
+        )
+
+        assert result.discount_amount == Decimal("30.00")
+        assert result.discount_reason == "Staff"
+        assert audit.last().context["changed"] == ["discount_amount"]
+
+    async def test_setting_the_discount_to_zero_clears_it_entirely(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_pending_approval=True,
+            total=Decimal("300.00"),
+        )
+
+        result, _, _ = await self._patch(repo, draft, _with_threshold("10"), discount_amount="0")
+
+        assert result.discount_amount == Decimal("0.00")
+        assert result.discount_reason is None
+        assert result.discount_pending_approval is False
+        assert result.total == Decimal("500.00")
+
+    async def test_changing_the_discount_withdraws_an_approval(self, repo: AsyncMock) -> None:
+        approver = uuid.uuid4()
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_approved_by=approver,
+            total=Decimal("300.00"),
+        )
+
+        result, _, _ = await self._patch(
+            repo, draft, _with_threshold("10"), discount_amount="250.00"
+        )
+
+        assert result.discount_approved_by is None
+        assert result.discount_pending_approval is True
+
+    async def test_changing_the_lines_withdraws_an_approval(self, repo: AsyncMock) -> None:
+        # What was approved was 200.00 off a 500.00 bill, not off whatever the
+        # bill is edited into afterwards.
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_approved_by=uuid.uuid4(),
+            total=Decimal("300.00"),
+        )
+
+        result, _, _ = await self._patch(
+            repo,
+            draft,
+            _with_threshold("10"),
+            items=[{"description": "X-ray", "unit_price": "1000.00"}],
+        )
+
+        assert result.subtotal == Decimal("1000.00")
+        assert result.discount_amount == Decimal("200.00")
+        assert result.total == Decimal("800.00")
+        assert result.discount_approved_by is None
+        assert result.discount_pending_approval is True
+
+    async def test_editing_only_the_notes_keeps_an_approval(self, repo: AsyncMock) -> None:
+        approver = uuid.uuid4()
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_approved_by=approver,
+            total=Decimal("300.00"),
+        )
+
+        result, _, _ = await self._patch(repo, draft, _with_threshold("10"), notes="Called patient")
+
+        assert result.discount_approved_by == approver
+        assert result.discount_pending_approval is False
+        assert result.total == Decimal("300.00")
+
+    async def test_shrinking_the_lines_below_the_discount_is_refused_before_any_write(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            total=Decimal("300.00"),
+        )
+        repo.get_invoice_for_update.return_value = draft
+        service, _, _ = _make_service(repo, hospitals=_with_threshold("10"))
+
+        with pytest.raises(ValidationError, match="exceeds the subtotal"):
+            await service.update_invoice(
+                HOSPITAL_ID,
+                draft.id,
+                build_update_invoice_request(
+                    items=[{"description": "Bandage", "unit_price": "50.00"}]
+                ),
+            )
+
+        # The lines were not replaced: validation runs before the first write.
+        repo.replace_items.assert_not_awaited()
+        repo.update_invoice.assert_not_awaited()
+
+    @pytest.mark.parametrize("raw", ["ten", -1, 100.5, "NaN", True, {"nested": 1}])
+    async def test_a_malformed_threshold_means_every_discount_awaits_approval(
+        self, repo: AsyncMock, raw: Any
+    ) -> None:
+        # A bad setting must make the rule stricter, never looser.
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+
+        result, _, _ = await self._patch(
+            repo, draft, _with_threshold(raw), discount_amount="1.00", discount_reason="Test"
+        )
+
+        assert result.discount_pending_approval is True
+
+    async def test_a_missing_hospital_means_every_discount_awaits_approval(
+        self, repo: AsyncMock
+    ) -> None:
+        hospitals = AsyncMock()
+        hospitals.get_by_id.return_value = None
+        service, _, _ = _make_service(repo, hospitals=hospitals)
+
+        assert await service._discount_threshold_percent(HOSPITAL_ID) == Decimal("0.00")
+
+
+class TestDiscountApprovalNotice:
+    """Approvers are told when a discount is waiting for them."""
+
+    async def _patch(self, repo: AsyncMock, draft: Any, **fields: Any) -> AsyncMock:
+        repo.get_invoice_for_update.return_value = draft
+        notifier = AsyncMock()
+        service, _, _ = _make_service(repo, hospitals=_with_threshold("10"), notifier=notifier)
+        await service.update_invoice(
+            HOSPITAL_ID, draft.id, build_update_invoice_request(**fields), actor_id=ACTOR_ID
+        )
+        return notifier
+
+    async def test_a_discount_that_needs_approval_notifies_the_approvers(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+
+        notifier = await self._patch(
+            repo, draft, discount_amount="200.00", discount_reason="Hardship"
+        )
+
+        notifier.notify.assert_awaited_once()
+        request = notifier.notify.await_args.args[0]
+        assert request.kind == "billing.discount_approval_requested"
+        assert request.hospital_id == HOSPITAL_ID
+        # Addressed to whoever can act on it, not to named people.
+        assert request.recipient_permission == "invoice.approve_discount"
+        assert request.recipient_user_ids == ()
+        assert request.actor_id == ACTOR_ID
+        assert request.link == "/billing"
+        assert request.variables["discount_amount"].endswith(" 200.00")
+        assert request.variables["patient_name"]
+        assert request.secret_variables == {}
+
+    async def test_a_discount_within_the_threshold_notifies_nobody(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID)
+
+        notifier = await self._patch(repo, draft, discount_amount="50.00", discount_reason="Staff")
+
+        notifier.notify.assert_not_awaited()
+
+    async def test_an_unrelated_edit_to_a_pending_invoice_does_not_notify_again(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_pending_approval=True,
+            total=Decimal("300.00"),
+        )
+
+        notifier = await self._patch(repo, draft, notes="Call the patient first")
+
+        notifier.notify.assert_not_awaited()
+
+    async def test_changing_a_pending_discount_asks_again(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_pending_approval=True,
+            total=Decimal("300.00"),
+        )
+
+        notifier = await self._patch(repo, draft, discount_amount="250.00")
+
+        notifier.notify.assert_awaited_once()
+        assert notifier.notify.await_args.args[0].variables["discount_amount"].endswith(" 250.00")
+
+
+class TestApproveDiscount:
+    async def test_approval_clears_the_flag_and_records_the_admin(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_pending_approval=True,
+            total=Decimal("300.00"),
+        )
+        repo.get_invoice_for_update.return_value = draft
+        service, session, audit = _make_service(repo)
+
+        result = await service.approve_discount(HOSPITAL_ID, draft.id, actor_id=ACTOR_ID)
+
+        assert result.discount_pending_approval is False
+        assert result.discount_approved_by == ACTOR_ID
+        assert result.status is InvoiceStatus.DRAFT
+        assert session.commits == 1
+        assert audit.actions() == ["invoice.discount_approved"]
+        assert audit.last().context["discount_amount"] == "200.00"
+
+    async def test_nothing_to_approve_is_a_409(self, repo: AsyncMock) -> None:
+        # What the second of two admins approving at once sees (spec §14).
+        repo.get_invoice_for_update.return_value = build_invoice_model(hospital_id=HOSPITAL_ID)
+        service, session, audit = _make_service(repo)
+
+        with pytest.raises(NoDiscountToApproveError) as excinfo:
+            await service.approve_discount(HOSPITAL_ID, uuid.uuid4(), actor_id=ACTOR_ID)
+
+        assert excinfo.value.status_code == 409
+        repo.update_invoice.assert_not_awaited()
+        assert session.commits == 0
+        assert audit.events == []
+
+    async def test_only_a_draft_has_a_discount_to_approve(self, repo: AsyncMock) -> None:
+        repo.get_invoice_for_update.return_value = _issued()
+        service, _, _ = _make_service(repo)
+
+        with pytest.raises(InvalidInvoiceStateError):
+            await service.approve_discount(HOSPITAL_ID, uuid.uuid4(), actor_id=ACTOR_ID)
+
+    async def test_unknown_invoice_is_a_404(self, repo: AsyncMock) -> None:
+        repo.get_invoice_for_update.return_value = None
+        service, _, _ = _make_service(repo)
+
+        with pytest.raises(InvoiceNotFoundError):
+            await service.approve_discount(HOSPITAL_ID, uuid.uuid4(), actor_id=ACTOR_ID)
+
+
+class TestIssueWithDiscount:
+    async def test_ac4_a_pending_discount_blocks_the_issue(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_pending_approval=True,
+            total=Decimal("300.00"),
+        )
+        repo.get_invoice_for_update.return_value = draft
+        sequences = AsyncMock()
+        service, session, _ = _make_service(repo, sequences=sequences)
+
+        with pytest.raises(DiscountAwaitingApprovalError) as excinfo:
+            await service.issue_invoice(HOSPITAL_ID, draft.id)
+
+        assert excinfo.value.status_code == 400
+        # No invoice number is consumed by a refused issue.
+        sequences.advance.assert_not_awaited()
+        assert session.commits == 0
+
+    async def test_an_approved_discount_is_carried_into_the_frozen_total(
+        self, repo: AsyncMock
+    ) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_approved_by=uuid.uuid4(),
+            total=Decimal("1.00"),  # stale on purpose
+        )
+        repo.get_invoice_for_update.return_value = draft
+        service, _, _ = _make_service(repo)
+
+        result = await service.issue_invoice(HOSPITAL_ID, draft.id)
+
+        assert result.status is InvoiceStatus.ISSUED
+        assert result.subtotal == Decimal("500.00")
+        assert result.discount_amount == Decimal("200.00")
+        assert result.total == Decimal("300.00")
+
+    async def test_a_fully_discounted_invoice_is_paid_at_issue(self, repo: AsyncMock) -> None:
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            discount_amount=Decimal("500.00"),
+            discount_reason="Waived",
+            total=Decimal("0.00"),
+        )
+        repo.get_invoice_for_update.return_value = draft
+        service, _, _ = _make_service(repo)
+
+        assert (await service.issue_invoice(HOSPITAL_ID, draft.id)).status is InvoiceStatus.PAID
+
+
+# ── Refunds (module spec §5.5, business rule 10) ────────────────────────────
+
+REFUND_KEY = "refund-key-00000001"
+
+
+def _paid(**overrides: Any) -> Any:
+    """A fully paid 500.00 invoice."""
+    values: dict[str, Any] = {"status": InvoiceStatus.PAID, "amount_paid": Decimal("500.00")}
+    values.update(overrides)
+    return _issued(**values)
+
+
+class TestRecordRefund:
+    async def _refund(
+        self, repo: AsyncMock, invoice: Any, *, key: str = REFUND_KEY, **body: Any
+    ) -> Any:
+        repo.get_invoice_for_update.return_value = invoice
+        service, session, audit = _make_service(repo)
+        result, created = await service.record_refund(
+            HOSPITAL_ID,
+            invoice.id,
+            build_record_refund_request(**body),
+            idempotency_key=key,
+            actor_id=ACTOR_ID,
+        )
+        return result, created, session, audit
+
+    async def test_a_partial_refund_leaves_the_status_alone(self, repo: AsyncMock) -> None:
+        invoice = _paid()
+
+        result, created, session, audit = await self._refund(
+            repo, invoice, amount="200.00", method="upi", reason="ECG not performed"
+        )
+
+        assert created is True
+        assert result.refund.amount == Decimal("200.00")
+        assert result.refund.reason == "ECG not performed"
+        assert result.refund.refunded_by == ACTOR_ID
+        assert result.invoice.status is InvoiceStatus.PAID
+        assert result.invoice.amount_refunded == Decimal("200.00")
+        # What was received is not rewritten.
+        assert result.invoice.amount_paid == Decimal("500.00")
+        assert repo.create_refund.await_args.kwargs["idempotency_key"] == REFUND_KEY
+        assert session.commits == 1
+        assert audit.actions() == ["invoice.refunded"]
+        assert audit.last().changes == {"status": {"before": "paid", "after": "paid"}}
+
+    async def test_refunding_everything_closes_the_invoice_as_refunded(
+        self, repo: AsyncMock
+    ) -> None:
+        invoice = _paid(amount_refunded=Decimal("200.00"))
+
+        result, _, _, audit = await self._refund(repo, invoice, amount="300.00")
+
+        assert result.invoice.status is InvoiceStatus.REFUNDED
+        assert result.invoice.amount_refunded == Decimal("500.00")
+        assert audit.last().changes["status"]["after"] == "refunded"
+
+    async def test_a_part_paid_invoice_can_be_refunded_in_full(self, repo: AsyncMock) -> None:
+        # The gap the core path left: a part-paid invoice could not be undone.
+        invoice = _issued(status=InvoiceStatus.PARTIALLY_PAID, amount_paid=Decimal("200.00"))
+
+        result, _, _, _ = await self._refund(repo, invoice, amount="200.00")
+
+        assert result.invoice.status is InvoiceStatus.REFUNDED
+
+    async def test_rule_10_a_refund_cannot_exceed_what_is_left(self, repo: AsyncMock) -> None:
+        invoice = _paid(amount_refunded=Decimal("200.00"))
+        repo.get_invoice_for_update.return_value = invoice
+        service, session, audit = _make_service(repo)
+
+        with pytest.raises(RefundExceedsPaidError) as excinfo:
+            await service.record_refund(
+                HOSPITAL_ID,
+                invoice.id,
+                build_record_refund_request(amount="300.01"),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+        assert excinfo.value.status_code == 400
+        assert excinfo.value.detail == {"amount": "300.01", "refundable_amount": "300.00"}
+        repo.create_refund.assert_not_awaited()
+        assert invoice.amount_refunded == Decimal("200.00")
+        assert session.commits == 0
+        assert audit.events == []
+
+    @pytest.mark.parametrize(
+        "status",
+        [InvoiceStatus.DRAFT, InvoiceStatus.ISSUED, InvoiceStatus.VOID, InvoiceStatus.REFUNDED],
+    )
+    async def test_only_an_invoice_that_took_money_can_be_refunded(
+        self, repo: AsyncMock, status: InvoiceStatus
+    ) -> None:
+        repo.get_invoice_for_update.return_value = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            status=status,
+            invoice_number=None if status is InvoiceStatus.DRAFT else "INV-2026-000007",
+        )
+        service, session, _ = _make_service(repo)
+
+        with pytest.raises(InvalidInvoiceStateError):
+            await service.record_refund(
+                HOSPITAL_ID,
+                uuid.uuid4(),
+                build_record_refund_request(),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+        repo.create_refund.assert_not_awaited()
+        assert session.commits == 0
+
+    async def test_unknown_invoice_is_a_404(self, repo: AsyncMock) -> None:
+        repo.get_invoice_for_update.return_value = None
+        service, _, _ = _make_service(repo)
+
+        with pytest.raises(InvoiceNotFoundError):
+            await service.record_refund(
+                HOSPITAL_ID,
+                uuid.uuid4(),
+                build_record_refund_request(),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+
+class TestRefundIdempotency:
+    async def test_a_replay_returns_the_original_and_refunds_nothing_more(
+        self, repo: AsyncMock
+    ) -> None:
+        invoice = _paid(status=InvoiceStatus.REFUNDED, amount_refunded=Decimal("500.00"))
+        original = build_refund_model(
+            hospital_id=HOSPITAL_ID,
+            invoice_id=invoice.id,
+            amount=Decimal("500.00"),
+            method=PaymentMethod.UPI,
+        )
+        repo.get_invoice_for_update.return_value = invoice
+        repo.get_refund_by_idempotency_key.return_value = original
+        service, _, audit = _make_service(repo)
+
+        result, created = await service.record_refund(
+            HOSPITAL_ID,
+            invoice.id,
+            build_record_refund_request(amount="500.00", method="upi"),
+            idempotency_key=REFUND_KEY,
+            actor_id=ACTOR_ID,
+        )
+
+        assert created is False
+        assert result.refund.id == original.id
+        # Already `refunded`, so a non-replay would have been refused: the
+        # replay is recognised before the state check.
+        repo.create_refund.assert_not_awaited()
+        repo.update_invoice.assert_not_awaited()
+        assert audit.events == []
+
+    @pytest.mark.parametrize(
+        "difference", [{"amount": "499.00"}, {"method": "cash"}, {"other_invoice": True}]
+    )
+    async def test_a_key_reused_for_a_different_refund_is_a_409(
+        self, repo: AsyncMock, difference: dict[str, Any]
+    ) -> None:
+        invoice = _paid()
+        original = build_refund_model(
+            hospital_id=HOSPITAL_ID,
+            invoice_id=uuid.uuid4() if difference.get("other_invoice") else invoice.id,
+            amount=Decimal("500.00"),
+            method=PaymentMethod.UPI,
+        )
+        repo.get_invoice_for_update.return_value = invoice
+        repo.get_refund_by_idempotency_key.return_value = original
+        service, session, _ = _make_service(repo)
+        body = {"amount": "500.00", "method": "upi"}
+        body.update({k: v for k, v in difference.items() if k != "other_invoice"})
+
+        with pytest.raises(IdempotencyKeyReuseError, match="different refund") as excinfo:
+            await service.record_refund(
+                HOSPITAL_ID,
+                invoice.id,
+                build_record_refund_request(**body),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+        assert excinfo.value.status_code == 409
+        repo.create_refund.assert_not_awaited()
+        assert session.commits == 0
+
+    async def test_a_key_racing_in_on_another_invoice_is_a_409(self, repo: AsyncMock) -> None:
+        invoice = _paid()
+        repo.get_invoice_for_update.return_value = invoice
+        repo.create_refund.side_effect = _integrity_error("uq_refunds_hospital_idempotency_key")
+        service, session, audit = _make_service(repo)
+
+        with pytest.raises(IdempotencyKeyReuseError):
+            await service.record_refund(
+                HOSPITAL_ID,
+                invoice.id,
+                build_record_refund_request(),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+        assert session.savepoints_rolled_back == 1
+        assert session.commits == 0
+        assert audit.events == []
+
+    async def test_any_other_integrity_error_is_not_swallowed(self, repo: AsyncMock) -> None:
+        invoice = _paid()
+        repo.get_invoice_for_update.return_value = invoice
+        repo.create_refund.side_effect = _integrity_error("ck_invoices_refunded_within_paid")
+        service, _, _ = _make_service(repo)
+
+        with pytest.raises(IntegrityError):
+            await service.record_refund(
+                HOSPITAL_ID,
+                invoice.id,
+                build_record_refund_request(),
+                idempotency_key=REFUND_KEY,
+                actor_id=ACTOR_ID,
+            )
+
+
+class TestRefundAndQueueQueries:
+    async def test_list_refunds(self, repo: AsyncMock) -> None:
+        invoice = _paid()
+        repo.get_invoice_by_id.return_value = invoice
+        repo.list_refunds.return_value = [build_refund_model(invoice_id=invoice.id)]
+        service, _, _ = _make_service(repo)
+
+        refunds = await service.list_refunds(HOSPITAL_ID, invoice.id)
+
+        assert [refund.invoice_id for refund in refunds] == [invoice.id]
+        repo.list_refunds.assert_awaited_once_with(HOSPITAL_ID, invoice.id)
+
+    async def test_refunds_are_scoped_through_their_invoice(self, repo: AsyncMock) -> None:
+        doctor_id = uuid.uuid4()
+        repo.get_invoice_by_id.return_value = None
+        service, _, _ = _make_service(repo, doctors=_doctors(doctor_id))
+
+        with pytest.raises(InvoiceNotFoundError):
+            await service.list_refunds(HOSPITAL_ID, uuid.uuid4(), own_visits_of=ACTOR_ID)
+
+        assert repo.get_invoice_by_id.await_args.kwargs == {"doctor_id": doctor_id}
+        repo.list_refunds.assert_not_awaited()
+
+    async def test_the_approval_queue_filter_reaches_list_and_count(self, repo: AsyncMock) -> None:
+        repo.list_invoices.return_value = []
+        repo.count_invoices.return_value = 0
+        service, _, _ = _make_service(repo)
+
+        await service.list_invoices(HOSPITAL_ID, discount_pending=True)
+
+        assert repo.list_invoices.await_args.kwargs["discount_pending"] is True
+        assert repo.count_invoices.await_args.kwargs["discount_pending"] is True
+
+
 # ── Hospital settings ───────────────────────────────────────────────────────
 
 
@@ -1341,3 +2160,190 @@ class TestBillingInvoiceDraftSink:
         await BillingInvoiceDraftSink(billing).draft_invoice_for(
             HOSPITAL_ID, uuid.uuid4(), actor_id=None
         )
+
+
+# ── Charges from other modules ──────────────────────────────────────────────
+
+
+def _charges(*prices: str) -> list[Charge]:
+    return [
+        Charge(description=f"Lab test — T{index}", unit_price=Decimal(price))
+        for index, price in enumerate(prices)
+    ]
+
+
+class TestAddCharges:
+    """Billing's side of the charge seam Laboratory and Pharmacy use."""
+
+    def test_the_service_is_a_charge_sink(self, repo: AsyncMock) -> None:
+        service, _, _ = _make_service(repo)
+
+        assert isinstance(service, ChargeSink)
+
+    async def _add(self, repo: AsyncMock, **overrides: Any) -> tuple[Any, FakeSession, Any]:
+        service, session, audit = _make_service(repo, hospitals=overrides.pop("hospitals", None))
+        values: dict[str, Any] = {
+            "patient_id": PATIENT_ID,
+            "appointment_id": None,
+            "charges": _charges("250.00", "400.00"),
+            "source": "laboratory",
+            "actor_id": ACTOR_ID,
+        }
+        values.update(overrides)
+        return await service.add_charges(HOSPITAL_ID, **values), session, audit
+
+    async def test_no_charges_does_nothing(self, repo: AsyncMock) -> None:
+        invoice_id, _, audit = await self._add(repo, charges=[])
+
+        assert invoice_id is None
+        repo.create_invoice.assert_not_awaited()
+        assert audit.events == []
+
+    async def test_with_no_visit_a_standalone_draft_is_raised(self, repo: AsyncMock) -> None:
+        invoice_id, session, audit = await self._add(repo)
+
+        fields = repo.create_invoice.await_args.kwargs
+        assert invoice_id is not None
+        assert fields["patient_id"] == PATIENT_ID
+        assert fields["appointment_id"] is None
+        assert fields["consultation_fee_pending"] is False
+        assert [line["description"] for line in fields["lines"]] == [
+            "Lab test — T0",
+            "Lab test — T1",
+        ]
+        # Untaxed, like the consultation line, for billing staff to correct.
+        assert {line["tax_rate"] for line in fields["lines"]} == {Decimal("0")}
+        assert fields["subtotal"] == Decimal("650.00")
+        assert fields["total"] == Decimal("650.00")
+        assert audit.last().action == "invoice.drafted"
+        assert audit.last().context["source"] == "laboratory"
+        # The charge belongs to the caller's transaction.
+        assert session.commits == 0
+
+    async def test_a_visit_with_no_invoice_gets_a_linked_draft(self, repo: AsyncMock) -> None:
+        appointment_id = uuid.uuid4()
+
+        await self._add(repo, appointment_id=appointment_id)
+
+        fields = repo.create_invoice.await_args.kwargs
+        assert fields["appointment_id"] == appointment_id
+        # The visit has not completed yet, so its fee is still to come.
+        assert fields["consultation_fee_pending"] is True
+
+    async def test_the_visits_open_draft_takes_the_lines(self, repo: AsyncMock) -> None:
+        appointment_id = uuid.uuid4()
+        draft = build_invoice_model(hospital_id=HOSPITAL_ID, appointment_id=appointment_id)
+        repo.get_live_invoice_for_appointment.return_value = draft
+        repo.get_invoice_for_update.return_value = draft
+
+        invoice_id, session, audit = await self._add(repo, appointment_id=appointment_id)
+
+        assert invoice_id == draft.id
+        repo.create_invoice.assert_not_awaited()
+        assert [item.position for item in draft.items] == [0, 1, 2]
+        # 500.00 already there, plus 250.00 and 400.00.
+        assert draft.subtotal == Decimal("1150.00")
+        assert draft.total == Decimal("1150.00")
+        assert audit.last().action == "invoice.charges_added"
+        assert audit.last().context == {
+            "source": "laboratory",
+            "lines_added": 2,
+            "total": "1150.00",
+        }
+        assert session.commits == 0
+
+    async def test_an_issued_visit_invoice_is_left_alone(self, repo: AsyncMock) -> None:
+        # AC-1: an issued invoice's lines are frozen. The charge goes on a new
+        # draft, which cannot also point at the visit.
+        appointment_id = uuid.uuid4()
+        issued = _issued(appointment_id=appointment_id)
+        repo.get_live_invoice_for_appointment.return_value = issued
+        repo.get_invoice_for_update.return_value = issued
+
+        invoice_id, _, _ = await self._add(repo, appointment_id=appointment_id)
+
+        assert invoice_id != issued.id
+        assert repo.create_invoice.await_args.kwargs["appointment_id"] is None
+        assert repo.create_invoice.await_args.kwargs["consultation_fee_pending"] is False
+        repo.append_items.assert_not_awaited()
+
+    async def test_a_draft_issued_while_we_waited_for_the_lock_is_left_alone(
+        self, repo: AsyncMock
+    ) -> None:
+        appointment_id = uuid.uuid4()
+        repo.get_live_invoice_for_appointment.return_value = build_invoice_model(
+            hospital_id=HOSPITAL_ID, appointment_id=appointment_id
+        )
+        repo.get_invoice_for_update.return_value = _issued(appointment_id=appointment_id)
+
+        await self._add(repo, appointment_id=appointment_id)
+
+        repo.append_items.assert_not_awaited()
+        assert repo.create_invoice.await_args.kwargs["appointment_id"] is None
+
+    async def test_losing_the_race_for_the_visit_falls_back_to_a_standalone_draft(
+        self, repo: AsyncMock
+    ) -> None:
+        appointment_id = uuid.uuid4()
+        create = repo.create_invoice.side_effect
+        calls: list[Any] = []
+
+        async def racing(**fields: Any) -> Any:
+            calls.append(fields["appointment_id"])
+            if len(calls) == 1:
+                raise _integrity_error("uq_invoices_live_appointment")
+            return await create(**fields)
+
+        repo.create_invoice.side_effect = racing
+
+        invoice_id, _, audit = await self._add(repo, appointment_id=appointment_id)
+
+        assert invoice_id is not None
+        assert calls == [appointment_id, None]
+        assert audit.last().action == "invoice.drafted"
+
+    async def test_more_lines_reopen_the_question_of_an_approved_discount(
+        self, repo: AsyncMock
+    ) -> None:
+        appointment_id = uuid.uuid4()
+        approver = uuid.uuid4()
+        draft = build_invoice_model(
+            hospital_id=HOSPITAL_ID,
+            appointment_id=appointment_id,
+            discount_amount=Decimal("200.00"),
+            discount_reason="Hardship",
+            discount_approved_by=approver,
+            total=Decimal("300.00"),
+        )
+        repo.get_live_invoice_for_appointment.return_value = draft
+        repo.get_invoice_for_update.return_value = draft
+
+        await self._add(repo, appointment_id=appointment_id, hospitals=_with_threshold("10"))
+
+        # 200.00 off 1150.00 is still above 10%, and the approval is withdrawn.
+        assert draft.total == Decimal("950.00")
+        assert draft.discount_pending_approval is True
+        assert draft.discount_approved_by is None
+
+    async def test_a_long_description_is_cut_to_the_column_width(self, repo: AsyncMock) -> None:
+        await self._add(repo, charges=[Charge(description="x" * 500, unit_price=Decimal("1.00"))])
+
+        [line] = repo.create_invoice.await_args.kwargs["lines"]
+        assert len(line["description"]) == 200
+
+    async def test_quantity_multiplies_the_line(self, repo: AsyncMock) -> None:
+        await self._add(
+            repo,
+            charges=[
+                Charge(
+                    description="Paracetamol 500mg",
+                    unit_price=Decimal("2.50"),
+                    quantity=Decimal(10),
+                )
+            ],
+            source="pharmacy",
+        )
+
+        fields = repo.create_invoice.await_args.kwargs
+        assert fields["lines"][0]["line_total"] == Decimal("25.00")
+        assert fields["total"] == Decimal("25.00")

@@ -17,21 +17,33 @@ from __future__ import annotations
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
 
 from app.api.v1 import (
     appointment_router,
     audit_router,
     auth_router,
+    dashboard_router,
     department_router,
     doctor_router,
     health_router,
     hospital_router,
+    inventory_router,
     invoice_router,
+    lab_order_router,
+    medicine_router,
+    notification_router,
+    patient_app_router,
     patient_router,
     permission_router,
+    prescription_router,
+    purchase_order_router,
+    report_router,
     role_router,
     service_router,
+    tests_catalog_router,
     user_router,
+    vendor_router,
 )
 from app.core.config import settings
 from app.core.constants import API_DOCS_URL, API_OPENAPI_URL, API_REDOC_URL, API_V1_PREFIX
@@ -225,6 +237,41 @@ def _register_routers(app: FastAPI) -> None:
         prefix=API_V1_PREFIX,
     )
 
+    # Laboratory routes — test catalog and lab orders
+    app.include_router(
+        tests_catalog_router,
+        prefix=API_V1_PREFIX,
+    )
+    app.include_router(
+        lab_order_router,
+        prefix=API_V1_PREFIX,
+    )
+
+    # Pharmacy routes — medicines and stock, prescriptions, vendors, purchase orders
+    for pharmacy_router in (
+        medicine_router,
+        prescription_router,
+        vendor_router,
+        purchase_order_router,
+    ):
+        app.include_router(pharmacy_router, prefix=API_V1_PREFIX)
+
+    # Inventory routes — items, locations, stock and purchase orders
+    app.include_router(
+        inventory_router,
+        prefix=API_V1_PREFIX,
+    )
+
+    # Reports routes — role dashboards, reports and their CSV export
+    for reports_router in (dashboard_router, report_router):
+        app.include_router(reports_router, prefix=API_V1_PREFIX)
+
+    # Notification routes — notification centre, preferences, broadcast
+    app.include_router(
+        notification_router,
+        prefix=API_V1_PREFIX,
+    )
+
     # Roles & Permissions routes (read-only catalog in MVP)
     app.include_router(
         role_router,
@@ -236,6 +283,10 @@ def _register_routers(app: FastAPI) -> None:
         permission_router,
         prefix=API_V1_PREFIX,
     )
+
+    # Patient App (docs/modules/15-patient-app.md §27) — a namespace of its
+    # own under /api/v1/patient, for a principal that is never a staff user.
+    app.include_router(patient_app_router, prefix=API_V1_PREFIX)
 
     logger.debug("routers_registered")
 
@@ -287,6 +338,9 @@ def _register_exception_handlers(app: FastAPI) -> None:
                 errors=exc.detail,
                 request_id=getattr(request.state, "request_id", None),
             ),
+            # Only an error that defines response headers carries any
+            # (the Patient App's Retry-After on a throttled code request).
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -349,11 +403,20 @@ def _register_exception_handlers(app: FastAPI) -> None:
 
         Only logs the detailed error. Never returns stack traces in production.
         """
-        handler_logger.exception(
-            "unhandled_exception",
-            path=str(request.url.path),
-            exc_info=exc,
-        )
+        if isinstance(exc, DBAPIError):
+            # A database error's own text quotes row values. Log its kind only.
+            handler_logger.error(
+                "unhandled_exception",
+                path=str(request.url.path),
+                error_type=type(exc.orig).__name__ if exc.orig else type(exc).__name__,
+                sqlstate=getattr(exc.orig, "sqlstate", None),
+            )
+        else:
+            handler_logger.exception(
+                "unhandled_exception",
+                path=str(request.url.path),
+                exc_info=exc,
+            )
 
         return JSONResponse(
             status_code=500,

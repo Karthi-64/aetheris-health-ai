@@ -4,8 +4,10 @@ Drives the real running backend (uvicorn on :8000) over HTTP, exercising the
 endpoints the profile screen calls — module spec ``02-user-management.md`` §12
 ("Own profile page"):
 
-  1. Invite a fresh user as the admin, then activate them with the invite
-     token, so the flows run as an ordinary low-privilege account.
+  1. Invite a fresh user as the admin, then activate them the way the
+     invited person does: with the link in the email queued for their
+     address. The API never returns that link, so this step reads the queued
+     email from the backend's database (see ``E2E_DB_URL`` below).
   2. GET  /users/me            — the page's initial load.
   3. PATCH /users/me           — name and phone.
   4. PATCH /users/me           — a malformed phone is rejected (422).
@@ -14,20 +16,142 @@ endpoints the profile screen calls — module spec ``02-user-management.md`` §1
   6. POST /auth/password/change — wrong current password is rejected, the
      right one succeeds, and the new password actually logs in.
   7. POST /auth/mfa/enroll → /mfa/confirm is refused with a bad code.
+
+Configuration (environment):
+
+``AETHERIS_API_BASE``
+    Base URL of the running backend. Default ``http://127.0.0.1:8000/api/v1``.
+
+``E2E_DB_URL``
+    Plain ``postgresql://user[:password]@host[:port]/dbname`` URL of the
+    database that backend is using. Required for step 1. It is used for one
+    read-only query: the body of the invitation email queued for the address
+    this run just invited. The script refuses to connect when it is unset,
+    when it is not a plain ``postgresql://`` URL, or when the database is
+    named ``aetheris`` or ``aetheris_test``: point the backend and this
+    variable at a disposable end-to-end database.
+
+The backend must have a mail transport configured (``SMTP_HOST``), otherwise
+no link is ever created and the invite reports ``delivery: unavailable``. For
+the email to still be in the queue when this script reads it, the
+notification worker must not have sent it yet (a sent email's body is erased).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 # Overridable so `make e2e` can follow a non-default BACKEND_PORT.
 BASE = os.environ.get("AETHERIS_API_BASE", "http://127.0.0.1:8000/api/v1")
 failures: list[str] = []
+
+#: Databases this script must never connect to: the developer's working data
+#: and the shared test database.
+FORBIDDEN_DATABASES = frozenset({"aetheris", "aetheris_test"})
+_ACTIVATION_LINK = re.compile(r"/reset-password#token=([A-Za-z0-9_\-]+)")
+
+
+class DatabaseStepRefusedError(Exception):
+    """The step that reads the queued email cannot run as configured."""
+
+
+def e2e_database_url() -> str:
+    """Return ``E2E_DB_URL`` after checking it is safe to connect to.
+
+    :raises DatabaseStepRefusedError: If the variable is unset, is not a plain
+        ``postgresql://`` URL, or names a database this script must not touch.
+    """
+    raw = os.environ.get("E2E_DB_URL", "").strip()
+    if not raw:
+        raise DatabaseStepRefusedError(
+            "E2E_DB_URL is not set. The activation link is no longer returned by the API; "
+            "this step reads it from the email queued in the backend's database. Set "
+            "E2E_DB_URL=postgresql://user@host:5432/<e2e database> (never 'aetheris' or "
+            "'aetheris_test')."
+        )
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme != "postgresql":
+        raise DatabaseStepRefusedError(
+            "E2E_DB_URL must be a plain postgresql:// URL "
+            f"(got scheme {parts.scheme or 'none'!r}; SQLAlchemy forms such as "
+            "postgresql+asyncpg:// are not accepted)."
+        )
+    if parts.query or parts.fragment:
+        # A query string can name a different database than the path does.
+        raise DatabaseStepRefusedError(
+            "E2E_DB_URL must not carry a query string or fragment: the database is taken "
+            "from the path only."
+        )
+    database = urllib.parse.unquote(parts.path.lstrip("/"))
+    if not database or "/" in database:
+        raise DatabaseStepRefusedError("E2E_DB_URL must name exactly one database in its path.")
+    if database.lower() in FORBIDDEN_DATABASES:
+        raise DatabaseStepRefusedError(
+            f"E2E_DB_URL points at {database!r}. This script refuses to connect to "
+            "'aetheris' or 'aetheris_test'; use a disposable end-to-end database."
+        )
+    return raw
+
+
+async def _read_emailed_token(url: str, email: str) -> str:
+    try:
+        import asyncpg  # the backend's own driver; not a new dependency
+    except ImportError as exc:
+        raise DatabaseStepRefusedError(
+            "asyncpg is not importable. Run this script with the backend's Python "
+            "environment (it is already a backend dependency)."
+        ) from exc
+
+    connection = await asyncpg.connect(url, timeout=10)
+    try:
+        # Check what we are really connected to, whatever the URL said.
+        actual = await connection.fetchval("SELECT current_database()")
+        if str(actual).lower() in FORBIDDEN_DATABASES:
+            raise DatabaseStepRefusedError(
+                f"Connected to {actual!r}; refusing to read from 'aetheris' or 'aetheris_test'."
+            )
+        async with connection.transaction(readonly=True):
+            bodies = await connection.fetch(
+                "SELECT body FROM notification_deliveries "
+                "WHERE lower(to_address) = lower($1) ORDER BY created_at DESC",
+                email,
+            )
+    finally:
+        await connection.close()
+
+    if not bodies:
+        raise DatabaseStepRefusedError(
+            f"No email is queued for {email} in this database. Is E2E_DB_URL the database "
+            "the backend is using, and does the backend have SMTP_HOST set?"
+        )
+    for row in bodies:
+        match = _ACTIVATION_LINK.search(row["body"] or "")
+        if match:
+            return match.group(1)
+    raise DatabaseStepRefusedError(
+        f"An email for {email} exists but its body no longer holds a link: the worker "
+        "has already sent it (a sent email's body is erased). Run against a backend whose "
+        "notification worker is stopped, or whose SMTP host does not accept mail."
+    )
+
+
+def emailed_activation_token(email: str) -> str:
+    """Read the activation token from the email queued for ``email``.
+
+    This is the invited person's view: what is in their mailbox. Nothing the
+    API returned is used.
+
+    :raises DatabaseStepRefusedError: If the step may not or cannot run.
+    """
+    return asyncio.run(_read_emailed_token(e2e_database_url(), email))
 
 
 def call(
@@ -86,13 +210,43 @@ def main() -> int:
         {"email": email, "first_name": "Profile", "last_name": "Tester"},
     )
     check("invite fresh user 201", status == 201, str(body)[:300])
-    invite_token = body.get("data", {}).get("invite_token")
-    check("invite returns a token", bool(invite_token))
+    invited = body.get("data", {})
+    # The activation link is a credential for the new account. It is emailed
+    # to the invited address and must never come back to the inviter.
+    check("invite response has NO invite_token", "invite_token" not in invited,
+          "the API returned an activation token to the inviter")
+    check("invite response does not carry an activation link",
+          "token=" not in json.dumps(body) and "reset-password" not in json.dumps(body))
+    delivery = (invited.get("invitation") or {}).get("delivery")
+    check("invite reports invitation.delivery",
+          delivery in ("queued", "unavailable"), f"invitation={invited.get('invitation')!r}")
+    if delivery != "queued":
+        print(
+            "\ncannot continue: the invitation was not queued "
+            f"(delivery={delivery!r}). The backend needs a mail transport (SMTP_HOST) "
+            "for an activation link to exist at all."
+        )
+        return 1
+
+    # Activate as the invited person would: with the link from their email.
+    try:
+        emailed_token = emailed_activation_token(email)
+    except DatabaseStepRefusedError as refusal:
+        print(f"\ncannot continue: {refusal}")
+        return 1
+    except Exception as exc:  # noqa: BLE001 — any connection failure ends the run the same way
+        print(f"\ncannot continue: reading the queued email failed ({type(exc).__name__}).")
+        return 1
+    check("the queued email carries an activation link", bool(emailed_token))
 
     status, body = call(
-        "POST", "/auth/password/reset", body={"token": invite_token, "new_password": original}
+        "POST", "/auth/password/reset", body={"token": emailed_token, "new_password": original}
     )
-    check("activate via invite token 200", status == 200, str(body)[:300])
+    check("activate via the emailed link 200", status == 200, str(body)[:300])
+    status, _ = call(
+        "POST", "/auth/password/reset", body={"token": emailed_token, "new_password": changed}
+    )
+    check("the emailed link works only once (401)", status == 401, f"status={status}")
 
     status, body = call("POST", "/auth/login", body={"email": email, "password": original})
     check("activated user can log in 200", status == 200, str(body)[:300])

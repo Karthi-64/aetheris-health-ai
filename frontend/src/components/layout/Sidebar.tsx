@@ -20,18 +20,16 @@ interface SidebarProps {
   onToggleCollapse: () => void
   mobileOpen: boolean
   onMobileClose: () => void
-  onOpenCopilot: () => void
 }
 
 interface SidebarBodyProps {
   collapsed: boolean
   onToggleCollapse?: () => void
   onNavigate?: () => void
-  onOpenCopilot: () => void
 }
 
 /** Shared inner content — rendered in the persistent desktop rail and the mobile drawer. */
-function SidebarBody({ collapsed, onToggleCollapse, onNavigate, onOpenCopilot }: SidebarBodyProps) {
+function SidebarBody({ collapsed, onToggleCollapse, onNavigate }: SidebarBodyProps) {
   const navigate = useNavigate()
   const { nav, role } = usePermissions()
   const user = useAuthStore((s) => s.user)
@@ -99,18 +97,25 @@ function SidebarBody({ collapsed, onToggleCollapse, onNavigate, onOpenCopilot }:
         ))}
       </nav>
 
-      {/* AI Copilot launcher */}
-      <button
-        onClick={onOpenCopilot}
+      {/* One AI feature exists, and only inside the booking dialog. This stays
+          a notice, not a control: nothing here opens an assistant. */}
+      <div
+        role="note"
+        aria-label="AI assistance is limited to slot suggestions when booking, where enabled"
+        title={collapsed ? 'AI assistance is limited to slot suggestions when booking, where enabled' : undefined}
         className={cn(
-          'neo-extruded bg-primary-container flex items-center gap-3 rounded-xl px-3 py-2.5 font-bold text-white transition-transform active:scale-[0.98]',
+          'border-outline-variant/40 text-on-surface-variant flex items-center gap-3 rounded-xl border border-dashed px-3 py-2.5',
           collapsed && 'justify-center',
         )}
-        title="AI Copilot"
       >
-        <Sparkles className="text-secondary-container size-5 shrink-0" />
-        {!collapsed && <span className="font-label text-label-caps">AI Copilot</span>}
-      </button>
+        <Sparkles className="text-outline size-5 shrink-0" />
+        {!collapsed && (
+          <div className="min-w-0 leading-tight">
+            <p className="font-label text-label-caps">AI assistance</p>
+            <p className="font-body text-outline text-xs">Slot suggestions only, where enabled</p>
+          </div>
+        )}
+      </div>
 
       {/* User — the identity block is the way into the own-profile page, which
           is available to every authenticated user regardless of permissions. */}
@@ -153,7 +158,6 @@ export default function Sidebar({
   onToggleCollapse,
   mobileOpen,
   onMobileClose,
-  onOpenCopilot,
 }: SidebarProps) {
   return (
     <>
@@ -164,11 +168,7 @@ export default function Sidebar({
           collapsed ? 'w-20' : 'w-64',
         )}
       >
-        <SidebarBody
-          collapsed={collapsed}
-          onToggleCollapse={onToggleCollapse}
-          onOpenCopilot={onOpenCopilot}
-        />
+        <SidebarBody collapsed={collapsed} onToggleCollapse={onToggleCollapse} />
       </aside>
 
       {/* Mobile drawer — Radix Sheet: focus trap + Escape + scroll lock (F11). */}
@@ -181,14 +181,7 @@ export default function Sidebar({
           <SheetDescription className="sr-only">
             Primary navigation and account actions
           </SheetDescription>
-          <SidebarBody
-            collapsed={false}
-            onNavigate={onMobileClose}
-            onOpenCopilot={() => {
-              onMobileClose()
-              onOpenCopilot()
-            }}
-          />
+          <SidebarBody collapsed={false} onNavigate={onMobileClose} />
         </SheetContent>
       </Sheet>
     </>

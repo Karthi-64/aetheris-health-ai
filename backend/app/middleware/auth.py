@@ -18,6 +18,13 @@ Two consumers rely on the state this sets:
   rather than to a shared client IP (``docs/06-API_STANDARDS.md`` §15).
 * :mod:`app.middleware.logging` — to correlate a request with its actor.
 
+**Two kinds of principal.** A staff token sets ``user_id`` (and
+``hospital_id``). A Patient App token (``docs/modules/15-patient-app.md``
+§5.6) sets ``patient_account_id`` and nothing else: a patient is never
+represented as a staff user, and in particular never as a ``user_id`` with no
+hospital — which is what a platform administrator looks like. The two
+verifiers refuse each other's tokens, so at most one of the two is ever set.
+
 Deliberately no database access. This runs on *every* request including
 unauthenticated and public ones, so it decodes the signed token and stops
 there; a per-request user lookup here would double the query cost of the API
@@ -34,7 +41,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.core.security import verify_access_token
+from app.core.security import verify_access_token, verify_patient_access_token
 
 logger = structlog.get_logger(__name__)
 
@@ -44,8 +51,9 @@ _BEARER_PREFIX = "Bearer "
 class AuthMiddleware(BaseHTTPMiddleware):
     """Resolve the bearer token to an identity on ``request.state``.
 
-    Sets ``user_id``, ``hospital_id`` and ``raw_token``. All three are ``None``
-    when the request carries no usable access token.
+    Sets ``user_id``, ``hospital_id``, ``patient_account_id`` and
+    ``raw_token``. All are ``None`` when the request carries no usable access
+    token; ``user_id`` and ``patient_account_id`` are never both set.
     """
 
     async def dispatch(
@@ -63,6 +71,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # consumers can read the attributes unconditionally.
         request.state.user_id = None
         request.state.hospital_id = None
+        request.state.patient_account_id = None
         request.state.raw_token = None
 
         auth_header = request.headers.get("Authorization", "")
@@ -90,8 +99,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             payload = verify_access_token(token)
         except pyjwt.InvalidTokenError:
             # Covers expired, malformed, and bad-signature tokens — PyJWT raises
-            # subclasses of InvalidTokenError for all of them.
-            logger.debug("auth_token_unusable", path=request.url.path)
+            # subclasses of InvalidTokenError for all of them. A patient token
+            # lands here too (it carries an audience this verifier does not
+            # expect), and is then identified as what it is.
+            AuthMiddleware._apply_patient_claims(request, token)
             return
 
         if payload.get("type") != "access":
@@ -110,6 +121,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 request.state.hospital_id = uuid.UUID(str(hospital_id))
             except ValueError:
                 logger.debug("auth_token_bad_hospital", path=request.url.path)
+
+    @staticmethod
+    def _apply_patient_claims(request: Request, token: str) -> None:
+        """Identify a Patient App token, if that is what *token* is.
+
+        Sets ``patient_account_id`` only. ``user_id`` and ``hospital_id`` are
+        left ``None``: nothing downstream may take a patient for a staff user.
+
+        :param request: The request whose state is being populated.
+        :param token: A bearer token the staff verifier did not accept.
+        """
+        try:
+            payload = verify_patient_access_token(token)
+            request.state.patient_account_id = uuid.UUID(str(payload["sub"]))
+        except (pyjwt.InvalidTokenError, KeyError, ValueError):
+            logger.debug("auth_token_unusable", path=request.url.path)
 
 
 __all__ = ["AuthMiddleware"]

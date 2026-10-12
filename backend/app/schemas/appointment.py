@@ -13,7 +13,9 @@ from __future__ import annotations
 
 # NOTE: runtime imports, not TYPE_CHECKING — Pydantic resolves field
 # annotations against the module's real globals (backend/CLAUDE.md).
+from datetime import date as DateType  # noqa: N812 — `date` is also a field name below
 from datetime import datetime  # noqa: TC003
+from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Self
 from uuid import UUID  # noqa: TC003
 
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MAX_REASON_LENGTH",
+    "MAX_RECOMMENDATION_DATE",
+    "MIN_RECOMMENDATION_DATE",
     "AppointmentListResponse",
     "AppointmentResponse",
     "AppointmentStatus",
@@ -39,6 +43,7 @@ __all__ = [
     "SlotRecommendation",
     "SlotRecommendationRequest",
     "SlotRecommendationResponse",
+    "SlotRecommendationStatus",
     "StatusHistoryEntryResponse",
 ]
 
@@ -47,6 +52,12 @@ MAX_REASON_LENGTH = 500
 
 #: Reusable bounded reason string.
 ReasonText = Annotated[str, Field(max_length=MAX_REASON_LENGTH)]
+
+#: Days a slot recommendation may be asked for. A fixed range rather than one
+#: relative to today: booking itself has no horizon rule, and a past date inside
+#: the range is valid — it simply has no free slots.
+MIN_RECOMMENDATION_DATE = DateType(2000, 1, 1)
+MAX_RECOMMENDATION_DATE = DateType(2100, 12, 31)
 
 
 def _require_aware(value: datetime, field: str) -> datetime:
@@ -188,43 +199,33 @@ class CancelAppointmentRequest(BaseModel):
 
 
 class SlotRecommendationRequest(BaseModel):
-    """Payload for ``POST /api/v1/appointments/recommend-slot`` (module spec §5.9)."""
+    """Payload for ``POST /api/v1/appointments/recommend-slot`` (module spec §5.9).
+
+    Exactly three fields, all chosen from lists or pickers — no free text and
+    no client-supplied slots. Anything else is rejected (``extra="forbid"``),
+    including a ``hospital_id``: the tenant always comes from the caller.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     patient_id: UUID = Field(description="Patient the appointment is for.")
-    doctor_id: UUID | None = Field(
-        default=None, description="Preferred doctor. Omit to let the model choose."
+    doctor_id: UUID = Field(description="Doctor whose day to choose a slot from.")
+    date: DateType = Field(
+        description="The calendar day, in the hospital's timezone (YYYY-MM-DD).",
     )
-    urgency: str = Field(default="routine", max_length=20, description="routine, soon, or urgent.")
-    preferred_window_start: datetime | None = Field(
-        default=None, description="Earliest acceptable start. Timezone-aware."
-    )
-    preferred_window_end: datetime | None = Field(
-        default=None, description="Latest acceptable start. Timezone-aware."
-    )
-    limit: int = Field(default=3, ge=1, le=10, description="How many ranked slots to return.")
 
-    @field_validator("preferred_window_start", "preferred_window_end")
+    @field_validator("date")
     @classmethod
-    def _aware(cls, value: datetime | None, info: object) -> datetime | None:
-        """Reject naive timestamps in the preferred window."""
-        if value is None:
-            return None
-        name = getattr(info, "field_name", "timestamp")
-        return _require_aware(value, name)
+    def _date_in_supported_range(cls, value: DateType) -> DateType:
+        """Reject a date whose day arithmetic would overflow.
 
-    @model_validator(mode="after")
-    def _check_window(self) -> Self:
-        """Reject an inverted preferred window."""
-        if (
-            self.preferred_window_start is not None
-            and self.preferred_window_end is not None
-            and self.preferred_window_end <= self.preferred_window_start
-        ):
-            msg = "preferred_window_end must be after preferred_window_start."
+        Without the bound, ``9999-12-31`` or ``0001-01-01`` overflows when the
+        local day is converted to UTC, and the caller gets a 500.
+        """
+        if not MIN_RECOMMENDATION_DATE <= value <= MAX_RECOMMENDATION_DATE:
+            msg = "date is outside the supported range."
             raise ValueError(msg)
-        return self
+        return value
 
 
 # ── Responses ───────────────────────────────────────────────────────────────
@@ -357,32 +358,58 @@ class AppointmentResponse(BaseModel):
         )
 
 
+class SlotRecommendationStatus(StrEnum):
+    """Outcome of a slot recommendation that did not fail."""
+
+    RECOMMENDED = "recommended"
+    NO_FREE_SLOTS = "no_free_slots"
+
+
 class SlotRecommendation(BaseModel):
-    """One AI-ranked slot (module spec §13)."""
+    """One AI-suggested slot (module spec §13).
 
-    model_config = ConfigDict(from_attributes=True)
+    The times and the doctor are the server's own values for a slot it
+    computed; only ``reason`` is model-authored.
+    """
 
-    slot_start: datetime = Field(description="Suggested start.")
-    slot_end: datetime = Field(description="Suggested end.")
+    slot_start: datetime = Field(
+        description="Start of the suggested slot, with the hospital's UTC offset."
+    )
+    slot_end: datetime = Field(description="End of the suggested slot.")
     doctor_id: UUID = Field(description="Doctor the slot belongs to.")
-    score: float = Field(ge=0.0, le=1.0, description="Model confidence, 0 to 1.")
-    reason: str = Field(max_length=500, description="Why this slot was suggested.")
+    reason: str | None = Field(
+        default=None,
+        max_length=200,
+        description="AI-generated, untrusted plain text. Null when the model gave none.",
+    )
 
 
 class SlotRecommendationResponse(BaseModel):
-    """Ranked slot suggestions.
+    """The result of asking for one AI slot suggestion.
 
-    The model only ever recommends — reception books (module spec §13,
-    "Safety"). Nothing here reserves a slot, so a suggestion going stale
-    between recommendation and booking is caught by the normal overlap check.
+    The model only ever recommends — a member of staff books (module spec §13,
+    "Safety"). Nothing here reserves a slot. There is deliberately no score,
+    confidence, provider or model field.
     """
 
-    model_config = ConfigDict(from_attributes=True)
-
-    recommendations: list[SlotRecommendation] = Field(
-        default_factory=list, description="Ranked best-first."
+    status: SlotRecommendationStatus = Field(description="recommended or no_free_slots.")
+    recommendation: SlotRecommendation | None = Field(
+        default=None, description="Set exactly when status is 'recommended'."
     )
-    model: str | None = Field(default=None, description="Model that produced the ranking.")
+    date: DateType = Field(description="The requested day, echoed.")
+    timezone: str = Field(description="IANA timezone of the hospital.")
+    candidate_count: int = Field(
+        ge=0, description="How many free slots the server offered the model."
+    )
+
+    @model_validator(mode="after")
+    def _recommendation_matches_status(self) -> Self:
+        """Require a recommendation exactly when the status says there is one."""
+        recommended = self.status is SlotRecommendationStatus.RECOMMENDED
+        if recommended != (self.recommendation is not None):
+            msg = "recommendation must be set exactly when status is 'recommended'."
+            raise ValueError(msg)
+        return self
 
 
 #: One page of appointment summaries — the body of a list response.

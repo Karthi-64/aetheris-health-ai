@@ -45,6 +45,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         request_id: uuid.UUID | None = None,
         ip_address: str | None = None,
         user_agent: str | None = None,
+        patient_account_id: uuid.UUID | None = None,
     ) -> AuditLog:
         """Append one audit entry.
 
@@ -59,6 +60,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
             hospital_id=hospital_id,
             actor_user_id=actor_user_id,
             actor_type=actor_type,
+            patient_account_id=patient_account_id,
             action=action,
             target_type=target_type,
             target_id=target_id,

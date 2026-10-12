@@ -4,8 +4,8 @@ Data access only: no business rules, no HTTP exceptions, ORM models out
 (``docs/03-ARCHITECTURE.md`` §4.4). Every method takes ``hospital_id`` and
 filters on it, including lines and payments (CLAUDE.md rules 4 and 5).
 
-Covers ``invoices``, ``invoice_items`` and ``payments`` because lines and
-payments are never addressed except through their invoice — they are one
+Covers ``invoices``, ``invoice_items``, ``payments`` and ``refunds`` because
+lines, payments and refunds are never addressed except through their invoice — they are one
 consistency boundary. A payment and the ``amount_paid`` it changes must be
 written together, under one lock.
 """
@@ -18,7 +18,14 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Select, func, select
 
 from app.models.appointment import Appointment
-from app.models.billing import Invoice, InvoiceItem, InvoiceStatus, Payment, PaymentMethod
+from app.models.billing import (
+    Invoice,
+    InvoiceItem,
+    InvoiceStatus,
+    Payment,
+    PaymentMethod,
+    Refund,
+)
 from app.repositories.base import BaseRepository
 
 if TYPE_CHECKING:
@@ -54,6 +61,7 @@ class InvoiceRepository(BaseRepository[Invoice]):
         issued_on_or_after: datetime | None = None,
         issued_before: datetime | None = None,
         doctor_id: uuid.UUID | None = None,
+        discount_pending: bool | None = None,
     ) -> Select[tuple[Invoice]]:
         """Apply the filters shared by list and count (module spec §9).
 
@@ -69,6 +77,8 @@ class InvoiceRepository(BaseRepository[Invoice]):
         :param issued_before: Upper bound on ``issued_at``, exclusive.
         :param doctor_id: Only invoices for appointments with this doctor.
             Invoices not tied to an appointment never match.
+        :param discount_pending: Filter on whether a discount awaits approval —
+            ``True`` is the admin's approval queue. ``None`` returns both.
         :returns: The statement with predicates applied.
         """
         if patient_id is not None:
@@ -81,6 +91,8 @@ class InvoiceRepository(BaseRepository[Invoice]):
             stmt = stmt.where(Invoice.issued_at >= issued_on_or_after)
         if issued_before is not None:
             stmt = stmt.where(Invoice.issued_at < issued_before)
+        if discount_pending is not None:
+            stmt = stmt.where(Invoice.discount_pending_approval.is_(discount_pending))
         if doctor_id is not None:
             stmt = stmt.where(
                 Invoice.appointment_id.in_(
@@ -172,6 +184,22 @@ class InvoiceRepository(BaseRepository[Invoice]):
         :param lines: Column values per replacement line, already priced.
         """
         invoice.items = self._build_items(invoice.hospital_id, lines)
+        await self._session.flush()
+
+    async def append_items(self, invoice: Invoice, lines: Sequence[dict[str, Any]]) -> None:
+        """Add lines to the end of a draft, leaving the existing ones alone.
+
+        Used when another module charges something to an open draft. Flushes
+        but does not refresh; the caller follows with :meth:`update_invoice`.
+
+        :param invoice: The attached draft to modify.
+        :param lines: Column values per new line, already priced.
+        """
+        start = max((item.position for item in invoice.items), default=-1) + 1
+        for offset, line in enumerate(lines):
+            invoice.items.append(
+                InvoiceItem(hospital_id=invoice.hospital_id, position=start + offset, **line)
+            )
         await self._session.flush()
 
     async def update_invoice(
@@ -372,6 +400,89 @@ class InvoiceRepository(BaseRepository[Invoice]):
                 Payment.deleted_at.is_(None),
             )
             .order_by(Payment.received_at.asc(), Payment.id.asc())
+        )
+        result = await self._session.execute(stmt)
+        return list(result.unique().scalars().all())
+
+    async def create_refund(
+        self,
+        *,
+        invoice: Invoice,
+        amount: Decimal,
+        method: PaymentMethod,
+        reason: str,
+        refunded_by: uuid.UUID,
+        refunded_at: datetime,
+        idempotency_key: str,
+        reference: str | None = None,
+    ) -> Refund:
+        """Insert a refund row against an invoice.
+
+        Like :meth:`create_payment`, this does *not* touch the invoice's
+        ``amount_refunded`` or status — the service does, so the row and the
+        figures it changes are visibly paired at the call site.
+
+        :param invoice: The invoice being refunded. Supplies the tenant.
+        :param amount: Amount given back.
+        :param method: How the money was returned.
+        :param reason: Why the refund was given.
+        :param refunded_by: User issuing the refund.
+        :param refunded_at: When it was issued (UTC).
+        :param idempotency_key: Client-supplied key.
+        :param reference: Transaction id or other reference.
+        :returns: The persisted refund.
+        """
+        refund = Refund(
+            hospital_id=invoice.hospital_id,
+            invoice_id=invoice.id,
+            amount=amount,
+            method=method,
+            reason=reason,
+            reference=reference,
+            refunded_by=refunded_by,
+            refunded_at=refunded_at,
+            idempotency_key=idempotency_key,
+            created_by=refunded_by,
+        )
+        self._session.add(refund)
+        await self._session.flush()
+        await self._session.refresh(refund)
+        return refund
+
+    async def get_refund_by_idempotency_key(
+        self, hospital_id: uuid.UUID, idempotency_key: str
+    ) -> Refund | None:
+        """Find a refund already issued under this key.
+
+        Not filtered on ``deleted_at``, for the same reason as
+        :meth:`get_payment_by_idempotency_key`: the unique index is not.
+
+        :param hospital_id: The tenant to scope to.
+        :param idempotency_key: The client-supplied key.
+        :returns: The original refund, or ``None``.
+        """
+        stmt = select(Refund).where(
+            Refund.hospital_id == hospital_id,
+            Refund.idempotency_key == idempotency_key,
+        )
+        result = await self._session.execute(stmt)
+        return result.unique().scalar_one_or_none()
+
+    async def list_refunds(self, hospital_id: uuid.UUID, invoice_id: uuid.UUID) -> list[Refund]:
+        """Return an invoice's refunds, oldest first.
+
+        :param hospital_id: The tenant to scope to.
+        :param invoice_id: The invoice whose refunds to read.
+        :returns: Refunds in the order they were issued.
+        """
+        stmt = (
+            select(Refund)
+            .where(
+                Refund.hospital_id == hospital_id,
+                Refund.invoice_id == invoice_id,
+                Refund.deleted_at.is_(None),
+            )
+            .order_by(Refund.refunded_at.asc(), Refund.id.asc())
         )
         result = await self._session.execute(stmt)
         return list(result.unique().scalars().all())

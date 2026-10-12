@@ -21,8 +21,11 @@ holds and tells the service, which applies the limit.
 ``Idempotency-Key`` header (business rule 6). A retry with the same key returns
 the original payment and ``200`` rather than recording a second one.
 
-**Not here yet.** ``approve-discount``, ``refund``, ``pdf`` and ``ai-explain``
-from §9 are not implemented; calling them is a 404.
+**Idempotency.** ``POST /invoices/{id}/payments`` and
+``POST /invoices/{id}/refund`` require an ``Idempotency-Key`` header.
+
+**Not here yet.** ``pdf`` and ``ai-explain`` from §9 are not implemented;
+calling them is a 404.
 """
 
 from __future__ import annotations
@@ -48,6 +51,9 @@ from app.schemas.billing import (
     PaymentRecordedResponse,
     PaymentResponse,
     RecordPaymentRequest,
+    RecordRefundRequest,
+    RefundRecordedResponse,
+    RefundResponse,
     UpdateInvoiceRequest,
     VoidInvoiceRequest,
 )
@@ -173,6 +179,9 @@ async def list_invoices(
     ),
     issued_from: date | None = Query(None, description="Earliest issue date, YYYY-MM-DD."),
     issued_to: date | None = Query(None, description="Latest issue date, YYYY-MM-DD."),
+    discount_pending: bool | None = Query(
+        None, description="`true` for drafts whose discount awaits an admin's approval."
+    ),
     page: int = Query(1, ge=1, description="1-based page number."),
     page_size: int = Query(25, ge=1, le=100, description="Records per page."),
     current_user: User = Depends(require_any_permission(*_READ_PERMISSIONS)),
@@ -186,6 +195,7 @@ async def list_invoices(
         status=invoice_status,
         issued_from=issued_from,
         issued_to=issued_to,
+        discount_pending=discount_pending,
         own_visits_of=_own_visits_scope(current_user),
     )
     return PaginatedResponse[InvoiceSummaryResponse](
@@ -238,7 +248,12 @@ async def get_invoice(
         "Edit a draft (module spec §5.2). **Drafts only** — an issued invoice "
         "cannot be changed and returns `400`.\n\n"
         "`items`, when present, **replaces** the whole line set and the totals "
-        "are recomputed. Omit `items` to leave the lines alone."
+        "are recomputed. Omit `items` to leave the lines alone.\n\n"
+        "`discount_amount` sets an invoice-level discount, as an amount. It "
+        "must not exceed the subtotal and needs a `discount_reason`. Above the "
+        "hospital's threshold the draft comes back with "
+        "`discount_pending_approval: true` and cannot be issued until an admin "
+        "approves it. Changing the discount or the lines withdraws an approval."
     ),
     responses={200: {"description": "Draft updated."}, **_LIFECYCLE_RESPONSES},
 )
@@ -266,7 +281,8 @@ async def update_invoice(
         "Issue a draft (module spec §5.3): recompute and freeze its totals and "
         "assign the hospital's next invoice number.\n\n"
         "Numbers are sequential and gap-free per hospital. The draft must have "
-        "at least one line. A zero-total invoice becomes `paid` immediately."
+        "at least one line, and a discount awaiting approval blocks the issue "
+        "(`400`). A zero-total invoice becomes `paid` immediately."
     ),
     responses={200: {"description": "Invoice issued."}, **_LIFECYCLE_RESPONSES},
 )
@@ -283,12 +299,41 @@ async def issue_invoice(
 
 
 @router.post(
+    "/{invoice_id}/approve-discount",
+    response_model=SuccessResponse[InvoiceResponse],
+    summary="Approve a draft's discount",
+    description=(
+        "Approve a discount that is above the hospital's threshold (module "
+        "spec §5.2), which unblocks the issue.\n\n"
+        "Returns `409` when there is nothing to approve — including for the "
+        "second of two admins approving at the same time."
+    ),
+    responses={
+        200: {"description": "Discount approved."},
+        409: {"description": "No discount is awaiting approval on this invoice."},
+        **_LIFECYCLE_RESPONSES,
+    },
+)
+async def approve_discount(
+    invoice_id: uuid.UUID = Path(description="Invoice UUID."),
+    current_user: User = Depends(require_permission("invoice.approve_discount")),
+    service: BillingService = Depends(get_billing_service),
+) -> SuccessResponse[InvoiceResponse]:
+    """Approve an above-threshold discount on a draft."""
+    invoice = await service.approve_discount(
+        _tenant_of(current_user), invoice_id, actor_id=current_user.id
+    )
+    return SuccessResponse[InvoiceResponse](message="Discount approved.", data=invoice)
+
+
+@router.post(
     "/{invoice_id}/void",
     response_model=SuccessResponse[InvoiceResponse],
     summary="Void an invoice",
     description=(
         "Void an issued invoice (module spec §5.6). A reason is required.\n\n"
-        "Allowed only while the invoice is `issued` and has taken no payment. "
+        "Allowed only while the invoice is `issued` and has taken no payment; "
+        "an invoice that has been paid is refunded instead. "
         "The invoice keeps its number, so the series stays gap-free."
     ),
     responses={200: {"description": "Invoice voided."}, **_LIFECYCLE_RESPONSES},
@@ -389,3 +434,84 @@ async def list_payments(
         _tenant_of(current_user), invoice_id, own_visits_of=_own_visits_scope(current_user)
     )
     return SuccessResponse[list[PaymentResponse]](message="Payments retrieved.", data=payments)
+
+
+# ── Refunds ─────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/{invoice_id}/refund",
+    status_code=status.HTTP_201_CREATED,
+    response_model=SuccessResponse[RefundRecordedResponse],
+    summary="Refund an invoice",
+    description=(
+        "Give money back against an invoice that has taken a payment (module "
+        "spec §5.5). A `reason` is required.\n\n"
+        "An `Idempotency-Key` header is **required**, with the same rules as "
+        "payments: a retry with the same key returns the original refund with "
+        "`200`, and reusing a key for a different refund is a `409`.\n\n"
+        "The amount cannot exceed what is left to refund (`amount_paid` minus "
+        "`amount_refunded`). Refunding everything closes the invoice as "
+        "`refunded`; a partial refund leaves its status unchanged."
+    ),
+    responses={
+        201: {"description": "Refund issued."},
+        200: {"description": "Idempotent replay — the original refund."},
+        400: {"description": "The invoice cannot be refunded, or the amount is too large."},
+        409: {"description": "The Idempotency-Key was used for a different refund."},
+        **_NOT_FOUND_RESPONSE,
+        **_COMMON_RESPONSES,
+    },
+)
+async def record_refund(
+    payload: RecordRefundRequest,
+    response: Response,
+    invoice_id: uuid.UUID = Path(description="Invoice UUID."),
+    idempotency_key: str = Header(
+        alias="Idempotency-Key",
+        min_length=16,
+        max_length=100,
+        description="Client-generated key making retries safe. Required.",
+    ),
+    current_user: User = Depends(require_permission("invoice.refund")),
+    service: BillingService = Depends(get_billing_service),
+) -> SuccessResponse[RefundRecordedResponse]:
+    """Issue a refund, idempotently."""
+    result, created = await service.record_refund(
+        _tenant_of(current_user),
+        invoice_id,
+        payload,
+        idempotency_key=idempotency_key,
+        actor_id=current_user.id,
+    )
+    if not created:
+        # A replay is not a new refund. Returning 201 again would tell the
+        # client it gave the money back twice.
+        response.status_code = status.HTTP_200_OK
+        return SuccessResponse[RefundRecordedResponse](
+            message="Refund already issued with this key.", data=result
+        )
+    return SuccessResponse[RefundRecordedResponse](message="Refund issued.", data=result)
+
+
+@router.get(
+    "/{invoice_id}/refunds",
+    response_model=SuccessResponse[list[RefundResponse]],
+    summary="List an invoice's refunds",
+    description="Return every refund issued against an invoice, oldest first.",
+    responses={
+        200: {"description": "Refunds returned."},
+        **_NOT_FOUND_RESPONSE,
+        **_COMMON_RESPONSES,
+    },
+)
+async def list_refunds(
+    invoice_id: uuid.UUID = Path(description="Invoice UUID."),
+    current_user: User = Depends(require_any_permission(*_READ_PERMISSIONS)),
+    service: BillingService = Depends(get_billing_service),
+) -> SuccessResponse[list[RefundResponse]]:
+    """Return an invoice's refunds."""
+    refunds = await service.list_refunds(
+        _tenant_of(current_user), invoice_id, own_visits_of=_own_visits_scope(current_user)
+    )
+    return SuccessResponse[list[RefundResponse]](message="Refunds retrieved.", data=refunds)

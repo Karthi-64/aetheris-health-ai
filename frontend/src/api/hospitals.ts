@@ -35,10 +35,26 @@ export interface UpdateHospitalSettingsInput {
   settings?: Record<string, unknown>
 }
 
+/** One gated feature, as `GET /hospitals/current/feature-flags` reports it. */
+export interface FeatureFlagState {
+  /** The hospital's stored flag is exactly `true` AND the server is configured to serve the feature. Configured is not the same as reachable. */
+  available: boolean
+}
+
+/** Answer of `GET /hospitals/current/feature-flags`. */
+export interface FeatureFlags {
+  /** Only the well-known flag keys; never other hospital settings. */
+  flags: Record<string, FeatureFlagState>
+}
+
+/** AI slot suggestions in the booking dialog. */
+export const AI_SLOT_RECOMMENDATION_FLAG = 'feature.ai.slot_recommendation'
+
 export const hospitalKeys = {
   all: ['hospitals'] as const,
   current: () => [...hospitalKeys.all, 'current'] as const,
   full: () => [...hospitalKeys.all, 'full'] as const,
+  featureFlags: () => [...hospitalKeys.all, 'feature-flags'] as const,
 }
 
 /** Public hospital record — used by any authenticated shell. */
@@ -58,6 +74,33 @@ export function useHospitalSettings(enabled = true) {
     enabled,
     staleTime: 60_000,
   })
+}
+
+/**
+ * Which gated features this hospital can use right now. Any signed-in user may
+ * read it. Never retried: a caller treats anything but an explicit
+ * `available: true` as "not available".
+ */
+export function useFeatureFlags(enabled = true) {
+  return useQuery({
+    queryKey: hospitalKeys.featureFlags(),
+    queryFn: () => http.get<FeatureFlags>('/hospitals/current/feature-flags'),
+    enabled,
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+}
+
+/**
+ * True only when the capability read says the flag is available. Loading, a
+ * failed read or a body of another shape all mean "no".
+ */
+export function isFeatureAvailable(flags: unknown, key: string): boolean {
+  if (typeof flags !== 'object' || flags === null) return false
+  const map = (flags as { flags?: unknown }).flags
+  if (typeof map !== 'object' || map === null) return false
+  const state = (map as Record<string, unknown>)[key]
+  return typeof state === 'object' && state !== null && (state as { available?: unknown }).available === true
 }
 
 /** PATCH /hospitals/current — requires settings.update. */

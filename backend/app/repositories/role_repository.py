@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import Select, or_
 from sqlalchemy.orm import selectinload
 
+from app.core.tenancy import CrossTenant, TenantScopeRequiredError
 from app.models.role import Role, RolePermission
 from app.repositories.base import BaseRepository
 
@@ -82,6 +83,30 @@ class RoleRepository(BaseRepository[Role]):
             **kwargs,
         )
 
+    async def get_by_id(
+        self, id: uuid.UUID, scope: uuid.UUID | CrossTenant | None = None
+    ) -> Role | None:
+        """Retrieve a role by id, as one hospital can see it.
+
+        Overrides the base lookup because ``roles.hospital_id`` is nullable: a
+        hospital sees its own roles **and** the shared roles that belong to no
+        hospital. It never sees another hospital's role.
+
+        :param id: The role's UUID.
+        :param scope: The trusted hospital id, or a ``cross_tenant(...)``
+            marker for a platform-level actor.
+        :returns: The role, or ``None`` if it is absent or another hospital's.
+        :raises TenantScopeRequiredError: If no scope was given.
+        """
+        if scope is None:
+            msg = "RoleRepository.get_by_id() needs a hospital id or an explicit cross_tenant(...)."
+            raise TenantScopeRequiredError(msg)
+        stmt = self._query().where(Role.id == id)
+        if not isinstance(scope, CrossTenant):
+            stmt = stmt.where(or_(Role.hospital_id == scope, Role.hospital_id.is_(None)))
+        result = await self._session.execute(stmt)
+        return result.unique().scalar_one_or_none()
+
     async def get_by_name(self, hospital_id: uuid.UUID | None, name: str) -> Role | None:
         """Retrieve a role by name within a hospital.
 
@@ -140,7 +165,7 @@ class RoleRepository(BaseRepository[Role]):
         self,
         role_id: uuid.UUID,
         *,
-        hospital_id: uuid.UUID | None = None,
+        hospital_id: uuid.UUID | CrossTenant | None = None,
     ) -> Role | None:
         """Retrieve one role with its permission rows eager-loaded.
 
@@ -149,16 +174,24 @@ class RoleRepository(BaseRepository[Role]):
         triggering an async lazy load.
 
         :param role_id: The role's UUID.
-        :param hospital_id: Optional tenant to scope by. When given, only
-            roles belonging to that hospital or system roles are returned;
-            when ``None``, any role (including another tenant's) can be read
-            — used by the Super Admin path.
+        :param hospital_id: The tenant to scope by: only roles belonging to
+            that hospital or system roles are returned. A platform-level actor
+            (Super Admin) passes a ``cross_tenant(...)`` marker instead, and
+            can then read any role.
         :returns: The role with permissions loaded, or ``None``.
+        :raises TenantScopeRequiredError: If no scope was given. A missing
+            tenant used to mean "any role"; it is now an error.
         """
+        if hospital_id is None:
+            msg = (
+                "RoleRepository.get_with_permissions() needs a hospital id "
+                "or an explicit cross_tenant(...)."
+            )
+            raise TenantScopeRequiredError(msg)
         stmt = self._query().options(
             selectinload(Role.role_permissions).selectinload(RolePermission.permission)
         )
-        if hospital_id is not None:
+        if not isinstance(hospital_id, CrossTenant):
             stmt = stmt.where(
                 or_(
                     Role.hospital_id == hospital_id,

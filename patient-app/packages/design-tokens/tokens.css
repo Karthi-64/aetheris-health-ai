@@ -1,0 +1,222 @@
+/* ============================================================================
+ * @atheris/design-tokens — the Atheris colour, type, spacing, radius and
+ * elevation tokens, plus the dark-mode set.
+ *
+ * COPIED from the `@theme` and `.dark` blocks of `frontend/src/index.css`
+ * (docs/modules/15-patient-app.md §25.3). The two blocks below must stay
+ * identical to that file: `npm run check:tokens` fails on any difference.
+ * Do not edit them here — change the Hospital app's tokens and copy again.
+ * ==========================================================================*/
+
+@theme {
+  /* -- Brand / Material color tokens (names match the Stitch markup) ------- */
+  --color-primary: #000f22; /* deep navy — primary actions, headings   */
+  --color-on-primary: #ffffff;
+  --color-primary-container: #0a2540; /* structural navy surfaces          */
+  --color-on-primary-container: #768dad;
+  --color-primary-fixed: #d2e4ff;
+  --color-primary-fixed-dim: #b0c8eb;
+  --color-inverse-primary: #b0c8eb;
+
+  --color-secondary: #00677e; /* soft teal — supportive UI               */
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #00d2fd; /* AI-electric cyan — the accent   */
+  --color-on-secondary-container: #005669;
+  --color-secondary-fixed: #b4ebff;
+  --color-secondary-fixed-dim: #3cd7ff;
+
+  --color-tertiary: #457b9d;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #00273a;
+  --color-on-tertiary-container: #5c91b4;
+
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+
+  /* Status (from design.md component specs) */
+  --color-critical: #e63946;
+  --color-stable: #2a9d8f;
+
+  /* Surfaces */
+  --color-background: #faf9fb;
+  --color-on-background: #1b1c1e;
+  --color-surface: #faf9fb;
+  --color-surface-dim: #dbd9dc;
+  --color-surface-bright: #faf9fb;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f5f3f6;
+  --color-surface-container: #efedf0;
+  --color-surface-container-high: #e9e8ea;
+  --color-surface-container-highest: #e3e2e5;
+  --color-surface-variant: #e3e2e5;
+  --color-on-surface: #1b1c1e;
+  --color-on-surface-variant: #43474d;
+  --color-inverse-surface: #2f3033;
+  --color-inverse-on-surface: #f2f0f3;
+
+  --color-outline: #74777e;
+  --color-outline-variant: #c4c6ce;
+
+  /* -- shadcn/ui semantic bridge (keeps ui/* components on-brand) --------- */
+  --color-foreground: #1b1c1e;
+  --color-primary-foreground: #ffffff;
+  --color-secondary-foreground: #ffffff;
+  --color-card: #ffffff;
+  --color-card-foreground: #1b1c1e;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #1b1c1e;
+  --color-muted: #efedf0;
+  --color-muted-foreground: #43474d;
+  --color-accent: #00d2fd;
+  --color-accent-foreground: #003544;
+  --color-destructive: #ba1a1a;
+  --color-border: #c4c6ce;
+  --color-input: #c4c6ce;
+  --color-ring: #00d2fd;
+
+  /* Chart palette (Recharts) — cyan/teal/navy family */
+  --color-chart-1: #00d2fd;
+  --color-chart-2: #00677e;
+  --color-chart-3: #0a2540;
+  --color-chart-4: #457b9d;
+  --color-chart-5: #b0c8eb;
+
+  /* -- Typography --------------------------------------------------------- */
+  --font-sans: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+  --font-body: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Public Sans', 'Manrope', ui-sans-serif, sans-serif;
+  --font-label: 'Geist', 'Inter', ui-sans-serif, sans-serif;
+  --font-mono: 'Geist', ui-monospace, monospace;
+
+  --text-headline-xl: 40px;
+  --text-headline-xl--line-height: 52px;
+  --text-headline-xl--letter-spacing: -0.02em;
+  --text-headline-xl--font-weight: 800;
+
+  --text-headline-lg: 32px;
+  --text-headline-lg--line-height: 40px;
+  --text-headline-lg--letter-spacing: -0.01em;
+  --text-headline-lg--font-weight: 700;
+
+  --text-headline-md: 24px;
+  --text-headline-md--line-height: 32px;
+  --text-headline-md--font-weight: 700;
+
+  --text-title-lg: 20px;
+  --text-title-lg--line-height: 28px;
+  --text-title-lg--font-weight: 600;
+
+  --text-body-lg: 16px;
+  --text-body-lg--line-height: 24px;
+
+  --text-body-md: 16px;
+  --text-body-md--line-height: 24px;
+  --text-body-md--font-weight: 500;
+
+  --text-body-sm: 14px;
+  --text-body-sm--line-height: 20px;
+
+  --text-label-caps: 12px;
+  --text-label-caps--line-height: 16px;
+  --text-label-caps--letter-spacing: 0.05em;
+  --text-label-caps--font-weight: 600;
+
+  --text-label-mono: 13px;
+  --text-label-mono--line-height: 18px;
+
+  /* -- Spacing (8px rhythm + named layout units) -------------------------- */
+  --spacing-unit: 8px;
+  --spacing-card-gap: 20px;
+  --spacing-gutter: 24px;
+  --spacing-container-padding: 32px;
+  --spacing-section-margin: 48px;
+
+  /* -- Radii -------------------------------------------------------------- */
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem; /* interactive elements (buttons, inputs)  */
+  --radius-2xl: 1rem; /* large glass cards                        */
+  --radius-3xl: 2rem;
+
+  /* -- Elevation: soft neomorphism + glass ------------------------------- */
+  --shadow-neo-base: -8px -8px 16px #ffffff, 8px 8px 16px #d1d9e6;
+  --shadow-neo-pressed: inset 4px 4px 8px #d1d9e6, inset -4px -4px 8px #ffffff;
+  --shadow-glass-panel: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
+  --shadow-ai-glow: 0 0 0 1px rgba(0, 210, 253, 0.4), 0 0 24px 0 rgba(0, 210, 253, 0.25);
+}
+
+.dark {
+  /* Primary flips to light so headings (text-primary) and primary buttons read
+     on dark surfaces; on-primary becomes the dark ink for the button label. */
+  --color-primary: #cfe1ff;
+  --color-on-primary: #002a4e;
+  --color-primary-container: #1c2a45;
+  --color-on-primary-container: #b8ccef;
+  --color-primary-fixed: #d2e4ff;
+  --color-primary-fixed-dim: #b0c8eb;
+  --color-inverse-primary: #2a4a78;
+
+  --color-secondary: #5cd9ff;
+  --color-on-secondary: #00344a;
+  --color-secondary-container: #00d2fd;
+  --color-on-secondary-container: #00252f;
+  --color-secondary-fixed: #b4ebff;
+  --color-secondary-fixed-dim: #3cd7ff;
+
+  --color-tertiary: #a6c8e6;
+  --color-on-tertiary: #0a2436;
+  --color-tertiary-container: #24425c;
+  --color-on-tertiary-container: #c9def0;
+
+  --color-error: #ffb4ab;
+  --color-on-error: #690005;
+  --color-error-container: #93000a;
+  --color-on-error-container: #ffdad6;
+
+  --color-critical: #ff6b74;
+  --color-stable: #4fd1c0;
+
+  /* Surfaces */
+  --color-background: #0a1120;
+  --color-on-background: #e6e9f0;
+  --color-surface: #0e1626;
+  --color-surface-dim: #090f1c;
+  --color-surface-bright: #1c2a45;
+  --color-surface-container-lowest: #0a1120;
+  --color-surface-container-low: #111b2e;
+  --color-surface-container: #16223a;
+  --color-surface-container-high: #1c2a45;
+  --color-surface-container-highest: #223150;
+  --color-surface-variant: #223150;
+  --color-on-surface: #e6e9f0;
+  --color-on-surface-variant: #b3bccd;
+  --color-inverse-surface: #e3e2e5;
+  --color-inverse-on-surface: #2f3033;
+
+  --color-outline: #8b96a8;
+  --color-outline-variant: #33415c;
+
+  /* shadcn semantic bridge */
+  --color-foreground: #e6e9f0;
+  --color-primary-foreground: #002a4e;
+  --color-secondary-foreground: #00344a;
+  --color-card: #111b2e;
+  --color-card-foreground: #e6e9f0;
+  --color-popover: #111b2e;
+  --color-popover-foreground: #e6e9f0;
+  --color-muted: #16223a;
+  --color-muted-foreground: #b3bccd;
+  --color-accent: #00d2fd;
+  --color-accent-foreground: #00252f;
+  --color-destructive: #ffb4ab;
+  --color-border: #33415c;
+  --color-input: #33415c;
+  --color-ring: #00d2fd;
+
+  /* Neomorphic elevation recomputed for dark surfaces (light highlight fails on
+     dark). Highlight = a lighter navy; shadow = near-black. */
+  --shadow-neo-base: -8px -8px 16px #1a2740, 8px 8px 16px #05090f;
+  --shadow-neo-pressed: inset 4px 4px 8px #05090f, inset -4px -4px 8px #1a2740;
+  --shadow-glass-panel: 0 8px 32px 0 rgba(0, 0, 0, 0.35);
+}

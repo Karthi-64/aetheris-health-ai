@@ -16,6 +16,7 @@ from app.models.appointment import (
     AppointmentType,
 )
 from app.models.audit_log import AuditLog
+from app.models.auth_throttle import AuthThrottleBucket, TrustedDevice
 from app.models.base import (
     Base,
     CommonColumnsMixin,
@@ -31,6 +32,7 @@ from app.models.billing import (
     InvoiceStatus,
     Payment,
     PaymentMethod,
+    Refund,
     Service,
 )
 from app.models.department import Department, DepartmentStatus
@@ -42,14 +44,77 @@ from app.models.doctor import (
     SlotStatus,
 )
 from app.models.hospital import Hospital
+from app.models.inventory import (
+    InventoryItem,
+    InventoryLocation,
+    InventoryLocationKind,
+    InventoryMovement,
+    InventoryMovementReason,
+    InventoryPurchaseOrder,
+    InventoryPurchaseOrderItem,
+    InventoryStock,
+)
+from app.models.lab import (
+    LabOrder,
+    LabOrderItem,
+    LabOrderPriority,
+    LabOrderStatus,
+    LabResultAmendment,
+    LabResultFlag,
+    LabResultType,
+    LabTest,
+)
+from app.models.notification import (
+    DeliveryStatus,
+    Notification,
+    NotificationChannel,
+    NotificationDelivery,
+    NotificationPreference,
+)
 from app.models.password_reset_token import PasswordResetToken
 from app.models.patient import BloodGroup, Gender, MrnSequence, Patient, PatientStatus
+from app.models.patient_account import (
+    LinkRelationship,
+    LinkVerification,
+    PatientAccount,
+    PatientAccountLink,
+    PatientAccountStatus,
+    PatientDevice,
+    PatientOtpChallenge,
+    PatientRefreshToken,
+)
+from app.models.patient_consent import (
+    ConsentPurpose,
+    GranteeType,
+    GrantPurposeNote,
+    GrantStatus,
+    PatientAccessGrant,
+    PatientConsentRecord,
+    RecordCategory,
+)
 from app.models.permission import Permission
+from app.models.pharmacy import (
+    Dispense,
+    DispenseItem,
+    Medicine,
+    MedicineBatch,
+    Prescription,
+    PrescriptionItem,
+    PrescriptionStatus,
+    PurchaseOrder,
+    PurchaseOrderItem,
+    PurchaseOrderStatus,
+    StockMovement,
+    StockMovementReason,
+    Vendor,
+)
 from app.models.refresh_token import RefreshToken
 from app.models.role import Role, RolePermission
 from app.models.user import User, UserRole, UserStatus
 
 __all__ = [
+    "AuthThrottleBucket",
+    "TrustedDevice",
     # Audit
     "AuditLog",
     # Base + mixins
@@ -75,6 +140,22 @@ __all__ = [
     "MrnSequence",
     "Patient",
     "PatientStatus",
+    # Patient App
+    "ConsentPurpose",
+    "GrantPurposeNote",
+    "GrantStatus",
+    "GranteeType",
+    "LinkRelationship",
+    "LinkVerification",
+    "PatientAccessGrant",
+    "PatientAccount",
+    "PatientAccountLink",
+    "PatientAccountStatus",
+    "PatientConsentRecord",
+    "PatientDevice",
+    "PatientOtpChallenge",
+    "PatientRefreshToken",
+    "RecordCategory",
     # Appointment
     "Appointment",
     "AppointmentStatus",
@@ -87,7 +168,46 @@ __all__ = [
     "InvoiceStatus",
     "Payment",
     "PaymentMethod",
+    "Refund",
     "Service",
+    # Inventory
+    "InventoryItem",
+    "InventoryLocation",
+    "InventoryLocationKind",
+    "InventoryMovement",
+    "InventoryMovementReason",
+    "InventoryPurchaseOrder",
+    "InventoryPurchaseOrderItem",
+    "InventoryStock",
+    # Laboratory
+    "LabOrder",
+    "LabOrderItem",
+    "LabOrderPriority",
+    "LabOrderStatus",
+    "LabResultAmendment",
+    "LabResultFlag",
+    "LabResultType",
+    "LabTest",
+    # Pharmacy
+    "Dispense",
+    "DispenseItem",
+    "Medicine",
+    "MedicineBatch",
+    "Prescription",
+    "PrescriptionItem",
+    "PrescriptionStatus",
+    "PurchaseOrder",
+    "PurchaseOrderItem",
+    "PurchaseOrderStatus",
+    "StockMovement",
+    "StockMovementReason",
+    "Vendor",
+    # Notification
+    "DeliveryStatus",
+    "Notification",
+    "NotificationChannel",
+    "NotificationDelivery",
+    "NotificationPreference",
     # Department
     "Department",
     "DepartmentStatus",

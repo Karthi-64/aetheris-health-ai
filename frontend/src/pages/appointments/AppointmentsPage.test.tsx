@@ -21,7 +21,18 @@ vi.mock('@/hooks/usePermissions', () => ({
 vi.mock('@/api/appointments', () => ({
   useAppointments: (p: unknown) => useAppointmentsMock(p),
   useBookAppointment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useAppointmentTransition: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useCancelAppointment: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useMarkNoShow: () => ({ mutateAsync: vi.fn(), isPending: false }),
   appointmentKeys: { all: ['appointments'] },
+}))
+// Each row's (closed) lab-order dialog holds its mutation.
+vi.mock('@/api/lab', () => ({
+  useCreateLabOrder: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}))
+vi.mock('@/api/pharmacy', () => ({
+  useCreatePrescription: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useMedicines: () => ({ data: undefined, isPending: false, isError: false }),
 }))
 // The queue header renders the (closed) BookAppointmentDialog, whose hooks run.
 vi.mock('@/api/doctors', () => ({ useDoctors: () => ({ data: { items: [] } }) }))

@@ -1,8 +1,9 @@
-import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { Link, useLocation } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
+import { isAxiosError } from 'axios'
 import { toast } from 'sonner'
 import { ArrowLeft, CheckCircle, Eye, EyeOff, KeyRound, Loader2 } from 'lucide-react'
 import { Logo } from '@/components/brand/Logo'
@@ -24,19 +25,53 @@ const resetSchema = z
 
 type ResetValues = z.infer<typeof resetSchema>
 
+const RESET_FALLBACK = "Couldn't reset your password. Please try again."
+
+/**
+ * What to tell the user when the reset is refused. The API writes a sentence
+ * for the outcomes a user can act on — a weak password (400), a used or
+ * expired link (401), invalid input (422). Anything else (a 5xx, the network)
+ * gets a fixed sentence rather than transport text.
+ */
+function resetErrorMessage(err: unknown): string {
+  if (isAxiosError(err) && [400, 401, 422].includes(err.response?.status ?? 0)) {
+    const message = (err.response?.data as { message?: unknown } | undefined)?.message
+    if (typeof message === 'string' && message) return message
+  }
+  return RESET_FALLBACK
+}
+
+/** The one-time token from `#token=...`, or from `?token=...` in an older link. */
+function tokenFromLocation(hash: string, search: string): string | null {
+  const fromFragment = new URLSearchParams(hash.replace(/^#/, '')).get('token')
+  return fromFragment || new URLSearchParams(search).get('token') || null
+}
+
 /**
  * Reset Password page (task 5).
  *
- * Receives the reset token from the URL query string (?token=...).
+ * Receives the one-time token from the URL fragment (#token=...). A fragment
+ * is never sent to a server, so the token stays out of access logs and
+ * Referer headers; it is also removed from the address bar and from history
+ * as soon as it has been read. Links sent before the fragment form existed
+ * carry it as ?token=... and are still accepted.
  * Validates the new password (min 12 chars per backend schema),
  * submits to POST /auth/password/reset, and shows a success state.
  */
 export default function ResetPasswordPage() {
-  const [searchParams] = useSearchParams()
-  const token = searchParams.get('token')
+  const location = useLocation()
+  // Read once, on first render: the effect below removes it from the URL.
+  const [token] = useState(() => tokenFromLocation(location.hash, location.search))
+  useEffect(() => {
+    if (token) window.history.replaceState(window.history.state, '', window.location.pathname)
+  }, [token])
   const [success, setSuccess] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
+  // `isSubmitting` only disables the button after a re-render. A second submit
+  // in the same tick would spend the single-use token twice: the first succeeds
+  // and the second reports an invalid link over the success screen.
+  const submitting = useRef(false)
 
   const {
     register,
@@ -115,6 +150,8 @@ export default function ResetPasswordPage() {
 
   // Form state
   async function onSubmit(values: ResetValues) {
+    if (submitting.current) return
+    submitting.current = true
     try {
       await api.post('/auth/password/reset', {
         token,
@@ -122,9 +159,9 @@ export default function ResetPasswordPage() {
       })
       setSuccess(true)
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? err.message : 'Reset link may be invalid or expired.';
-      toast.error(msg);
+      toast.error(resetErrorMessage(err))
+    } finally {
+      submitting.current = false
     }
   }
 
@@ -150,7 +187,7 @@ export default function ResetPasswordPage() {
           </p>
         </div>
 
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-5" noValidate>
+        <form onSubmit={(e) => handleSubmit(onSubmit)(e)} className="space-y-5" noValidate>
           {/* New password */}
           <div className="space-y-2">
             <label htmlFor="password" className="font-label text-label-caps text-on-surface-variant">

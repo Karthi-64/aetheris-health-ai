@@ -57,6 +57,8 @@ __all__ = [
     "InvoiceStatus",
     "Payment",
     "PaymentMethod",
+    "REFUNDABLE_STATUSES",
+    "Refund",
     "Service",
 ]
 
@@ -79,6 +81,12 @@ class PaymentMethod(StrEnum):
 #: total to pay against, and paid/void/refunded are closed.
 PAYABLE_STATUSES: frozenset[InvoiceStatus] = frozenset(
     {InvoiceStatus.ISSUED, InvoiceStatus.PARTIALLY_PAID}
+)
+
+
+#: Statuses in which an invoice holds money that can be given back.
+REFUNDABLE_STATUSES: frozenset[InvoiceStatus] = frozenset(
+    {InvoiceStatus.PARTIALLY_PAID, InvoiceStatus.PAID}
 )
 
 
@@ -201,6 +209,10 @@ class Invoice(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         CheckConstraint("discount_amount <= subtotal", name="discount_within_subtotal"),
         CheckConstraint("amount_paid <= total", name="paid_within_total"),
         CheckConstraint(
+            "amount_refunded >= 0 AND amount_refunded <= amount_paid",
+            name="refunded_within_paid",
+        ),
+        CheckConstraint(
             "status = 'draft' OR invoice_number IS NOT NULL",
             name="number_required_once_issued",
         ),
@@ -218,6 +230,11 @@ class Invoice(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
             postgresql_where=text(
                 "appointment_id IS NOT NULL AND status <> 'void' AND deleted_at IS NULL"
             ),
+        ),
+        Index(
+            "ix_invoices_discount_pending",
+            "hospital_id",
+            postgresql_where=text("discount_pending_approval"),
         ),
         Index("ix_invoices_status", "hospital_id", "status", "issued_at"),
         Index("ix_invoices_patient", "patient_id", text("issued_at DESC")),
@@ -276,6 +293,13 @@ class Invoice(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         nullable=True,
         comment="Admin who approved an above-threshold discount.",
     )
+    discount_pending_approval: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+        comment="The discount is above the hospital's threshold and awaits an admin.",
+    )
     total: Mapped[Decimal] = mapped_column(
         Numeric(15, 2),
         nullable=False,
@@ -289,6 +313,20 @@ class Invoice(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         default=Decimal("0.00"),
         server_default=text("0"),
         comment="Sum of payments recorded. Never exceeds total.",
+    )
+    amount_refunded: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2),
+        nullable=False,
+        default=Decimal("0.00"),
+        server_default=text("0"),
+        comment="Sum of refunds given back. Never exceeds amount_paid.",
+    )
+    consultation_fee_pending: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+        comment="Raised by another module's charge mid-visit; completion still owes the fee.",
     )
     status: Mapped[InvoiceStatus] = mapped_column(
         SQLEnum(
@@ -349,6 +387,11 @@ class Invoice(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
     def balance_due(self) -> Decimal:
         """What is still owed: ``total - amount_paid``."""
         return self.total - self.amount_paid
+
+    @property
+    def refundable_amount(self) -> Decimal:
+        """What can still be given back: ``amount_paid - amount_refunded``."""
+        return self.amount_paid - self.amount_refunded
 
     @property
     def is_editable(self) -> bool:
@@ -509,5 +552,78 @@ class Payment(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
     def __repr__(self) -> str:
         return (
             f"<Payment id={self.id!s:.8} invoice={self.invoice_id!s:.8} "
+            f"amount={self.amount} method={self.method}>"
+        )
+
+
+class Refund(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
+    """Money given back against an invoice. Append-only in practice.
+
+    A separate table rather than a negative :class:`Payment` — see migration
+    0012 for why.
+    """
+
+    __tablename__ = "refunds"
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="amount_positive"),
+        Index(
+            "uq_refunds_hospital_idempotency_key",
+            "hospital_id",
+            "idempotency_key",
+            unique=True,
+        ),
+        Index("ix_refunds_invoice", "invoice_id", "refunded_at"),
+    )
+
+    hospital_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("hospitals.id", ondelete="RESTRICT"),
+        nullable=False,
+        comment="Owning tenant, carried so refunds are directly tenant-filterable.",
+    )
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("invoices.id", ondelete="RESTRICT"),
+        nullable=False,
+        comment="Invoice the refund was made against.",
+    )
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, comment="Amount given back. Always positive."
+    )
+    method: Mapped[PaymentMethod] = mapped_column(
+        SQLEnum(
+            PaymentMethod,
+            name="payment_method",
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=False,
+        comment="How the money was returned.",
+    )
+    reason: Mapped[str] = mapped_column(
+        String(500), nullable=False, comment="Why the refund was given. Required."
+    )
+    reference: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, comment="Transaction id or other reference for the refund."
+    )
+    refunded_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        comment="User who issued the refund.",
+    )
+    refunded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, comment="When the refund was issued (UTC)."
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="Client-supplied key making refund retries safe.",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Refund id={self.id!s:.8} invoice={self.invoice_id!s:.8} "
             f"amount={self.amount} method={self.method}>"
         )

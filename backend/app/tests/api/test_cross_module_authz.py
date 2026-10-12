@@ -48,6 +48,18 @@ READ_ENDPOINTS: list[tuple[str, str]] = [
     ("/api/v1/roles", "role.read"),
     ("/api/v1/hospitals/current/full", "settings.read"),
     ("/api/v1/audit-logs", "audit.read"),
+    # Reports and dashboards. `/dashboards/doctor` is deliberately absent: a
+    # holder of its code who is not a doctor is answered 404, so it cannot sit
+    # in a table that asserts 200 for a bare user. See
+    # `test_doctor_dashboard_denied_without_permission` below. The export route
+    # needs two codes and is covered in `test_reports_api.py`.
+    ("/api/v1/dashboards/admin", "report.admin.read"),
+    ("/api/v1/dashboards/reception", "report.reception.read"),
+    ("/api/v1/dashboards/billing", "report.billing.read"),
+    ("/api/v1/reports/patients", "report.admin.read"),
+    ("/api/v1/reports/appointments", "report.admin.read"),
+    ("/api/v1/reports/revenue", "report.billing.read"),
+    ("/api/v1/reports/outstanding", "report.billing.read"),
 ]
 
 #: (method, path, permission, body) for guarded mutating endpoints. The body
@@ -143,6 +155,16 @@ async def test_read_served_with_permission(
     headers = _headers(await _make_user(db_session, hospital_id, [permission]), hospital_id)
     response = await api.get(path, headers=headers)
     assert response.status_code == 200, f"{path} denied a legitimate holder of {permission}"
+
+
+async def test_doctor_dashboard_denied_without_permission(
+    api: AsyncClient,
+    no_permissions: dict[str, str],
+) -> None:
+    """The doctor dashboard refuses a caller without ``report.doctor.read``."""
+    response = await api.get("/api/v1/dashboards/doctor", headers=no_permissions)
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "PERMISSION_DENIED"
 
 
 @pytest.mark.parametrize(("method", "path", "permission", "body"), MUTATION_ENDPOINTS)

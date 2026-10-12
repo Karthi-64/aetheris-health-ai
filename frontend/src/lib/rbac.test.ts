@@ -21,7 +21,7 @@ describe('rbac', () => {
     // Being able to create patients does not imply the list view: the server
     // requires patient.read for GET /patients, so the nav must not promise it.
     expect(hasAnyPermission(['patient.create'], 'patient.read')).toBe(false)
-    expect(hasAnyPermission(['report.read'], 'patient.read')).toBe(false)
+    expect(hasAnyPermission(['report.admin.read'], 'patient.read')).toBe(false)
     expect(hasAnyPermission(undefined, 'dashboard.view')).toBe(false)
   })
 
@@ -58,6 +58,39 @@ describe('rbac', () => {
     expect(paths).toEqual(expect.arrayContaining(['/dashboard', '/billing', '/reports', '/patients']))
     expect(paths).not.toContain('/settings')
     expect(paths).not.toContain('/users')
+  })
+
+  it('reports are opened by the admin or the billing read code, not by a dashboard-only code', () => {
+    // docs/modules/10-reports-dashboard.md §10: doctors and receptionists have
+    // a dashboard and no report.
+    expect(hasAnyPermission(['report.admin.read'], 'report.admin.read')).toBe(true)
+    expect(hasAnyPermission(['report.billing.read'], 'report.admin.read')).toBe(true)
+    expect(hasAnyPermission(['report.doctor.read'], 'report.admin.read')).toBe(false)
+    expect(hasAnyPermission(['report.reception.read'], 'report.admin.read')).toBe(false)
+    // Exporting alone opens nothing: there is no report to export from.
+    expect(hasAnyPermission(['report.export'], 'report.admin.read')).toBe(false)
+    expect(navForPermissions(MOCK_PERMISSIONS_BY_ROLE.doctor).map((n) => n.to)).not.toContain('/reports')
+    expect(navForPermissions(MOCK_PERMISSIONS_BY_ROLE.hospital_admin).map((n) => n.to)).toContain('/reports')
+  })
+
+  it('each role holds exactly its seeded report codes', () => {
+    const reportCodes = (role: keyof typeof MOCK_PERMISSIONS_BY_ROLE) =>
+      MOCK_PERMISSIONS_BY_ROLE[role].filter((p) => p.startsWith('report.')).sort()
+    const all = [
+      'report.admin.read',
+      'report.billing.read',
+      'report.doctor.read',
+      'report.export',
+      'report.reception.read',
+    ]
+    expect(reportCodes('super_admin')).toEqual(all)
+    expect(reportCodes('hospital_admin')).toEqual(all)
+    expect(reportCodes('doctor')).toEqual(['report.doctor.read'])
+    expect(reportCodes('receptionist')).toEqual(['report.reception.read'])
+    expect(reportCodes('billing_staff')).toEqual(['report.billing.read', 'report.export'])
+    for (const role of ['nurse', 'lab_technician', 'pharmacist', 'inventory_manager'] as const) {
+      expect(reportCodes(role)).toEqual([])
+    }
   })
 
   it('billing is opened by either invoice read code', () => {

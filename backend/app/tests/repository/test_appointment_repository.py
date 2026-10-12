@@ -633,3 +633,188 @@ class TestListingAndQueue:
         ids = {a.id for a in candidates}
         assert overdue.id in ids
         assert finished.id not in ids
+
+
+class TestThePatientsOwnCalendar:
+    """The two queries patient booking decides the patient's own rules with."""
+
+    async def test_overlap_and_count_are_scoped_to_the_patient_and_the_hospital(
+        self,
+        repository: AppointmentRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+    ) -> None:
+        patient_id, doctor_id = await _fixtures(db_session, hospital_id)
+        other_patient, other_doctor = await _fixtures(db_session, hospital_id)
+        foreign_patient, foreign_doctor = await _fixtures(db_session, other_hospital_id)
+        mine = await _book(repository, hospital_id, patient_id, doctor_id)
+        await _book(repository, hospital_id, other_patient, other_doctor)
+        await _book(repository, other_hospital_id, foreign_patient, foreign_doctor)
+        window = (BASE, BASE + timedelta(minutes=15))
+        before = BASE - timedelta(days=1)
+
+        found = await repository.find_overlapping_for_patient(hospital_id, patient_id, *window)
+
+        assert [row.id for row in found] == [mine.id]
+        assert (
+            await repository.find_overlapping_for_patient(other_hospital_id, patient_id, *window)
+            == []
+        )
+        assert (
+            await repository.find_overlapping_for_patient(hospital_id, foreign_patient, *window)
+            == []
+        )
+        assert (
+            await repository.count_upcoming_booked_for_patient(
+                hospital_id, patient_id, after=before
+            )
+            == 1
+        )
+        assert (
+            await repository.count_upcoming_booked_for_patient(
+                other_hospital_id, patient_id, after=before
+            )
+            == 0
+        )
+        assert (
+            await repository.count_upcoming_booked_for_patient(
+                hospital_id, foreign_patient, after=before
+            )
+            == 0
+        )
+
+    async def test_overlap_is_half_open_and_ignores_appointments_that_freed_their_slot(
+        self, repository: AppointmentRepository, db_session: AsyncSession, hospital_id: uuid.UUID
+    ) -> None:
+        patient_id, doctor_id = await _fixtures(db_session, hospital_id)
+        held = await _book(repository, hospital_id, patient_id, doctor_id)
+        end = BASE + timedelta(minutes=15)
+
+        async def overlapping(start: datetime, stop: datetime) -> int:
+            return len(
+                await repository.find_overlapping_for_patient(hospital_id, patient_id, start, stop)
+            )
+
+        assert await overlapping(BASE + timedelta(minutes=10), end + timedelta(minutes=10)) == 1
+        assert await overlapping(end, end + timedelta(minutes=15)) == 0
+        assert await overlapping(BASE - timedelta(minutes=15), BASE) == 0
+        for status in (AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW):
+            await repository.update_appointment(held, status=status)
+            assert await overlapping(BASE, end) == 0
+        for status in (
+            AppointmentStatus.CHECKED_IN,
+            AppointmentStatus.IN_PROGRESS,
+            AppointmentStatus.COMPLETED,
+        ):
+            await repository.update_appointment(held, status=status)
+            assert await overlapping(BASE, end) == 1
+
+    async def test_the_count_is_of_booked_appointments_that_have_not_started(
+        self, repository: AppointmentRepository, db_session: AsyncSession, hospital_id: uuid.UUID
+    ) -> None:
+        patient_id, doctor_id = await _fixtures(db_session, hospital_id)
+        first = await _book(repository, hospital_id, patient_id, doctor_id)
+        await _book(repository, hospital_id, patient_id, doctor_id, offset_minutes=60)
+
+        async def held(after: datetime) -> int:
+            return await repository.count_upcoming_booked_for_patient(
+                hospital_id, patient_id, after=after
+            )
+
+        assert await held(BASE - timedelta(minutes=1)) == 2
+        assert await held(BASE) == 1
+        assert await held(BASE + timedelta(hours=2)) == 0
+        await repository.update_appointment(first, status=AppointmentStatus.CANCELLED)
+        assert await held(BASE - timedelta(minutes=1)) == 1
+
+
+class TestAPatientsOwnAppointmentsAcrossHospitals:
+    """The cross-hospital reads behind "My appointments": owned pairs, or nothing."""
+
+    async def test_only_rows_whose_hospital_and_patient_are_one_pair_are_returned(
+        self,
+        repository: AppointmentRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+    ) -> None:
+        from app.core.tenancy import cross_tenant
+
+        scope = cross_tenant("test: a patient's own appointments")
+        patient_a, doctor_a = await _fixtures(db_session, hospital_id)
+        patient_b, doctor_b = await _fixtures(db_session, other_hospital_id)
+        stranger, stranger_doctor = await _fixtures(db_session, hospital_id)
+        mine_a = await _book(repository, hospital_id, patient_a, doctor_a)
+        mine_b = await _book(repository, other_hospital_id, patient_b, doctor_b, offset_minutes=30)
+        theirs = await _book(repository, hospital_id, stranger, stranger_doctor)
+        pairs = [(hospital_id, patient_a), (other_hospital_id, patient_b)]
+        before = BASE - timedelta(days=1)
+
+        rows, total = await repository.list_for_patient_records(
+            pairs, scope, upcoming=True, now=before
+        )
+
+        assert ([row.id for row in rows], total) == ([mine_a.id, mine_b.id], 2)
+        # A pair is a pair: the right patient at the wrong hospital owns nothing.
+        crossed = [(other_hospital_id, patient_a), (hospital_id, patient_b)]
+        assert await repository.list_for_patient_records(
+            crossed, scope, upcoming=True, now=before
+        ) == ([], 0)
+        assert await repository.list_for_patient_records([], scope, upcoming=True, now=before) == (
+            [],
+            0,
+        )
+        # Confined to one hospital, the other hospital's row is not there.
+        confined, count = await repository.list_for_patient_records(
+            pairs, hospital_id, upcoming=True, now=before
+        )
+        assert ([row.id for row in confined], count) == ([mine_a.id], 1)
+
+        assert (await repository.get_for_patient_records(pairs, scope, mine_b.id)).id == mine_b.id  # type: ignore[union-attr]
+        assert await repository.get_for_patient_records(pairs, scope, theirs.id) is None
+        assert await repository.get_for_patient_records(crossed, scope, mine_a.id) is None
+        assert await repository.get_for_patient_records([], scope, mine_a.id) is None
+        assert await repository.get_for_patient_records(pairs, other_hospital_id, mine_a.id) is None
+
+    async def test_upcoming_and_past_split_on_status_and_end_and_sort_opposite_ways(
+        self, repository: AppointmentRepository, db_session: AsyncSession, hospital_id: uuid.UUID
+    ) -> None:
+        patient_id, doctor_id = await _fixtures(db_session, hospital_id)
+        rows = [
+            await _book(repository, hospital_id, patient_id, doctor_id, offset_minutes=60 * n)
+            for n in range(5)
+        ]
+        await repository.update_appointment(rows[1], status=AppointmentStatus.CANCELLED)
+        await repository.update_appointment(rows[3], status=AppointmentStatus.COMPLETED)
+        await repository.update_appointment(rows[4], status=AppointmentStatus.CHECKED_IN)
+        pairs = [(hospital_id, patient_id)]
+        now = BASE + timedelta(minutes=15)  # the first one has just ended
+
+        async def ids(upcoming: bool, **page: int) -> tuple[list[uuid.UUID], int]:
+            found, total = await repository.list_for_patient_records(
+                pairs, hospital_id, upcoming=upcoming, now=now, **page
+            )
+            return [row.id for row in found], total
+
+        assert await ids(True) == ([rows[2].id, rows[4].id], 2)
+        assert await ids(False) == ([rows[3].id, rows[1].id, rows[0].id], 3)
+        assert await ids(False, skip=1, limit=1) == ([rows[1].id], 3)
+        assert (await ids(True, skip=5))[0] == []
+
+    async def test_locking_reads_the_current_row_of_this_hospital_only(
+        self,
+        repository: AppointmentRepository,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+    ) -> None:
+        patient_id, doctor_id = await _fixtures(db_session, hospital_id)
+        booked = await _book(repository, hospital_id, patient_id, doctor_id)
+
+        locked = await repository.lock_appointment_by_id(hospital_id, booked.id)
+
+        assert locked is not None and locked.id == booked.id
+        assert locked.doctor.id == doctor_id
+        assert await repository.lock_appointment_by_id(other_hospital_id, booked.id) is None
+        assert await repository.lock_appointment_by_id(hospital_id, uuid.uuid4()) is None

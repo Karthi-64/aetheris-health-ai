@@ -21,9 +21,18 @@ from app.schemas.user import (
     UserUpdateRequest,
 )
 from app.services.auth_service import AuthService
-from app.services.user_service import UserService
+from app.services.user_service import InvitationDelivery, UserService
 
 router = APIRouter(prefix="/users", tags=["Users"])
+
+#: What the caller is told when an invitation is sent again. Deliberately
+#: nothing more specific than this: no address, no reason, and never the link.
+_INVITATION_MESSAGES = {
+    InvitationDelivery.QUEUED: "Invitation queued.",
+    InvitationDelivery.UNAVAILABLE: (
+        "No invitation was sent: email delivery is not available. The user stays invited."
+    ),
+}
 
 
 @router.get(
@@ -126,7 +135,10 @@ async def list_users(
 @router.post(
     "",
     summary="Invite a user",
-    description="Create a new user with an invited status.",
+    description=(
+        "Create a new user with an invited status and email them a one-time "
+        "activation link. The link is never returned by the API."
+    ),
     status_code=201,
     responses={
         201: {
@@ -150,7 +162,7 @@ async def list_users(
                             "password_changed_at": None,
                             "created_at": "2026-08-11T10:00:00Z",
                             "updated_at": "2026-08-11T10:00:00Z",
-                            "invite_token": "<single-use credential - returned exactly once, deliver to the invitee, never log or echo>",
+                            "invitation": {"delivery": "queued"},
                         },
                         "metadata": {"request_id": None},
                     }
@@ -168,18 +180,16 @@ async def invite_user(
 ) -> dict[str, Any]:
     """Invite a new user.
 
-    .. note::
-
-        ``data.invite_token`` in the response is a **single-use credential**
-        minted for the invited user. It is returned exactly once so the
-        Notifications module can deliver it to the invitee's email — it must
-        never be logged, stored, or echoed anywhere else
-        (``docs/07-SECURITY.md``).
+    The activation link is emailed to the invited address and is **not** in
+    this response: it is a credential for the new account, and the caller is
+    not its owner. ``data.invitation.delivery`` says only whether an email
+    was queued (``queued``) or could not be sent because email is not set up
+    (``unavailable``).
     """
     # Collect actor's permissions
     actor_permissions = _get_user_permission_codes(current_user)
 
-    user, invite_token = await user_service.invite_user(
+    user, delivery = await user_service.invite_user(
         hospital_id=current_user.hospital_id,
         email=payload.email,
         first_name=payload.first_name,
@@ -200,13 +210,55 @@ async def invite_user(
     ]
 
     data = _user_to_dict(user, roles)
-    # B6 seam: the single-use invite token is handed back here so the
-    # Notifications module can deliver it. Email delivery is out of scope.
-    data["invite_token"] = invite_token
+    data["invitation"] = {"delivery": delivery.value}
 
     return success_envelope(
         "User invited.",
         data=data,
+    )
+
+
+@router.post(
+    "/{user_id}/invitation",
+    summary="Send the invitation again",
+    description=(
+        "Email an invited user a fresh one-time activation link. Any link sent "
+        "earlier stops working. The link is never returned by the API."
+    ),
+    responses={
+        200: {
+            "description": "Whether an invitation email was queued.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "success": True,
+                        "message": "Invitation queued.",
+                        "data": {"delivery": "queued"},
+                        "metadata": {"request_id": None},
+                    }
+                }
+            },
+        },
+        403: {"description": "Permission denied."},
+        404: {"description": "User not found."},
+        409: {"description": "The user is not waiting to activate an invitation."},
+    },
+)
+async def resend_invitation(
+    user_id: str,
+    current_user: User = Depends(require_permission("user.create")),
+    user_service: UserService = Depends(get_user_service),
+) -> dict[str, Any]:
+    """Send an invited user a fresh activation link by email."""
+    delivery = await user_service.resend_invitation(
+        user_id=uuid.UUID(user_id),
+        actor_id=current_user.id,
+        actor_hospital_id=current_user.hospital_id,
+        actor_permissions=_get_user_permission_codes(current_user),
+    )
+    return success_envelope(
+        _INVITATION_MESSAGES[delivery],
+        data={"delivery": delivery.value},
     )
 
 

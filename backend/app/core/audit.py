@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import uuid  # noqa: TC003 — needed at runtime for dataclass field resolution
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from app.core.logging import get_logger
 
@@ -41,7 +41,9 @@ class AuditEvent:
 
     :param action: Dotted action name, e.g. ``patient.created``. Stable across
         releases — dashboards and compliance queries filter on it.
-    :param hospital_id: Tenant the action occurred in.
+    :param hospital_id: Tenant the action occurred in. ``None`` only for a
+        platform-level event — a patient signing in, before any hospital is
+        involved.
     :param target_type: Entity type acted on, e.g. ``patient``.
     :param target_id: UUID of the entity acted on.
     :param actor_id: UUID of the acting user. ``None`` for system actions.
@@ -49,15 +51,25 @@ class AuditEvent:
         ``{"phone": {"before": ..., "after": ...}}``. May contain PII — see
         :class:`StructlogAuditSink` for how that is handled today.
     :param context: Non-PII contextual detail (result counts, filter names).
+    :param actor_type: ``"staff"`` (the default: a user, or the system when
+        there is no ``actor_id``) or ``"patient"`` for a Patient App action.
+    :param patient_account_id: UUID of the acting patient account. Set only
+        with ``actor_type="patient"``; a patient is never an ``actor_id``.
+    :param ip_address: The caller's address, where the caller is known.
+    :param user_agent: The caller's user agent, where known.
     """
 
     action: str
-    hospital_id: uuid.UUID
+    hospital_id: uuid.UUID | None
     target_type: str
     target_id: uuid.UUID | None = None
     actor_id: uuid.UUID | None = None
     changes: dict[str, dict[str, Any]] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
+    actor_type: Literal["staff", "patient"] = "staff"
+    patient_account_id: uuid.UUID | None = None
+    ip_address: str | None = None
+    user_agent: str | None = None
 
 
 @runtime_checkable
@@ -100,6 +112,16 @@ class StructlogAuditSink:
 
         :param event: The event to record.
         """
+        # A staff event keeps exactly the line it always had; the patient
+        # fields appear only on a patient event.
+        patient: dict[str, Any] = {}
+        if event.actor_type == "patient":
+            patient = {
+                "actor_type": "patient",
+                "patient_account_id": (
+                    str(event.patient_account_id) if event.patient_account_id else None
+                ),
+            }
         _logger.info(
             event.action,
             hospital_id=str(event.hospital_id),
@@ -108,5 +130,6 @@ class StructlogAuditSink:
             target_id=str(event.target_id) if event.target_id else None,
             # Names only — never values. See the class docstring.
             changed_fields=sorted(event.changes),
+            **patient,
             **event.context,
         )

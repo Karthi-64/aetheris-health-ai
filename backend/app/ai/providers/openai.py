@@ -13,7 +13,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from app.ai.providers.base import AIChunk, AIProvider, AIResponse, Message, ToolDefinition
+from app.ai.providers.base import (
+    AIChunk,
+    AIProvider,
+    AIResponse,
+    Message,
+    ResponseSchema,
+    ToolDefinition,
+)
 
 
 class OpenAIProvider(AIProvider):
@@ -36,6 +43,9 @@ class OpenAIProvider(AIProvider):
         temperature: float = 0.3,
         tools: list[ToolDefinition] | None = None,
         stream: bool = False,
+        *,
+        response_schema: ResponseSchema | None = None,
+        timeout_seconds: float | None = None,
     ) -> AIResponse | AsyncIterator[AIChunk]:
         """Send a completion to OpenAI's API.
 

@@ -27,6 +27,8 @@ teardown, so tests never see each other's rows and ordering never matters
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
 import uuid
 from typing import TYPE_CHECKING, Any, Self
@@ -34,6 +36,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -48,7 +51,51 @@ if TYPE_CHECKING:
     from app.core.audit import AuditEvent
     from app.database.unit_of_work import UnitOfWork
 
-__all__ = ["FakeSession", "RecordingAuditSink", "grant_permissions"]
+__all__ = [
+    "REAL_NETWORK_ATTEMPTS",
+    "AdmitAllThrottle",
+    "FakeSession",
+    "every_log_line_reaches_the_root",
+    "RecordingAuditSink",
+    "grant_permissions",
+    "real_throttle",
+]
+
+# The developer's real Groq key lives in ``backend/.env`` and pytest runs from
+# ``backend/``. An environment variable outranks the dotenv file, so blanking
+# it here — before anything imports ``app.core.config`` — keeps the real key
+# out of the settings singleton for the whole run. The autouse fixtures below
+# then hold every individual test to "AI off, no network".
+os.environ["GROQ_API_KEY"] = ""
+
+# MFA secrets are encrypted at rest and there is deliberately no default key
+# (``app/core/config.py``). The suite gets a fresh random one per run, set the
+# same way and for the same reason as the line above: before the settings
+# singleton is built, and outranking any real key in the developer's shell or
+# ``backend/.env`` — a test must never encrypt or decrypt with a real key.
+os.environ["MFA_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+os.environ["MFA_ENCRYPTION_PREVIOUS_KEYS"] = ""
+
+# Failed logins are padded to a minimum duration in production so that their
+# timing reveals nothing (``AUTH_FAILURE_MIN_SECONDS``). The suite makes
+# hundreds of them, so the padding is off here; the tests that are about the
+# padding switch it on for themselves.
+os.environ["AUTH_FAILURE_MIN_SECONDS"] = "0"
+
+#: Names of every AI setting, removed from the environment for each test.
+_AI_ENV_NAMES = (
+    "GROQ_API_KEY",
+    "AI_ENABLED",
+    "AI_FAST_MODEL",
+    "GROQ_BASE_URL",
+    "AI_REQUEST_TIMEOUT_SECONDS",
+    "GROQ_STRICT_JSON_SCHEMA",
+    "AI_MAX_CONCURRENT_CALLS",
+)
+
+#: Hosts a test tried to reach over a real transport. Filled by
+#: :func:`no_real_network`; a test that leaves an entry here fails in teardown.
+REAL_NETWORK_ATTEMPTS: list[str] = []
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -87,7 +134,7 @@ def override_settings() -> Generator[None]:
     original_values: dict[str, Any] = {}
 
     # Store original values.
-    for key in ("APP_ENV", "APP_DEBUG", "LOG_LEVEL"):
+    for key in ("APP_ENV", "APP_DEBUG", "LOG_LEVEL", "AUTH_DEVICE_COOKIE_SECURE"):
         original_values[key] = getattr(settings, key, None)
 
     try:
@@ -95,12 +142,85 @@ def override_settings() -> Generator[None]:
         settings.APP_ENV = "development"  # type: ignore[assignment]
         settings.APP_DEBUG = True
         settings.LOG_LEVEL = "CRITICAL"
+        # The suite's HTTP clients talk to ``http://test``, and a ``Secure``
+        # cookie is not sent over plain HTTP, so the trusted-device cookie is
+        # sent without ``Secure`` here (allowed in development only, which is
+        # what the suite runs as). Tests about the cookie's production
+        # attributes switch it back on and use an ``https://`` client.
+        settings.AUTH_DEVICE_COOKIE_SECURE = False
         yield
     finally:
         # Restore original values.
         for key, value in original_values.items():
             if value is not None:
                 setattr(settings, key, value)
+
+
+@pytest.fixture(autouse=True)
+def ai_off_by_default(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """No test sees the developer's real Groq key; each test starts with AI off.
+
+    Three layers, because the real key is on disk next to the test run:
+
+    - the AI variables are removed from the environment, so a key exported in
+      the developer's shell reaches no ``Settings`` built in a test;
+    - ``Settings`` stops reading ``.env`` for the duration of the test, so
+      even a bare ``Settings()`` cannot pick the key up from ``backend/.env``;
+    - the imported singleton is pinned to the AI defaults with no key, and the
+      cached AI runtime is dropped before and after.
+
+    A test that wants AI on installs a runtime built on a fake transport with
+    ``app.tests.ai_fakes.make_runtime``.
+    """
+    from app.ai import runtime
+    from app.core.config import Settings, settings
+
+    for name in _AI_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    monkeypatch.setattr(settings, "GROQ_API_KEY", None)
+    monkeypatch.setattr(settings, "AI_ENABLED", None)
+    monkeypatch.setattr(settings, "AI_FAST_MODEL", None)
+    monkeypatch.setattr(settings, "GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    monkeypatch.setattr(settings, "AI_REQUEST_TIMEOUT_SECONDS", 8.0)
+    monkeypatch.setattr(settings, "GROQ_STRICT_JSON_SCHEMA", True)
+    monkeypatch.setattr(settings, "AI_MAX_CONCURRENT_CALLS", 4)
+    runtime.reset_ai_runtime()
+    yield
+    runtime.reset_ai_runtime()
+
+
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """A test that reaches the real network fails instead of calling a provider.
+
+    The guard records *and* raises, and the fixture fails the test in
+    teardown. Raising alone is not enough on the one path the guard exists
+    for: the Groq adapter turns any exception from the HTTP call into an
+    ordinary "provider unavailable" error, which several tests expect.
+
+    ``ASGITransport`` and ``MockTransport`` are different classes and are
+    unaffected. Only the host is recorded — never a header.
+    """
+    import httpx
+
+    async def _refuse_async(self: object, request: httpx.Request) -> httpx.Response:
+        REAL_NETWORK_ATTEMPTS.append(request.url.host)
+        msg = "A test tried to open a real network connection."
+        raise AssertionError(msg)
+
+    def _refuse_sync(self: object, request: httpx.Request) -> httpx.Response:
+        REAL_NETWORK_ATTEMPTS.append(request.url.host)
+        msg = "A test tried to open a real network connection."
+        raise AssertionError(msg)
+
+    REAL_NETWORK_ATTEMPTS.clear()
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _refuse_async)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _refuse_sync)
+    yield
+    attempts = len(REAL_NETWORK_ATTEMPTS)
+    REAL_NETWORK_ATTEMPTS.clear()
+    assert attempts == 0, "A test tried to open a real network connection."
 
 
 @pytest.fixture(autouse=True)
@@ -193,6 +313,89 @@ class FakeSession:
     async def rollback(self) -> None:
         """Record a rollback."""
         self.rollbacks += 1
+
+
+@contextlib.contextmanager
+def every_log_line_reaches_the_root() -> Generator[None]:
+    """Undo, for a while, everything that can keep a log line from the root logger.
+
+    Tests that assert "this secret is in no log line" attach a handler to the
+    root logger. That proves nothing if lines never get there — and across a
+    whole run they may not: the suite logs at ``CRITICAL``, and any earlier
+    test may have set a level on a named logger, switched propagation off or
+    called ``logging.disable``. All of that is lifted here and put back after.
+    """
+    manager = logging.root.manager
+    disabled = manager.disable
+    saved: dict[logging.Logger, tuple[int, bool, bool]] = {}
+    logging.disable(logging.NOTSET)
+    for candidate in list(manager.loggerDict.values()):
+        if isinstance(candidate, logging.Logger):
+            saved[candidate] = (candidate.level, candidate.propagate, candidate.disabled)
+            candidate.setLevel(logging.NOTSET)
+            candidate.propagate = True
+            candidate.disabled = False
+    previous_root = logging.root.level
+    logging.root.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        logging.root.setLevel(previous_root)
+        for candidate, (level, propagate, was_disabled) in saved.items():
+            candidate.setLevel(level)
+            candidate.propagate = propagate
+            candidate.disabled = was_disabled
+        logging.disable(disabled)
+
+
+class AdmitAllThrottle:
+    """An authentication throttle that lets everything through and remembers it.
+
+    For unit tests of ``AuthService`` that are about something else. It is a
+    test double only: ``AuthService`` cannot be built without a throttle, and
+    the application always gives it the real one.
+    """
+
+    def __init__(self) -> None:
+        self.admitted: list[list[Any]] = []
+        self.settled: list[tuple[Any, list[Any]]] = []
+        self.refuse = False
+
+    async def now(self) -> Any:
+        """The current time."""
+        from datetime import UTC, datetime
+
+        return datetime.now(UTC)
+
+    async def admit(self, targets: Any) -> Any:
+        """Admit (or, with ``refuse`` set, refuse) and record the buckets asked for."""
+        from app.services.auth_throttle import Admission
+
+        self.admitted.append(list(targets))
+        if self.refuse:
+            return Admission(admitted=False, refused_by=targets[0].kind)
+        return Admission(admitted=True)
+
+    async def settle(self, admission: Any, *, clear: Any = ()) -> None:
+        """Record a settlement."""
+        self.settled.append((admission, list(clear)))
+
+
+def real_throttle(session: AsyncSession, uow: UnitOfWork) -> dict[str, Any]:
+    """The real throttle and trusted-device store on a test session.
+
+    :returns: Keyword arguments for ``AuthService(...)``.
+    """
+    from app.repositories.auth_throttle_repository import (
+        AuthThrottleRepository,
+        TrustedDeviceRepository,
+    )
+    from app.services.auth_throttle import AuthThrottle
+
+    return {
+        "throttle": AuthThrottle(AuthThrottleRepository(session), uow),
+        "trusted_devices": TrustedDeviceRepository(session),
+    }
 
 
 class RecordingAuditSink:

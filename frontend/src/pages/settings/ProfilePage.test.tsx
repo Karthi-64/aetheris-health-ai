@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import ProfilePage from './ProfilePage'
 import { useAuthStore } from '@/store/auth-store'
+import { ApiError } from '@/api/types'
+import { toast } from 'sonner'
 
 const { get, patch, post } = vi.hoisted(() => ({
   get: vi.fn(),
@@ -126,5 +128,56 @@ describe('ProfilePage', () => {
     await waitFor(() => expect(useAuthStore.getState().user?.name).toBe('Asha M. Rao'))
     // The session's permissions must survive a profile edit untouched.
     expect(useAuthStore.getState().user?.permissions).toEqual(['patient.read'])
+  })
+
+  it('puts a 422 under the field the API names and anything else above the form', async () => {
+    const user = userEvent.setup()
+    patch.mockRejectedValue(
+      new ApiError('Validation failed.', 'VALIDATION_ERROR', 422, [
+        { field: 'phone', message: "String should match pattern '^\\+?[1-9]\\d{1,14}$'" },
+        { field: 'email', message: 'Extra inputs are not permitted' },
+      ]),
+    )
+    renderPage()
+
+    const firstName = await screen.findByDisplayValue('Asha')
+    await user.type(firstName, 'x')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+
+    expect(await screen.findByText(/String should match pattern/)).toBeInTheDocument()
+    expect(screen.getByDisplayValue('+919812345678')).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByText('Extra inputs are not permitted')).toBeInTheDocument()
+    expect(toast.error).toHaveBeenCalledWith('Check the highlighted fields and try again.')
+  })
+
+  it('shows a plain sentence, not transport text, when the save cannot reach the server', async () => {
+    const user = userEvent.setup()
+    patch.mockRejectedValue(new ApiError('Network Error', 'network_error'))
+    renderPage()
+
+    await user.type(await screen.findByDisplayValue('Asha'), 'x')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('Could not save your profile. Please try again.'),
+    )
+  })
+
+  it('sends one save when the form is submitted twice in the same tick', async () => {
+    const user = userEvent.setup()
+    let finish: (value: typeof PROFILE) => void = () => {}
+    patch.mockImplementation(() => new Promise((resolve) => (finish = resolve)))
+    renderPage()
+
+    const firstName = await screen.findByDisplayValue('Asha')
+    await user.type(firstName, 'x')
+    const form = firstName.closest('form') as HTMLFormElement
+    fireEvent.submit(form)
+    fireEvent.submit(form)
+
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1))
+    finish({ ...PROFILE, first_name: 'Ashax' })
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1))
+    expect(patch).toHaveBeenCalledTimes(1)
   })
 })

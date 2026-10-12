@@ -2,12 +2,12 @@
 # Aetheris Health AI — Root Developer Commands
 #
 # Thin wrapper that delegates to docker-compose (infra + backend) and
-# npm (frontend). Run `make help` for the full list.
+# npm (Hospital frontend, Patient App). Run `make help` for the full list.
 # ──────────────────────────────────────────────────────────────────────────────
 
 .PHONY: help up down logs migrate seed test lint format dev \
         frontend-dev frontend-test frontend-lint frontend-build backend-test \
-        backend-lint
+        backend-lint patient-dev patient-test patient-lint patient-build
 
 .DEFAULT_GOAL := help
 
@@ -54,11 +54,25 @@ frontend-lint: ## Run ESLint on the frontend
 frontend-build: ## Build the frontend for production
 	cd frontend && npm run build
 
+# ── Patient App ──────────────────────────────────────────────────────────────
+
+patient-dev: ## Start the Patient App development server (http://localhost:5174)
+	cd patient-app && npm run dev
+
+patient-test: ## Run the Patient App test suite
+	cd patient-app && npm test
+
+patient-lint: ## Run ESLint, the type check and the design-token check on the Patient App
+	cd patient-app && npm run lint && npm run typecheck && npm run check:tokens
+
+patient-build: ## Build the Patient App for production
+	cd patient-app && npm run build
+
 # ── Combined ─────────────────────────────────────────────────────────────────
 
-test: backend-test frontend-test ## Run all backend and frontend tests
+test: backend-test frontend-test patient-test ## Run all backend, frontend and Patient App tests
 
-lint: backend-lint frontend-lint ## Run all backend and frontend lint checks
+lint: backend-lint frontend-lint patient-lint ## Run all backend, frontend and Patient App lint checks
 
 format: ## Format backend code with ruff
 	cd backend && uv run ruff format app/

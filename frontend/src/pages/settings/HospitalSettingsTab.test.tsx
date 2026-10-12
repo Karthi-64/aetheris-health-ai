@@ -4,6 +4,8 @@ import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { HospitalSettingsTab } from './HospitalSettingsTab'
 import type { HospitalSettings } from '@/api/hospitals'
+import { ApiError } from '@/api/types'
+import { toast } from 'sonner'
 
 const { mutateAsync } = vi.hoisted(() => ({ mutateAsync: vi.fn() }))
 
@@ -99,5 +101,58 @@ describe('HospitalSettingsTab', () => {
 
     await waitFor(() => expect(mutateAsync).toHaveBeenCalled())
     expect(mutateAsync.mock.calls[0][0].address).not.toHaveProperty('line1')
+  })
+
+  it('puts a 422 under the input the API names and the rest above the form', async () => {
+    const user = userEvent.setup()
+    mutateAsync.mockRejectedValue(
+      new ApiError('Validation failed.', 'VALIDATION_ERROR', 422, [
+        { field: 'phone', message: 'String should match pattern' },
+        { field: 'address', message: 'Value error, Address values must be text' },
+      ]),
+    )
+    renderTab()
+
+    const phone = screen.getByLabelText('Contact phone')
+    await user.type(phone, 'x')
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+
+    expect(await screen.findByText('String should match pattern')).toBeInTheDocument()
+    expect(phone).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByText('Address values must be text')).toBeInTheDocument()
+    expect(toast.error).toHaveBeenCalledWith("Couldn't save the settings. Check the highlighted fields.")
+
+    // Editing the rejected input clears its message.
+    await user.type(phone, '1')
+    expect(screen.queryByText('String should match pattern')).not.toBeInTheDocument()
+  })
+
+  it("reports the API's refusal, and a plain sentence when the server fails", async () => {
+    const user = userEvent.setup()
+    renderTab()
+
+    mutateAsync.mockRejectedValueOnce(new ApiError('Permission denied.', 'PERMISSION_DENIED', 403))
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Permission denied.'))
+
+    mutateAsync.mockRejectedValueOnce(new ApiError('Request failed with status code 500', 'network_error', 500))
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith('Could not save the settings. Please try again.'),
+    )
+  })
+
+  it('sends one save when Save is clicked twice before the button disables', async () => {
+    let finish: () => void = () => {}
+    mutateAsync.mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)))
+    renderTab()
+
+    const save = screen.getByRole('button', { name: /save changes/i })
+    save.click()
+    save.click()
+
+    expect(mutateAsync).toHaveBeenCalledTimes(1)
+    finish()
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1))
   })
 })

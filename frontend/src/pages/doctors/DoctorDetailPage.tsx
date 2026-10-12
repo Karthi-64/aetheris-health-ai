@@ -6,7 +6,9 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Detail, InfoCard } from '@/components/ui/detail-card'
 import { formatMoney } from '@/lib/format'
-import { useDoctor } from '@/api/doctors'
+import { useDoctor, type Qualification } from '@/api/doctors'
+import { usePermissions } from '@/hooks/usePermissions'
+import { DoctorActions } from './DoctorActions'
 
 function initials(name: string): string {
   return name
@@ -18,7 +20,7 @@ function initials(name: string): string {
     .toUpperCase()
 }
 
-function qualificationList(items: Array<Record<string, unknown>>): string {
+function qualificationList(items: Qualification[]): string {
   const parts = items
     .map((q) => {
       const degree = typeof q.degree === 'string' ? q.degree : null
@@ -34,7 +36,10 @@ function qualificationList(items: Array<Record<string, unknown>>): string {
 
 export default function DoctorDetailPage() {
   const { doctorId } = useParams<{ doctorId: string }>()
-  const { data: doctor, isError, refetch } = useDoctor(doctorId)
+  const { can } = usePermissions()
+  // A deactivated doctor is a 404 by default, and this is the page it is
+  // reactivated from.
+  const { data: doctor, isError, refetch } = useDoctor(doctorId, { includeInactive: true })
 
   const backLink = (
     <Link
@@ -63,7 +68,7 @@ export default function DoctorDetailPage() {
 
   if (!doctor) {
     return (
-      <div className="w-full space-y-6">
+      <div className="w-full space-y-6" aria-busy="true" aria-label="Loading doctor">
         {backLink}
         <Skeleton className="h-20 w-full max-w-md rounded-2xl" />
         <Skeleton className="h-40 w-full rounded-2xl" />
@@ -72,6 +77,7 @@ export default function DoctorDetailPage() {
   }
 
   const quals = qualificationList(doctor.qualifications)
+  const inactive = doctor.status === 'inactive'
 
   return (
     <div className="w-full space-y-6">
@@ -89,10 +95,21 @@ export default function DoctorDetailPage() {
             <p className="font-body text-on-surface-variant text-sm">{doctor.specialization}</p>
           </div>
         </div>
-        <Badge variant={doctor.status === 'active' ? 'success' : 'neutral'} className="capitalize">
-          {doctor.status}
-        </Badge>
+        <div className="flex flex-wrap items-center gap-3">
+          <Badge variant={inactive ? 'neutral' : 'success'} className="capitalize">
+            {doctor.status}
+          </Badge>
+          <DoctorActions doctor={doctor} />
+        </div>
       </header>
+
+      {inactive && (
+        <Alert variant="warning" title="This doctor is inactive">
+          Deactivated doctors are hidden from the directory, can't be booked for appointments and
+          can't be edited.
+          {can('doctor.update') && ' Reactivate the doctor to make them available again.'}
+        </Alert>
+      )}
 
       <InfoCard title="Practice">
         <Detail label="Department" value={doctor.department_name} />

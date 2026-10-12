@@ -38,6 +38,7 @@ from app.seeds.demo_data import (
     PATIENTS,
     seed_demo_data,
 )
+from app.seeds.seed import ensure_demo_flags
 
 if TYPE_CHECKING:
     import uuid
@@ -343,3 +344,65 @@ class TestIdempotency:
 
         assert await _counts(db_session, hospital.id) == first
         assert await _counts(db_session, other_hospital_id) == first
+
+
+class TestDemoFlags:
+    """The demo hospital gets AI slot suggestions unless the flag was set explicitly.
+
+    ``ensure_demo_flags`` is called directly, for the reason this module's
+    docstring gives for ``seed_demo_data``: ``seed_database`` commits on its
+    own engine and would escape the test transaction.
+    """
+
+    FLAG = "feature.ai.slot_recommendation"
+
+    async def _stored(self, session: AsyncSession, hospital_id: uuid.UUID) -> dict[str, Any]:
+        """Read ``settings`` from the row itself, not from the loaded object."""
+        result = await session.execute(
+            select(Hospital.__table__.c.settings).where(Hospital.__table__.c.id == hospital_id)
+        )
+        return dict(result.scalar_one() or {})
+
+    async def test_absent_flag_is_switched_on(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        assert self.FLAG not in (hospital.settings or {})
+
+        defaulted = await ensure_demo_flags(db_session, hospital)
+
+        assert defaulted is True
+        assert (await self._stored(db_session, hospital.id))[self.FLAG] is True
+
+    async def test_explicit_false_is_respected(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        hospital.settings = {self.FLAG: False}
+        await db_session.flush()
+
+        defaulted = await ensure_demo_flags(db_session, hospital)
+
+        assert defaulted is False
+        assert await self._stored(db_session, hospital.id) == {self.FLAG: False}
+
+    async def test_other_settings_survive(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        hospital.settings = {"billing.tax_rate": "18.00", "appointment.no_show_grace_minutes": 45}
+        await db_session.flush()
+
+        await ensure_demo_flags(db_session, hospital)
+
+        assert await self._stored(db_session, hospital.id) == {
+            "billing.tax_rate": "18.00",
+            "appointment.no_show_grace_minutes": 45,
+            self.FLAG: True,
+        }
+
+    async def test_second_run_changes_nothing(
+        self, db_session: AsyncSession, hospital: Hospital
+    ) -> None:
+        assert await ensure_demo_flags(db_session, hospital) is True
+        after_first = await self._stored(db_session, hospital.id)
+
+        assert await ensure_demo_flags(db_session, hospital) is False
+        assert await self._stored(db_session, hospital.id) == after_first

@@ -46,6 +46,7 @@ DATABASE_MODEL_NAMING_CONVENTION: dict[str, str] = {
 AUDIT_ACTOR_TYPE_USER = "user"
 AUDIT_ACTOR_TYPE_SYSTEM = "system"
 AUDIT_ACTOR_TYPE_AI = "ai"
+AUDIT_ACTOR_TYPE_PATIENT = "patient"
 
 # ── Timeouts ───────────────────────────────────────────────────────────────
 DEFAULT_HTTP_TIMEOUT_SECONDS = 30

@@ -52,6 +52,7 @@ ALL_BILLING_PERMISSIONS = [
     "invoice.update",
     "invoice.issue",
     "invoice.void",
+    "invoice.approve_discount",
     "invoice.payment.record",
 ]
 
@@ -1266,3 +1267,433 @@ class TestDoctorOwnVisits:
 
         assert (await api.get(URL, headers=headers)).json()["data"] == []
         assert (await api.get(f"{URL}/{scene['mine']['id']}", headers=headers)).status_code == 404
+
+
+# ── Discounts (module spec §5.2, AC-4) ──────────────────────────────────────
+
+
+async def _set_threshold(session: AsyncSession, hospital_id: uuid.UUID, percent: str) -> None:
+    """Configure the hospital's discount approval threshold."""
+    from app.models.hospital import Hospital
+
+    hospital = await session.get(Hospital, hospital_id)
+    assert hospital is not None
+    hospital.settings = {"billing": {"discount_approval_threshold_percent": percent}}
+    await session.flush()
+
+
+class TestDiscounts:
+    async def test_a_small_discount_needs_no_approval_and_can_be_issued(
+        self,
+        api: AsyncClient,
+        admin: dict[str, str],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        patient_id: uuid.UUID,
+    ) -> None:
+        await _set_threshold(db_session, hospital_id, "10")
+        draft = await _draft(api, admin, patient_id)
+
+        patched = await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "50.00", "discount_reason": "Staff discount"},
+            headers=admin,
+        )
+
+        assert patched.status_code == 200
+        data = patched.json()["data"]
+        assert data["discount_amount"] == "50.00"
+        assert data["discount_reason"] == "Staff discount"
+        assert data["discount_pending_approval"] is False
+        assert data["total"] == "450.00"
+        issued = await _issue(api, admin, draft["id"])
+        assert issued["total"] == "450.00"
+
+    async def test_ac4_a_large_discount_blocks_issue_until_an_admin_approves(
+        self,
+        api: AsyncClient,
+        admin: dict[str, str],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        patient_id: uuid.UUID,
+        audit: RecordingAuditSink,
+    ) -> None:
+        await _set_threshold(db_session, hospital_id, "10")
+        draft = await _draft(api, admin, patient_id)
+        patched = await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "200.00", "discount_reason": "Financial hardship"},
+            headers=admin,
+        )
+        assert patched.json()["data"]["discount_pending_approval"] is True
+
+        blocked = await api.post(f"{URL}/{draft['id']}/issue", headers=admin)
+        assert blocked.status_code == 400
+        assert "approve" in blocked.json()["message"]
+
+        # It shows up in the approval queue.
+        queue = await api.get(URL, params={"discount_pending": "true"}, headers=admin)
+        assert [item["id"] for item in queue.json()["data"]] == [draft["id"]]
+
+        approved = await api.post(f"{URL}/{draft['id']}/approve-discount", headers=admin)
+        assert approved.status_code == 200
+        assert approved.json()["data"]["discount_pending_approval"] is False
+        assert approved.json()["data"]["discount_approved_by"] is not None
+
+        issued = await _issue(api, admin, draft["id"])
+        assert issued["status"] == "issued"
+        assert issued["total"] == "300.00"
+        assert audit.actions()[-3:] == [
+            "invoice.updated",
+            "invoice.discount_approved",
+            "invoice.issued",
+        ]
+        queue = await api.get(URL, params={"discount_pending": "true"}, headers=admin)
+        assert queue.json()["data"] == []
+
+    async def test_with_no_threshold_configured_any_discount_needs_approval(
+        self, api: AsyncClient, admin: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+
+        patched = await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "1.00", "discount_reason": "Rounding"},
+            headers=admin,
+        )
+
+        assert patched.json()["data"]["discount_pending_approval"] is True
+
+    async def test_approving_twice_returns_409(
+        self, api: AsyncClient, admin: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+        await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "100.00", "discount_reason": "Hardship"},
+            headers=admin,
+        )
+        assert (
+            await api.post(f"{URL}/{draft['id']}/approve-discount", headers=admin)
+        ).status_code == 200
+
+        again = await api.post(f"{URL}/{draft['id']}/approve-discount", headers=admin)
+
+        assert again.status_code == 409
+        assert again.json()["error_code"] == "RESOURCE_CONFLICT"
+
+    async def test_changing_the_discount_after_approval_needs_approval_again(
+        self, api: AsyncClient, admin: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+        await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "100.00", "discount_reason": "Hardship"},
+            headers=admin,
+        )
+        approved = await api.post(f"{URL}/{draft['id']}/approve-discount", headers=admin)
+        assert approved.json()["data"]["discount_approved_by"] is not None
+
+        changed = await api.patch(
+            f"{URL}/{draft['id']}", json={"discount_amount": "150.00"}, headers=admin
+        )
+
+        assert changed.json()["data"]["discount_pending_approval"] is True
+        assert changed.json()["data"]["discount_approved_by"] is None
+        assert (await api.post(f"{URL}/{draft['id']}/issue", headers=admin)).status_code == 400
+
+    @pytest.mark.parametrize(
+        ("body", "field"),
+        [
+            ({"discount_amount": "500.01", "discount_reason": "Too much"}, "discount_amount"),
+            ({"discount_amount": "10.00"}, "discount_reason"),
+        ],
+    )
+    async def test_invalid_discounts_return_422_naming_the_field(
+        self,
+        api: AsyncClient,
+        admin: dict[str, str],
+        patient_id: uuid.UUID,
+        body: dict[str, str],
+        field: str,
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+
+        response = await api.patch(f"{URL}/{draft['id']}", json=body, headers=admin)
+
+        assert response.status_code == 422
+        assert _first_field_error(response) == field
+        fetched = await api.get(f"{URL}/{draft['id']}", headers=admin)
+        assert fetched.json()["data"]["discount_amount"] == "0.00"
+
+    @pytest.mark.parametrize("body", [{"discount_amount": "-1.00"}, {"discount_amount": None}])
+    async def test_malformed_discounts_return_422(
+        self, api: AsyncClient, admin: dict[str, str], patient_id: uuid.UUID, body: dict[str, Any]
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+
+        response = await api.patch(f"{URL}/{draft['id']}", json=body, headers=admin)
+
+        assert response.status_code == 422
+
+    async def test_a_client_cannot_mark_its_own_discount_approved(
+        self, api: AsyncClient, admin: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        draft = await _draft(api, admin, patient_id)
+
+        for field, value in (
+            ("discount_pending_approval", False),
+            ("discount_approved_by", str(uuid.uuid4())),
+        ):
+            response = await api.patch(
+                f"{URL}/{draft['id']}",
+                json={"discount_amount": "200.00", "discount_reason": "x", field: value},
+                headers=admin,
+            )
+            assert response.status_code == 422
+
+    async def test_billing_staff_can_set_a_discount_but_not_approve_it(
+        self,
+        api: AsyncClient,
+        admin: dict[str, str],
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        patient_id: uuid.UUID,
+    ) -> None:
+        # Seeded Billing Staff: create/update/issue/payment, no approve_discount.
+        staff = await insert_user_with_permissions(
+            db_session,
+            hospital_id,
+            ["invoice.read", "invoice.create", "invoice.update", "invoice.issue"],
+        )
+        headers = auth_headers(staff.id, hospital_id)
+        draft = await _draft(api, headers, patient_id)
+
+        patched = await api.patch(
+            f"{URL}/{draft['id']}",
+            json={"discount_amount": "200.00", "discount_reason": "Hardship"},
+            headers=headers,
+        )
+        approve = await api.post(f"{URL}/{draft['id']}/approve-discount", headers=headers)
+        issue = await api.post(f"{URL}/{draft['id']}/issue", headers=headers)
+
+        assert patched.status_code == 200
+        assert approve.status_code == 403
+        # And they cannot get round it by issuing.
+        assert issue.status_code == 400
+
+
+# ── Refunds (module spec §5.5, business rule 10) ────────────────────────────
+
+
+async def _refund(
+    api: AsyncClient,
+    headers: dict[str, str],
+    invoice_id: str,
+    amount: str,
+    *,
+    key: str | None = None,
+    method: str = "cash",
+    reason: str | None = "Service not performed",
+) -> Any:
+    """Post a refund and return the raw response."""
+    body: dict[str, Any] = {"amount": amount, "method": method}
+    if reason is not None:
+        body["reason"] = reason
+    return await api.post(
+        f"{URL}/{invoice_id}/refund",
+        json=body,
+        headers={**headers, "Idempotency-Key": key or _key()},
+    )
+
+
+@pytest_asyncio.fixture
+async def refunder(db_session: AsyncSession, hospital_id: uuid.UUID) -> dict[str, str]:
+    """An admin who may also refund. Refunds carry their own permission."""
+    user = await insert_user_with_permissions(
+        db_session, hospital_id, [*ALL_BILLING_PERMISSIONS, "invoice.refund"]
+    )
+    return auth_headers(user.id, hospital_id)
+
+
+class TestRefunds:
+    async def test_partial_then_full_refund(
+        self,
+        api: AsyncClient,
+        refunder: dict[str, str],
+        patient_id: uuid.UUID,
+        audit: RecordingAuditSink,
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "500.00")
+
+        partial = await _refund(api, refunder, invoice["id"], "200.00", method="upi")
+        full = await _refund(api, refunder, invoice["id"], "300.00")
+
+        assert partial.status_code == 201
+        first = partial.json()["data"]
+        assert first["refund"]["amount"] == "200.00"
+        assert first["refund"]["method"] == "upi"
+        assert first["refund"]["reason"] == "Service not performed"
+        assert first["invoice"]["status"] == "paid"
+        assert first["invoice"]["amount_refunded"] == "200.00"
+        assert first["invoice"]["amount_paid"] == "500.00"
+
+        assert full.status_code == 201
+        second = full.json()["data"]
+        assert second["invoice"]["status"] == "refunded"
+        assert second["invoice"]["amount_refunded"] == "500.00"
+        assert audit.actions()[-2:] == ["invoice.refunded", "invoice.refunded"]
+
+        listed = await api.get(f"{URL}/{invoice['id']}/refunds", headers=refunder)
+        assert [(r["amount"], r["method"]) for r in listed.json()["data"]] == [
+            ("200.00", "upi"),
+            ("300.00", "cash"),
+        ]
+        assert "idempotency_key" not in listed.json()["data"][0]
+
+    async def test_a_part_paid_invoice_can_be_undone_by_refunding_it(
+        self, api: AsyncClient, refunder: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "200.00")
+
+        response = await _refund(api, refunder, invoice["id"], "200.00")
+
+        assert response.json()["data"]["invoice"]["status"] == "refunded"
+        # A refunded invoice is closed: no more payments, refunds or voiding.
+        assert (await _pay(api, refunder, invoice["id"], "10.00")).status_code == 400
+        assert (await _refund(api, refunder, invoice["id"], "10.00")).status_code == 400
+        void = await api.post(f"{URL}/{invoice['id']}/void", json={"reason": "x"}, headers=refunder)
+        assert void.status_code == 400
+
+    async def test_refunding_more_than_is_left_returns_400(
+        self, api: AsyncClient, refunder: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "300.00")
+        await _refund(api, refunder, invoice["id"], "100.00")
+
+        response = await _refund(api, refunder, invoice["id"], "200.01")
+
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "BUSINESS_RULE_VIOLATION"
+        fetched = await api.get(f"{URL}/{invoice['id']}", headers=refunder)
+        assert fetched.json()["data"]["amount_refunded"] == "100.00"
+
+    async def test_an_unpaid_invoice_cannot_be_refunded(
+        self, api: AsyncClient, refunder: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        draft = await _draft(api, refunder, patient_id)
+        issued = await _issued(api, refunder, patient_id)
+
+        assert (await _refund(api, refunder, draft["id"], "1.00")).status_code == 400
+        assert (await _refund(api, refunder, issued["id"], "1.00")).status_code == 400
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"amount": "0", "method": "cash", "reason": "x"},
+            {"amount": "10.005", "method": "cash", "reason": "x"},
+            {"amount": "10.00", "method": "cheque", "reason": "x"},
+            {"amount": "10.00", "method": "cash"},
+            {"amount": "10.00", "method": "cash", "reason": "   "},
+        ],
+    )
+    async def test_invalid_refund_bodies_return_422(
+        self,
+        api: AsyncClient,
+        refunder: dict[str, str],
+        patient_id: uuid.UUID,
+        body: dict[str, str],
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "500.00")
+
+        response = await api.post(
+            f"{URL}/{invoice['id']}/refund",
+            json=body,
+            headers={**refunder, "Idempotency-Key": _key()},
+        )
+
+        assert response.status_code == 422
+
+    async def test_missing_idempotency_key_returns_422(
+        self, api: AsyncClient, refunder: dict[str, str], patient_id: uuid.UUID
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "500.00")
+
+        response = await api.post(
+            f"{URL}/{invoice['id']}/refund",
+            json={"amount": "10.00", "method": "cash", "reason": "x"},
+            headers=refunder,
+        )
+
+        assert response.status_code == 422
+
+    async def test_replaying_a_key_does_not_refund_twice(
+        self,
+        api: AsyncClient,
+        refunder: dict[str, str],
+        patient_id: uuid.UUID,
+        db_session: AsyncSession,
+    ) -> None:
+        from app.models.billing import Refund
+
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "500.00")
+        key = _key()
+
+        first = await _refund(api, refunder, invoice["id"], "500.00", key=key)
+        replay = await _refund(api, refunder, invoice["id"], "500.00", key=key)
+        different = await _refund(api, refunder, invoice["id"], "100.00", key=key)
+
+        assert first.status_code == 201
+        assert replay.status_code == 200
+        assert replay.json()["data"]["refund"]["id"] == first.json()["data"]["refund"]["id"]
+        assert different.status_code == 409
+        recorded = await db_session.scalar(
+            select(func.count()).select_from(Refund).where(Refund.idempotency_key == key)
+        )
+        assert recorded == 1
+
+    async def test_refunding_needs_its_own_permission(
+        self,
+        api: AsyncClient,
+        admin: dict[str, str],
+        receptionist: dict[str, str],
+        refunder: dict[str, str],
+        patient_id: uuid.UUID,
+    ) -> None:
+        # `admin` here holds every billing permission *except* invoice.refund.
+        invoice = await _issued(api, admin, patient_id)
+        await _pay(api, admin, invoice["id"], "500.00")
+
+        assert (await _refund(api, admin, invoice["id"], "10.00")).status_code == 403
+        assert (await _refund(api, receptionist, invoice["id"], "10.00")).status_code == 403
+        assert (await _refund(api, refunder, invoice["id"], "10.00")).status_code == 201
+        # Reading the refund history needs only read access.
+        assert (
+            await api.get(f"{URL}/{invoice['id']}/refunds", headers=receptionist)
+        ).status_code == 200
+
+    async def test_another_hospital_cannot_refund_or_read_refunds(
+        self,
+        api: AsyncClient,
+        refunder: dict[str, str],
+        db_session: AsyncSession,
+        other_hospital_id: uuid.UUID,
+        patient_id: uuid.UUID,
+    ) -> None:
+        invoice = await _issued(api, refunder, patient_id)
+        await _pay(api, refunder, invoice["id"], "500.00")
+        outsider = await insert_user_with_permissions(
+            db_session, other_hospital_id, [*ALL_BILLING_PERMISSIONS, "invoice.refund"]
+        )
+        headers = auth_headers(outsider.id, other_hospital_id)
+
+        assert (await _refund(api, headers, invoice["id"], "10.00")).status_code == 404
+        assert (await api.get(f"{URL}/{invoice['id']}/refunds", headers=headers)).status_code == 404
+        mine = await api.get(f"{URL}/{invoice['id']}", headers=refunder)
+        assert mine.json()["data"]["amount_refunded"] == "0.00"

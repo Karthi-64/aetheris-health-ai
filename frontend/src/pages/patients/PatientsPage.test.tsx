@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import PatientsPage from './PatientsPage'
 import type { PatientSummary } from '@/api/patients'
@@ -56,10 +57,13 @@ function page(items: PatientSummary[], totalPages = 1) {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // Each row links to its record, so the table needs a router around it.
   return render(
-    <QueryClientProvider client={client}>
-      <PatientsPage />
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <PatientsPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
   )
 }
 

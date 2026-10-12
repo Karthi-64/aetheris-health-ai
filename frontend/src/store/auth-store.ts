@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { queryClient } from '@/lib/query-client'
 import { ROLE_KEY_BY_NAME, type Permission, type Role } from '@/lib/rbac'
 import { tokenStore } from '@/services/tokenStore'
 
@@ -36,8 +37,27 @@ export function toAuthUser(raw: Record<string, unknown>): AuthUser {
   }
 }
 
+/**
+ * Why the user was signed out when they did not ask to be. The sign-in page
+ * reads it to say what happened; an ordinary sign-out carries none.
+ */
+export type SignOutReason = 'session_ended' | 'password_changed'
+
+/**
+ * Drop every cached server response. The cache is keyed by resource, not by
+ * user, so anything left in it would be shown to whoever signs in next in this
+ * tab. In-flight requests are cancelled first so a late answer for the previous
+ * user cannot land in the emptied cache.
+ */
+function clearServerCache() {
+  void queryClient.cancelQueries()
+  queryClient.clear()
+}
+
 interface AuthState {
   user: AuthUser | null
+  /** Set by a forced sign-out, cleared by the next sign-in or sign-out. */
+  signOutReason: SignOutReason | null
   /** Derived, in-memory only. Never persisted, so it cannot be forged from
    *  devtools (defect F2). A reload drops it; the app re-auths via /auth/refresh. */
   isAuthenticated: boolean
@@ -51,7 +71,8 @@ interface AuthState {
    * server issued for this session.
    */
   setUser: (update: Partial<Omit<AuthUser, 'permissions'>>) => void
-  logout: () => void
+  /** End the session. Pass a reason only when the user did not ask to sign out. */
+  logout: (reason?: SignOutReason) => void
   setRestoring: (v: boolean) => void
 }
 
@@ -61,24 +82,28 @@ interface AuthState {
  * in the backend response body), and `isAuthenticated` is derived state — not
  * a flag a visitor can write to localStorage to become an admin (defects F2, F3).
  */
-export const useAuthStore = create<AuthState>((set) => ({
+export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
+  signOutReason: null,
   isAuthenticated: false,
   // If there's no refresh token in memory there's nothing to restore, so
   // skip the spinner entirely (avoids a full-screen flash on public pages).
   isRestoring: tokenStore.getRefreshToken() !== null,
   setAuth: (user, accessToken, refreshToken?: string | null) => {
+    // A different identity must never inherit the previous one's cached data.
+    if (get().user?.id !== user.id) clearServerCache()
     tokenStore.setAccessToken(accessToken)
     if (refreshToken !== undefined) {
       tokenStore.setRefreshToken(refreshToken)
     }
-    set({ user, isAuthenticated: true })
+    set({ user, isAuthenticated: true, signOutReason: null })
   },
   setUser: (update) =>
     set((state) => (state.user ? { user: { ...state.user, ...update } } : state)),
-  logout: () => {
+  logout: (reason) => {
     tokenStore.clear()
-    set({ user: null, isAuthenticated: false })
+    clearServerCache()
+    set({ user: null, isAuthenticated: false, signOutReason: reason ?? null })
   },
   setRestoring: (v) => set({ isRestoring: v }),
 }))

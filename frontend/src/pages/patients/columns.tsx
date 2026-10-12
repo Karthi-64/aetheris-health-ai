@@ -1,4 +1,6 @@
 import type { ColumnDef } from '@tanstack/react-table'
+import { Link } from 'react-router-dom'
+import { ChevronRight } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { GENDER_LABELS, type PatientStatus, type PatientSummary } from '@/api/patients'
 
@@ -59,6 +61,20 @@ export const patientColumns: ColumnDef<PatientSummary>[] = [
       <Badge variant={STATUS_VARIANT[row.original.status]}>
         {STATUS_LABEL[row.original.status]}
       </Badge>
+    ),
+  },
+  {
+    id: 'actions',
+    header: '',
+    cell: ({ row }) => (
+      <Link
+        to={`/patients/${row.original.id}`}
+        // Two patients can share a name; the MRN is what tells their links apart.
+        aria-label={`View ${row.original.full_name}, ${row.original.mrn}`}
+        className="text-outline hover:text-secondary inline-flex items-center gap-1 transition-colors"
+      >
+        View <ChevronRight className="size-4" />
+      </Link>
     ),
   },
 ]

@@ -4,9 +4,12 @@ import { cn } from '@/lib/utils'
 /** A labelled value inside an {@link InfoCard}. Renders an em-dash for empty values. */
 export function Detail({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="space-y-0.5">
+    // `min-w-0` lets the grid column shrink below its content, and the value
+    // wraps anywhere: an email or licence number has no spaces to break at and
+    // would otherwise push the card, and the page, wider than the screen.
+    <div className="min-w-0 space-y-0.5">
       <p className="font-label text-label-caps text-on-surface-variant">{label}</p>
-      <div className="font-body text-body-md text-on-surface">
+      <div className="font-body text-body-md text-on-surface [overflow-wrap:anywhere]">
         {value === null || value === undefined || value === '' ? (
           <span className="text-outline-variant">—</span>
         ) : (

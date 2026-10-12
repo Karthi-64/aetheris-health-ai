@@ -37,6 +37,16 @@ Post code freeze (Dec 1 – Dec 31): pilot beta with one hospital, hardening, lo
 
 Production launch: **January 2027.**
 
+### AI status note (2026-10-06)
+
+The sprint sections below are kept as originally planned. This note records where the AI work actually stands; the full description is in [`08-AI_ARCHITECTURE.md`](08-AI_ARCHITECTURE.md) §0.
+
+- **A real provider is connected.** Groq, called over `httpx` against its OpenAI-compatible API (no vendor SDK). The model is `openai/gpt-oss-20b`, overridable with `AI_FAST_MODEL`. The model named in earlier planning, `llama-3.1-70b-versatile`, was decommissioned by Groq. AI stays off on a server with no `GROQ_API_KEY`.
+- **One AI capability is implemented: appointment slot recommendation** (Sprint 5 item) — `POST /api/v1/appointments/recommend-slot`, behind the `appointment.recommend_slot` and `doctor.availability.read` permissions and the per-hospital `feature.ai.slot_recommendation` flag.
+- **The action is human-confirmed.** The AI suggests one free slot; a member of staff presses "Use this slot" and then "Book". Nothing is booked by AI.
+- **Scope is intentionally narrow.** The model is shown only a date and one doctor's schedule as clock times — no patient data — and its answer is validated on the server. One call per request, with a timeout; no retry and no fallback provider.
+- **Not built yet:** the patient history summary (Sprint 3 item), AI Chat and streaming (M1), Function Calling (M2), Hospital Memory (M3), RAG (M4), and the M5 items — the `ai_interactions` table, cost tracking, budgets and the eval harness. AI calls are recorded today as structured log lines only.
+
 ---
 
 ## Sprint 0 — Foundation (Jul 28 – Aug 9)
@@ -186,7 +196,7 @@ Production launch: **January 2027.**
   - Medical history (structured)
   - Document upload → object storage (S3 or MinIO)
   - Patient search (by name, phone, MRN)
-  - Basic AI: patient history summary (streaming SSE)
+  - Basic AI: patient history summary (streaming SSE) — _status 2026-10-06: not built; see the AI status note above_
 
 ### Frontend
 - Patient registration form
@@ -241,7 +251,7 @@ Production launch: **January 2027.**
   - Walk-in flow (immediate slot)
   - Double-booking prevention (PostgreSQL `EXCLUDE` constraint)
   - No-show sweeper (background job)
-  - AI slot recommendation (basic)
+  - AI slot recommendation (basic) — _status 2026-10-06: implemented as one suggested slot, confirmed and booked by a member of staff; see the AI status note above_
 - Multi-tenant isolation validation across all 6 modules built so far
 - Performance tuning: query indexes, N+1 elimination
 
@@ -284,6 +294,7 @@ Production launch: **January 2027.**
   - Money as NUMERIC(15,2) throughout — no floats anywhere
 - `ai_assistant` module Phase 1 per `13-ai-assistant.md`
   - **AI Milestone 1: AI Chat** — provider abstraction, Groq default, streaming SSE, session/message persistence
+    - _Status 2026-10-06: the provider abstraction and the Groq connection already exist (model `openai/gpt-oss-20b`, via `httpx`); chat, streaming and session/message persistence are not built._
   - **AI Milestone 2: Function Calling** — typed tools wrapping module services (patient search, appointment list, doctor availability), permission-checked, audit-logged
 - `notifications` base — templates, in-app, email
 
@@ -412,7 +423,7 @@ Production launch: **January 2027.**
 1. **AI-generated natural language dashboard summary** (defer to v2.1) — dashboards work without it
 2. **RAG (AI Milestone 4)** (defer to v2.1) — Chat + Function Calling + Memory is still a strong AI story
 3. **SMS notifications** — already deferred to v2.1
-4. **AI slot recommendation in Appointments** — manual booking still works fine
+4. **AI slot recommendation in Appointments** — manual booking still works fine _(status 2026-10-06: already implemented; manual booking is unaffected when AI is off or fails)_
 5. **Report PDF export** — CSV export still works, PDF can wait
 6. **MFA (TOTP)** — password + lockout is still secure enough for pilot; MFA becomes v2.1
 

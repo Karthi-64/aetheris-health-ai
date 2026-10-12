@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+@import '@atheris/design-tokens/tokens.css';
+
+/* The shared primitives live outside `src/`; make sure their classes are seen. */
+@source '../packages/ui/src';
+
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  * {
+    @apply border-outline-variant;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background font-body text-on-background antialiased;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+/*
+ * One visible focus indicator for every interactive element (WCAG 2.1 AA,
+ * 2.4.7 / 1.4.11). Deliberately outside any layer: unlayered rules win over
+ * Tailwind's layered utilities, so a copied primitive's `outline-none` cannot
+ * remove it. Teal on the light surfaces is 6.6:1.
+ */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-secondary);
+  outline-offset: 2px;
+}

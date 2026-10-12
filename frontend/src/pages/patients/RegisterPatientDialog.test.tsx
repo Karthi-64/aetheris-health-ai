@@ -83,6 +83,30 @@ describe('RegisterPatientDialog', () => {
     expect(post).not.toHaveBeenCalled()
   })
 
+  it('blocks a phone or email the API would reject, instead of posting it', async () => {
+    const user = userEvent.setup()
+    renderDialog()
+    await open(user)
+
+    await user.type(screen.getByLabelText(/First name/), 'Ananya')
+    await user.type(screen.getByLabelText(/Last name/), 'Rao')
+    await user.type(screen.getByLabelText(/Date of birth/), '1988-03-14')
+    await user.click(screen.getByRole('combobox', { name: /Gender/ }))
+    await user.click(await screen.findByRole('option', { name: 'Female' }))
+    // A landline: the API only adds a country code to an Indian mobile.
+    await user.type(screen.getByLabelText('Phone'), '040 2345 6789')
+    await user.type(screen.getByLabelText('Email'), 'ananya@example..com')
+    await user.click(screen.getByRole('button', { name: 'Register' }))
+
+    expect(
+      await screen.findByText(
+        'Enter a 10-digit mobile number, or include the country code, e.g. +91 98123 45678',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.getByText('Enter a valid email')).toBeInTheDocument()
+    expect(post).not.toHaveBeenCalled()
+  })
+
   it('posts snake_case fields with a date of birth and a backend gender value', async () => {
     const user = userEvent.setup()
     renderDialog()

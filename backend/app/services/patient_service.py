@@ -9,9 +9,10 @@ Returns Pydantic DTOs, never ORM models (``docs/03-ARCHITECTURE.md`` §15,
 rule 7).
 
 **Tenancy.** Every public method takes ``hospital_id`` and passes it to the
-repository. Until ``app/core/tenancy.py`` provides ambient tenant context, the
-caller supplies it — and a caller that supplies the wrong one gets nothing back
-rather than another tenant's data, because the filter is applied in SQL.
+repository. A caller that supplies the wrong one gets nothing back rather than
+another tenant's data: the filter is applied in SQL, and inside a request
+``app/core/tenancy.py`` additionally confines the session to the authenticated
+principal's hospital.
 
 **Actor.** ``actor_id`` is the acting user's UUID, supplied by the caller. When
 the authentication module lands it comes from ``get_current_user``; the

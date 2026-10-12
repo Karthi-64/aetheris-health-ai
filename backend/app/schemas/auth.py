@@ -13,11 +13,24 @@ from pydantic import BaseModel, EmailStr, Field
 # ── Request Schemas ─────────────────────────────────────────────────────────
 
 
+#: Longest password any endpoint accepts for verification. Far above any real
+#: password, far below the hasher's own limit, and it bounds the work one
+#: request can ask the hasher to do.
+MAX_PASSWORD_INPUT_LENGTH = 1024
+
+
 class LoginRequest(BaseModel):
     """Login credentials payload."""
 
     email: EmailStr
-    password: str = Field(..., min_length=1, description="The user's password")
+    # The upper bound is a security control, not a style rule. The password
+    # hasher raises on input over 4096 characters; without a cap here that was
+    # a 500 for a real account and a 401 for an unknown email — a one-request
+    # way to tell them apart. Capped at the schema, every caller gets the same
+    # 422 before any account is looked up.
+    password: str = Field(
+        ..., min_length=1, max_length=MAX_PASSWORD_INPUT_LENGTH, description="The user's password"
+    )
 
 
 class MfaVerifyRequest(BaseModel):
@@ -57,20 +70,36 @@ class ResetPasswordRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     """Authenticated password change payload."""
 
-    current_password: str = Field(..., description="The current password")
+    current_password: str = Field(
+        ..., max_length=MAX_PASSWORD_INPUT_LENGTH, description="The current password"
+    )
     new_password: str = Field(..., min_length=12, max_length=128, description="The new password")
 
 
 class MfaEnrollRequest(BaseModel):
     """MFA enrollment initiation payload."""
 
-    password: str = Field(..., description="Current password for verification")
+    password: str = Field(
+        ..., max_length=MAX_PASSWORD_INPUT_LENGTH, description="Current password for verification"
+    )
 
 
 class MfaConfirmRequest(BaseModel):
-    """MFA enrollment confirmation payload."""
+    """MFA enrollment confirmation payload.
 
-    secret: str = Field(..., description="The TOTP secret from the enroll response")
+    Only ``code`` is used. ``secret`` is still accepted so that existing
+    clients, which echo the enrolment secret back, keep working — but it is
+    ignored. The server confirms against the pending secret it stored itself.
+    """
+
+    secret: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Deprecated and ignored. Accepted for backward compatibility only; "
+            "the server never reads a secret from the client."
+        ),
+    )
     code: str = Field(
         ...,
         min_length=6,
@@ -83,7 +112,9 @@ class MfaConfirmRequest(BaseModel):
 class MfaDisableRequest(BaseModel):
     """MFA disable payload."""
 
-    password: str = Field(..., description="Current password for verification")
+    password: str = Field(
+        ..., max_length=MAX_PASSWORD_INPUT_LENGTH, description="Current password for verification"
+    )
     code: str = Field(
         ..., min_length=6, max_length=6, pattern=r"^\d{6}$", description="6-digit TOTP code"
     )

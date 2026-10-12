@@ -52,7 +52,7 @@ Frontend runs at `http://localhost:5173`.
 - **Redis:** `REDIS_URL`
 - **JWT:** `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_ISSUER`, `JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS`
 - **Object storage:** `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`
-- **AI providers:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `GOOGLE_API_KEY`
+- **AI (optional):** `GROQ_API_KEY` turns it on; optional `AI_ENABLED`, `AI_FAST_MODEL`, `GROQ_BASE_URL`, `AI_REQUEST_TIMEOUT_SECONDS`, `GROQ_STRICT_JSON_SCHEMA`, `AI_MAX_CONCURRENT_CALLS` (see `backend/.env.example`). `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` are not read by any code yet
 - **Email:** `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`
 - **Logging:** `LOG_LEVEL`, `LOG_FORMAT`
 - **Rate limits:** `RATE_LIMIT_ANON_PER_MIN`, `RATE_LIMIT_USER_PER_MIN`, `RATE_LIMIT_AI_PER_MIN`
@@ -228,8 +228,8 @@ Never run `db-reset` against staging or production.
 - Bump the `version` field on any prompt change
 - Run `make ai-eval PROMPT=<id>` before merging prompt changes
 - Every new AI use case needs an evaluation golden set
-- Log AI interactions locally; the `ai_interactions` table records them
-- For local development without provider costs, use Ollama via the `ollama` provider
+- Every model call writes one structured `ai_interaction` log line (provider, model, tokens, outcome — never the key, prompt or answer). The `ai_interactions` table is planned and does not exist yet
+- Only the Groq provider is connected. The Ollama adapter is an unregistered stub, so there is no local-model option yet
 
 ---
 
@@ -239,8 +239,8 @@ Never run `db-reset` against staging or production.
 - **Slow queries:** enable `DATABASE_ECHO=true` locally
 - **Redis inspection:** `make redis-cli`
 - **DB inspection:** `make db-shell`
-- **AI interactions:** query `ai_interactions` for the request_id
-- **Feature flags:** stored in `hospitals.settings.feature_flags`
+- **AI interactions:** filter the logs for `ai_interaction` with the request_id (there is no `ai_interactions` table yet)
+- **Feature flags:** stored as top-level keys of `hospitals.settings`, e.g. `"feature.ai.slot_recommendation": true`; read them with `GET /api/v1/hospitals/current/feature-flags`
 
 ---
 

@@ -29,7 +29,7 @@ from app.models.billing import InvoiceStatus, PaymentMethod
 from app.schemas.common import Page
 
 if TYPE_CHECKING:
-    from app.models.billing import Invoice, InvoiceItem, Payment, Service
+    from app.models.billing import Invoice, InvoiceItem, Payment, Refund, Service
 
 __all__ = [
     "MAX_INVOICE_LINES",
@@ -45,6 +45,9 @@ __all__ = [
     "PaymentRecordedResponse",
     "PaymentResponse",
     "RecordPaymentRequest",
+    "RecordRefundRequest",
+    "RefundRecordedResponse",
+    "RefundResponse",
     "ServiceListResponse",
     "ServiceResponse",
     "UpdateInvoiceRequest",
@@ -323,6 +326,11 @@ class UpdateInvoiceRequest(BaseModel):
     Omit it to leave the lines alone. Patient and appointment cannot be changed
     — an invoice raised against the wrong patient is voided and re-raised, not
     quietly repointed.
+
+    ``discount_amount`` is an amount in the hospital's currency, not a
+    percentage, and applies to the whole invoice (module spec §5.2). Whether it
+    needs an admin's approval is decided by the server against the hospital's
+    threshold; a client cannot mark a discount approved.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -331,20 +339,26 @@ class UpdateInvoiceRequest(BaseModel):
         default=None, max_length=MAX_INVOICE_LINES, description="Replacement line set."
     )
     notes: str | None = Field(default=None, max_length=2000, description="Notes on the invoice.")
+    discount_amount: Money | None = Field(
+        default=None, description="Invoice-level discount. Send 0 to remove a discount."
+    )
+    discount_reason: str | None = Field(
+        default=None, max_length=200, description="Why the discount is given. Required with one."
+    )
 
-    @field_validator("notes")
+    @field_validator("notes", "discount_reason")
     @classmethod
-    def _trim_notes(cls, value: str | None) -> str | None:
-        """Trim the notes, collapsing blank to ``None``."""
+    def _trim_optional(cls, value: str | None) -> str | None:
+        """Trim optional free text, collapsing blank to ``None``."""
         return _blank_to_none(value)
 
     @model_validator(mode="after")
     def _check_something_changes(self) -> Self:
-        """Reject an empty PATCH and a ``null`` line set."""
+        """Reject an empty PATCH, and ``null`` where it has no meaning."""
         if not self.model_fields_set:
-            msg = "Provide at least one of: items, notes."
+            msg = "Provide at least one of: items, notes, discount_amount, discount_reason."
             raise ValueError(msg)
-        _reject_explicit_nulls(self, frozenset({"items"}))
+        _reject_explicit_nulls(self, frozenset({"items", "discount_amount"}))
         return self
 
 
@@ -397,6 +411,47 @@ class RecordPaymentRequest(BaseModel):
         return _blank_to_none(value)
 
 
+class RecordRefundRequest(BaseModel):
+    """Payload for ``POST /api/v1/invoices/{id}/refund`` (module spec §5.5).
+
+    A reason is **required**: a refund is money leaving the hospital, and the
+    record of why has to exist at the moment it leaves.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "amount": "300.00",
+                "method": "upi",
+                "reason": "ECG was not performed.",
+                "reference": "UPI-REFUND-4471",
+            },
+        },
+    )
+
+    amount: Decimal = Field(
+        max_digits=15, decimal_places=2, gt=0, description="Amount given back. Must be positive."
+    )
+    method: PaymentMethod = Field(description="How the money is returned.")
+    reason: str = Field(min_length=1, max_length=500, description="Why the refund is given.")
+    reference: str | None = Field(
+        default=None, max_length=100, description="Transaction id or other reference."
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        """Reject a whitespace-only reason."""
+        return _strip_required(value, "Refund reason")
+
+    @field_validator("reference")
+    @classmethod
+    def _trim_reference(cls, value: str | None) -> str | None:
+        """Trim the reference, collapsing blank to ``None``."""
+        return _blank_to_none(value)
+
+
 # ── Invoice responses ───────────────────────────────────────────────────────
 
 
@@ -438,7 +493,11 @@ class InvoiceSummaryResponse(BaseModel):
     currency: str = Field(description="ISO 4217 code, inherited from the hospital.")
     total: Decimal = Field(description="Invoice total.")
     amount_paid: Decimal = Field(description="Sum of payments recorded.")
+    amount_refunded: Decimal = Field(description="Sum of refunds given back.")
     balance_due: Decimal = Field(description="total minus amount_paid.")
+    discount_pending_approval: bool = Field(
+        description="A discount awaits an admin; the invoice cannot be issued until approved."
+    )
     issued_at: datetime | None = Field(description="When it was issued (UTC).")
     created_at: datetime = Field(description="Creation timestamp (UTC).")
 
@@ -463,7 +522,9 @@ class InvoiceSummaryResponse(BaseModel):
             currency=currency,
             total=invoice.total,
             amount_paid=invoice.amount_paid,
+            amount_refunded=invoice.amount_refunded,
             balance_due=invoice.balance_due,
+            discount_pending_approval=invoice.discount_pending_approval,
             issued_at=invoice.issued_at,
             created_at=invoice.created_at,
         )
@@ -486,8 +547,16 @@ class InvoiceResponse(BaseModel):
     subtotal: Decimal = Field(description="Sum of line amounts before tax.")
     tax_amount: Decimal = Field(description="Sum of line tax.")
     discount_amount: Decimal = Field(description="Invoice-level discount.")
+    discount_reason: str | None = Field(description="Why the discount was given.")
+    discount_pending_approval: bool = Field(
+        description="The discount awaits an admin; the invoice cannot be issued until approved."
+    )
+    discount_approved_by: UUID | None = Field(
+        description="Admin who approved an above-threshold discount."
+    )
     total: Decimal = Field(description="subtotal + tax_amount - discount_amount.")
     amount_paid: Decimal = Field(description="Sum of payments recorded.")
+    amount_refunded: Decimal = Field(description="Sum of refunds given back.")
     balance_due: Decimal = Field(description="total minus amount_paid.")
     notes: str | None = Field(description="Notes on the invoice.")
     issued_at: datetime | None = Field(description="When it was issued (UTC).")
@@ -517,8 +586,12 @@ class InvoiceResponse(BaseModel):
             subtotal=invoice.subtotal,
             tax_amount=invoice.tax_amount,
             discount_amount=invoice.discount_amount,
+            discount_reason=invoice.discount_reason,
+            discount_pending_approval=invoice.discount_pending_approval,
+            discount_approved_by=invoice.discount_approved_by,
             total=invoice.total,
             amount_paid=invoice.amount_paid,
+            amount_refunded=invoice.amount_refunded,
             balance_due=invoice.balance_due,
             notes=invoice.notes,
             issued_at=invoice.issued_at,
@@ -562,6 +635,41 @@ class PaymentRecordedResponse(BaseModel):
 
     payment: PaymentResponse = Field(description="The payment recorded.")
     invoice: InvoiceSummaryResponse = Field(description="The invoice after this payment.")
+
+
+class RefundResponse(BaseModel):
+    """One refund issued against an invoice."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(description="Refund UUID.")
+    invoice_id: UUID = Field(description="Invoice the refund was made against.")
+    amount: Decimal = Field(description="Amount given back.")
+    method: PaymentMethod = Field(description="How the money was returned.")
+    reason: str = Field(description="Why the refund was given.")
+    reference: str | None = Field(description="Transaction id or other reference.")
+    refunded_by: UUID = Field(description="User who issued the refund.")
+    refunded_at: datetime = Field(description="When it was issued (UTC).")
+
+    @classmethod
+    def from_model(cls, refund: Refund) -> Self:
+        """Build a DTO from an ORM instance.
+
+        :param refund: The ORM instance to convert.
+        :returns: The populated DTO.
+        """
+        return cls.model_validate(refund)
+
+
+class RefundRecordedResponse(BaseModel):
+    """Body of ``POST /invoices/{id}/refund``.
+
+    The refund plus the invoice as it stands afterwards, mirroring
+    :class:`PaymentRecordedResponse`.
+    """
+
+    refund: RefundResponse = Field(description="The refund issued.")
+    invoice: InvoiceSummaryResponse = Field(description="The invoice after this refund.")
 
 
 #: One page of catalog services — the body of a list response.

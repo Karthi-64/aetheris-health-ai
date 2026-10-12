@@ -18,6 +18,7 @@ Usage::
     SlotRanker,
 )
 from app.services.auth_service import AuthService
+from app.services.auth_throttle import AuthThrottle
 
     async def handler(
         auth: Annotated[AuthService, Depends(get_auth_service)],
@@ -32,6 +33,8 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.runtime import AIRuntime
+from app.api.dependencies.ai import provide_ai_runtime
 from app.api.dependencies.db import get_db_session
 
 # ── Repository DI ────────────────────────────────────────────────────────────
@@ -41,37 +44,61 @@ from app.api.dependencies.repositories import (  # noqa: F401
     DbSession,
     get_appointment_repository,
     get_audit_log_repository,
+    get_auth_throttle_repository,
     get_department_repository,
     get_doctor_repository,
     get_hospital_repository,
+    get_inventory_po_repository,
+    get_inventory_repository,
     get_invoice_number_sequence_repository,
     get_invoice_repository,
+    get_lab_order_repository,
+    get_lab_test_repository,
+    get_medicine_repository,
     get_mrn_sequence_repository,
+    get_notification_repository,
     get_password_reset_token_repository,
     get_patient_repository,
     get_permission_repository,
+    get_prescription_repository,
+    get_procurement_repository,
     get_refresh_token_repository,
+    get_report_repository,
     get_role_repository,
     get_service_catalog_repository,
+    get_trusted_device_repository,
     get_user_repository,
 )
 from app.core.audit import AuditSink
+from app.core.charges import ChargeSink
+from app.core.notifications import Notifier
 from app.database.unit_of_work import UnitOfWork
 from app.repositories import (
     AppointmentRepository,
     AuditLogRepository,
+    AuthThrottleRepository,
     DepartmentRepository,
     DoctorRepository,
     HospitalRepository,
+    InventoryPurchaseOrderRepository,
+    InventoryRepository,
     InvoiceNumberSequenceRepository,
     InvoiceRepository,
+    LabOrderRepository,
+    LabTestRepository,
+    MedicineRepository,
     MrnSequenceRepository,
+    NotificationRepository,
     PasswordResetTokenRepository,
     PatientRepository,
     PermissionRepository,
+    PrescriptionRepository,
+    ProcurementRepository,
     RefreshTokenRepository,
+    ReportRepository,
     RoleRepository,
     ServiceCatalogRepository,
+    TrustedDeviceRepository,
     UserRepository,
 )
 from app.services.appointment_service import (
@@ -82,18 +109,29 @@ from app.services.appointment_service import (
 )
 from app.services.audit_service import AuditService
 from app.services.auth_service import AuthService
+from app.services.auth_throttle import AuthThrottle
 from app.services.billing_service import BillingInvoiceDraftSink, BillingService
 from app.services.department_service import DepartmentService, DepartmentUsageSource
+from app.services.dispensing_service import DispensingService
 from app.services.doctor_service import (
     BookedIntervalSource,
     DoctorDepartmentUsageSource,
     DoctorService,
 )
 from app.services.hospital_service import HospitalService
+from app.services.inventory_po_service import InventoryPurchaseOrderService
+from app.services.inventory_service import InventoryService
+from app.services.lab_catalog_service import LabCatalogService
+from app.services.lab_service import LabService
 from app.services.mrn_service import MRNService
+from app.services.notification_service import NotificationService
 from app.services.patient_service import PatientService
+from app.services.pharmacy_catalog_service import PharmacyCatalogService
+from app.services.procurement_service import ProcurementService
+from app.services.report_service import ReportService
 from app.services.role_service import RoleService
 from app.services.service_catalog_service import ServiceCatalogService
+from app.services.slot_ranker import AISlotRanker
 from app.services.user_service import UserService
 
 # ── Dependency type aliases ──────────────────────────────────────────────────
@@ -134,14 +172,45 @@ def get_audit_service(
     return AuditService(session, audit_repo, user_repo)
 
 
+# ── Notifications module ─────────────────────────────────────────────────────
+def get_notification_service(
+    notifications: NotificationRepository = Depends(get_notification_repository),
+    users: UserRepository = Depends(get_user_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> NotificationService:
+    """Provide a :class:`NotificationService` bound to the request session.
+
+    It shares the request-scoped session with every other service, which is
+    what makes a notification transactional with the event that caused it:
+    both are written, or neither is.
+    """
+    return NotificationService(notifications, users, hospitals, session, audit)
+
+
+def get_notifier(
+    service: NotificationService = Depends(get_notification_service),
+) -> Notifier:
+    """Provide the :class:`~app.core.notifications.Notifier` other modules emit to.
+
+    Other modules depend on the protocol, not on the Notifications module, so
+    this provider is the only place the two are joined.
+    """
+    return service
+
+
 # ── Hospital settings module ─────────────────────────────────────────────────
 def get_hospital_service(
     hospitals: HospitalRepository = Depends(get_hospital_repository),
     uow: UnitOfWork = Depends(get_unit_of_work),
     audit: AuditSink = Depends(get_audit_sink),
+    runtime: AIRuntime = Depends(provide_ai_runtime),
 ) -> HospitalService:
     """Provide a :class:`HospitalService` composed with its dependencies."""
-    return HospitalService(hospitals=hospitals, uow=uow, audit=audit)
+    return HospitalService(
+        hospitals=hospitals, uow=uow, audit=audit, ai_configured=runtime.status.configured
+    )
 
 
 def get_auth_service(
@@ -152,6 +221,9 @@ def get_auth_service(
     ),
     uow: UnitOfWork = Depends(get_unit_of_work),
     audit: AuditSink = Depends(get_audit_sink),
+    notifier: Notifier = Depends(get_notifier),
+    throttle_buckets: AuthThrottleRepository = Depends(get_auth_throttle_repository),
+    trusted_devices: TrustedDeviceRepository = Depends(get_trusted_device_repository),
 ) -> AuthService:
     """Provide an :class:`AuthService` composed with its repository dependencies."""
     return AuthService(
@@ -160,6 +232,9 @@ def get_auth_service(
         password_reset_repo=password_reset_repo,
         uow=uow,
         audit=audit,
+        throttle=AuthThrottle(throttle_buckets, uow),
+        trusted_devices=trusted_devices,
+        notifier=notifier,
     )
 
 
@@ -174,6 +249,7 @@ def get_user_service(
     password_reset_repo: PasswordResetTokenRepository = Depends(
         get_password_reset_token_repository
     ),
+    notifier: Notifier = Depends(get_notifier),
 ) -> UserService:
     """Provide a :class:`UserService` composed with its repository dependencies."""
     return UserService(
@@ -184,6 +260,7 @@ def get_user_service(
         uow=uow,
         audit=audit,
         password_reset_repo=password_reset_repo,
+        notifier=notifier,
     )
 
 
@@ -311,6 +388,7 @@ def get_billing_service(
     hospitals: HospitalRepository = Depends(get_hospital_repository),
     session: AsyncSession = Depends(get_db_session),
     audit: AuditSink = Depends(get_audit_sink),
+    notifier: Notifier = Depends(get_notifier),
 ) -> BillingService:
     """Provide a :class:`BillingService` bound to the request session.
 
@@ -320,8 +398,139 @@ def get_billing_service(
     as the issue it numbers — which is what keeps the series gap-free.
     """
     return BillingService(
-        invoices, sequences, catalog, patients, appointments, doctors, hospitals, session, audit
+        invoices,
+        sequences,
+        catalog,
+        patients,
+        appointments,
+        doctors,
+        hospitals,
+        session,
+        audit,
+        notifier=notifier,
     )
+
+
+def get_charge_sink(billing: BillingService = Depends(get_billing_service)) -> ChargeSink:
+    """Provide the :class:`~app.core.charges.ChargeSink` other modules charge through.
+
+    Laboratory and Pharmacy depend on the protocol, not on Billing, so they
+    can be built and tested without it. Billing shares the request session, so
+    a charge commits or rolls back with the order or dispense that raised it.
+    """
+    return billing
+
+
+# ── Laboratory module ───────────────────────────────────────────────────────
+def get_lab_catalog_service(
+    tests: LabTestRepository = Depends(get_lab_test_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> LabCatalogService:
+    """Provide a :class:`LabCatalogService` bound to the request session."""
+    return LabCatalogService(tests, session, audit)
+
+
+def get_lab_service(
+    orders: LabOrderRepository = Depends(get_lab_order_repository),
+    tests: LabTestRepository = Depends(get_lab_test_repository),
+    appointments: AppointmentRepository = Depends(get_appointment_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+    charges: ChargeSink = Depends(get_charge_sink),
+    notifier: Notifier = Depends(get_notifier),
+) -> LabService:
+    """Provide a :class:`LabService` bound to the request session."""
+    return LabService(
+        orders, tests, appointments, session, audit, charges=charges, notifier=notifier
+    )
+
+
+# ── Pharmacy module ─────────────────────────────────────────────────────────
+def get_pharmacy_catalog_service(
+    medicines: MedicineRepository = Depends(get_medicine_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> PharmacyCatalogService:
+    """Provide a :class:`PharmacyCatalogService` bound to the request session."""
+    return PharmacyCatalogService(medicines, hospitals, session, audit)
+
+
+def get_dispensing_service(
+    prescriptions: PrescriptionRepository = Depends(get_prescription_repository),
+    medicines: MedicineRepository = Depends(get_medicine_repository),
+    appointments: AppointmentRepository = Depends(get_appointment_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+    charges: ChargeSink = Depends(get_charge_sink),
+) -> DispensingService:
+    """Provide a :class:`DispensingService` bound to the request session.
+
+    Billing shares the session through the charge sink, so the stock
+    movements, the dispense and its bill line commit or roll back together
+    (module spec §5.1 step 3).
+    """
+    return DispensingService(
+        prescriptions, medicines, appointments, hospitals, session, audit, charges=charges
+    )
+
+
+def get_procurement_service(
+    procurement: ProcurementRepository = Depends(get_procurement_repository),
+    medicines: MedicineRepository = Depends(get_medicine_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> ProcurementService:
+    """Provide a :class:`ProcurementService` bound to the request session."""
+    return ProcurementService(procurement, medicines, hospitals, session, audit)
+
+
+# ── Inventory module ────────────────────────────────────────────────────────
+def get_inventory_service(
+    inventory: InventoryRepository = Depends(get_inventory_repository),
+    departments: DepartmentRepository = Depends(get_department_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+    notifier: Notifier = Depends(get_notifier),
+) -> InventoryService:
+    """Provide an :class:`InventoryService` bound to the request session."""
+    return InventoryService(inventory, departments, hospitals, session, audit, notifier=notifier)
+
+
+def get_inventory_po_service(
+    orders: InventoryPurchaseOrderRepository = Depends(get_inventory_po_repository),
+    inventory: InventoryRepository = Depends(get_inventory_repository),
+    vendors: ProcurementRepository = Depends(get_procurement_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> InventoryPurchaseOrderService:
+    """Provide an :class:`InventoryPurchaseOrderService` bound to the request session.
+
+    Vendors come from Pharmacy's repository: the table is shared by design
+    (``docs/modules/09-inventory.md`` §20).
+    """
+    return InventoryPurchaseOrderService(orders, inventory, vendors, hospitals, session, audit)
+
+
+# ── Reports module ──────────────────────────────────────────────────────────
+def get_report_service(
+    reports: ReportRepository = Depends(get_report_repository),
+    hospitals: HospitalRepository = Depends(get_hospital_repository),
+    doctors: DoctorRepository = Depends(get_doctor_repository),
+    session: AsyncSession = Depends(get_db_session),
+    audit: AuditSink = Depends(get_audit_sink),
+) -> ReportService:
+    """Provide a :class:`ReportService` bound to the request session.
+
+    The session and audit sink are there for one thing: an export records an
+    audit entry and commits it. Every other report method only reads.
+    """
+    return ReportService(reports, hospitals, doctors, session, audit)
 
 
 # ── Appointment module ──────────────────────────────────────────────────────
@@ -338,27 +547,18 @@ def get_invoice_draft_sink(
     return BillingInvoiceDraftSink(billing)
 
 
-def get_slot_ranker() -> SlotRanker | None:
-    """Provide the AI slot ranker, when the AI stack is configured.
+def get_slot_ranker(
+    runtime: AIRuntime = Depends(provide_ai_runtime),
+) -> SlotRanker | None:
+    """Provide the AI slot ranker, or ``None`` when AI is not configured on this server.
 
-    Returns ``None`` when the AI platform is unavailable, which makes
-    ``POST /appointments/recommend-slot`` return an empty list instead of
-    failing. Booking by hand must never depend on the AI stack being up
-    (module spec §18 gates the feature behind a flag for the same reason).
+    With ``None``, ``POST /appointments/recommend-slot`` answers
+    ``AI_NOT_CONFIGURED`` and booking by hand is unaffected. Building the
+    ranker is two attribute assignments: no I/O happens per request.
     """
-    try:
-        from app.ai.prompts.registry import PromptRegistry
-        from app.ai.providers import registry as provider_registry
-        from app.ai.services.ai_service import AIService
-        from app.services.slot_ranker import AISlotRanker
-
-        prompts = PromptRegistry()
-        prompts.load_all("app/ai/prompts/templates")
-        return AISlotRanker(AIService(provider_registry, prompts), prompts)
-    except Exception:  # noqa: BLE001 — an unconfigured AI stack is not an error here
-        # No provider credentials, no templates on disk, or the AI package is
-        # mid-refactor: none of that should stop a receptionist booking.
+    if not runtime.status.configured:
         return None
+    return AISlotRanker(runtime.service, runtime.prompts)
 
 
 def get_appointment_service(
@@ -412,9 +612,25 @@ __all__ = [
     # Department module
     "get_department_service",
     "get_department_usage_source",
+    # Notifications module
+    "get_notification_service",
+    "get_notifier",
     # Billing module
     "get_billing_service",
+    "get_charge_sink",
+    # Inventory module
+    "get_inventory_po_service",
+    "get_inventory_service",
+    # Laboratory module
+    "get_lab_catalog_service",
+    "get_lab_service",
+    # Pharmacy module
+    "get_dispensing_service",
+    "get_pharmacy_catalog_service",
+    "get_procurement_service",
     "get_service_catalog_service",
+    # Reports module
+    "get_report_service",
     # Appointment module
     "get_appointment_service",
     "get_invoice_draft_sink",

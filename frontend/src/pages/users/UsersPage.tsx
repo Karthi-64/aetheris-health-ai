@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import { UserCog, UserPlus } from 'lucide-react'
 import PageHeader from '@/components/layout/PageHeader'
 import { DataTable } from '@/components/ui/data-table'
@@ -6,7 +7,10 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { useUsers, type ManagedUser, type UserStatus } from '@/api/users'
+import { ApiError } from '@/api/types'
+import { useResendInvitation, useUsers, type ManagedUser, type UserStatus } from '@/api/users'
+import { usePermissions } from '@/hooks/usePermissions'
+import { apiErrorMessage } from '@/lib/apiErrors'
 import { usersColumns } from './columns'
 import { InviteUserDialog } from './InviteUserDialog'
 import { EditUserDialog } from './EditUserDialog'
@@ -21,6 +25,42 @@ const STATUS_FILTERS: { value: string; label: string }[] = [
   { value: 'invited', label: 'Invited' },
   { value: 'suspended', label: 'Suspended' },
 ]
+
+/**
+ * Sends the invitation again and reports what the API said happened to it.
+ * The returned handler is only ever called from a click.
+ */
+function useResendInvitationHandler() {
+  const resendInvitation = useResendInvitation()
+  // Users with a resend in flight: a second click on the same row is ignored
+  // until the first has been answered.
+  const resending = useRef(new Set<string>())
+
+  async function handleResendInvitation(user: ManagedUser) {
+    if (resending.current.has(user.id)) return
+    resending.current.add(user.id)
+    try {
+      const { delivery } = await resendInvitation.mutateAsync(user.id)
+      if (delivery === 'queued') {
+        toast.success(`Invitation queued for ${user.email}`, {
+          description: 'Delivery is not confirmed.',
+        })
+      } else {
+        toast.error(`No invitation was sent to ${user.email}. Email delivery is not available.`)
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError && err.status === 429
+          ? `Too many invitations were sent to ${user.email}. Try again later.`
+          : apiErrorMessage(err, "Couldn't resend the invitation. Please try again."),
+      )
+    } finally {
+      resending.current.delete(user.id)
+    }
+  }
+
+  return handleResendInvitation
+}
 
 /** Admin user management (module 02 §12): list, invite, roles, deactivate. */
 export default function UsersPage() {
@@ -61,6 +101,9 @@ export default function UsersPage() {
   const users = data?.items ?? []
   const pageCount = data?.pagination.totalPages ?? 1
 
+  const { can } = usePermissions()
+  const handleResendInvitation = useResendInvitationHandler()
+
   const inviteButton = (
     <Button className="rounded-full">
       <UserPlus className="size-4" /> Invite user
@@ -89,6 +132,10 @@ export default function UsersPage() {
             onEdit: setEditTarget,
             onDeactivate: setStatusTarget,
             onReactivate: setStatusTarget,
+            // Sending an invitation needs the permission that creating one does.
+            onResendInvitation: can('user.create')
+              ? (user) => void handleResendInvitation(user)
+              : undefined,
           })}
           data={users}
           isLoading={isLoading}
@@ -100,7 +147,7 @@ export default function UsersPage() {
           serverPagination={{ page, totalPages: pageCount, onPageChange: setPage }}
           toolbarRight={
             <Select value={statusFilter} onValueChange={changeStatus}>
-              <SelectTrigger className="w-44">
+              <SelectTrigger className="w-44" aria-label="Filter by status">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

@@ -15,9 +15,13 @@ aetheris-health-ai/
 │   ├── migrations/     # Alembic database migrations
 │   ├── tests/          # Unit, integration, and API tests
 │   └── Dockerfile      # Production multi-stage build
-├── frontend/           # React 18 + Vite + Tailwind + Shadcn UI
+├── frontend/           # Hospital app (staff): React 18 + Vite + Tailwind + Shadcn UI
 │   ├── src/            # Application source
 │   ├── Dockerfile      # Development image (Vite dev server)
+│   └── package.json
+├── patient-app/        # Patient App: a separate Vite workspace (see patient-app/README.md)
+│   ├── src/            # Application source
+│   ├── packages/       # design-tokens, ui, api-core (workspace packages)
 │   └── package.json
 ├── docker-compose.yml  # Local development stack (Postgres, Redis, backend, frontend)
 ├── Makefile            # Developer commands
@@ -108,7 +112,7 @@ Run `make help` for the full list:
 | `make logs` | Tail service logs |
 | `make migrate` | Apply database migrations |
 | `make seed` | Seed demo data |
-| `make test` | Run all backend + frontend tests |
+| `make test` | Run all backend, frontend and Patient App tests |
 | `make lint` | Run all lint and type checks |
 | `make format` | Format backend code |
 | `make dev` | Start frontend dev server |
@@ -117,6 +121,10 @@ Run `make help` for the full list:
 | `make frontend-test` | Frontend tests only |
 | `make frontend-lint` | Frontend lint only |
 | `make frontend-build` | Build frontend for production |
+| `make patient-dev` | Start the Patient App dev server (http://localhost:5174) |
+| `make patient-test` | Patient App tests only |
+| `make patient-lint` | Patient App lint, type check and design-token check |
+| `make patient-build` | Build the Patient App for production |
 
 ---
 
@@ -134,6 +142,28 @@ natively outside Docker, it falls back to `http://localhost:8000`.
 ```bash
 docker compose up -d --build frontend
 ```
+
+---
+
+## Patient App
+
+The Patient App is a second, separate web application for patients: phone
+OTP sign-in, hospital and doctor discovery, availability, appointment
+booking, and the patient's own appointments. It lives in `patient-app/`,
+has its own lockfile and build, and talks only to `/api/v1/patient/*`.
+
+It is not part of `docker-compose.yml`; run it next to the stack:
+
+```bash
+make up                         # backend on http://localhost:8000
+cd patient-app && npm ci        # first time only
+make patient-dev                # http://localhost:5174
+```
+
+A hospital appears in the Patient App only when it is active and has
+`feature.patient_app.enabled` set to `true` in its settings (the demo
+hospital from `make seed` has it). See [`patient-app/README.md`](patient-app/README.md)
+and [`docs/modules/15-patient-app.md`](docs/modules/15-patient-app.md).
 
 ---
 
@@ -158,9 +188,10 @@ The seed is idempotent — safe to run multiple times.
 ## Testing
 
 ```bash
-make test           # run all tests (backend + frontend)
+make test           # run all tests (backend + frontend + Patient App)
 make backend-test   # backend only (pytest)
-make frontend-test  # frontend only (vitest)
+make frontend-test  # Hospital frontend only (vitest)
+make patient-test   # Patient App only (vitest)
 ```
 
 ---
@@ -168,7 +199,7 @@ make frontend-test  # frontend only (vitest)
 ## Linting & Formatting
 
 ```bash
-make lint       # backend (ruff + mypy) + frontend (eslint)
+make lint       # backend (ruff + mypy) + frontend (eslint) + Patient App (eslint, tsc, tokens)
 make format     # backend code formatting (ruff)
 ```
 

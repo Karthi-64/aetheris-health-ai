@@ -23,7 +23,10 @@ class AuditLog(Base):
     """One immutable audit entry.
 
     :attr:`hospital_id` is ``NULL`` for platform-level events and
-    :attr:`actor_user_id` is ``NULL`` for system actions (§2.21).
+    :attr:`actor_user_id` is ``NULL`` for system actions (§2.21). A Patient App
+    action has ``actor_type = "patient"`` and names its account in
+    :attr:`patient_account_id`; a patient is never a ``users`` row, so
+    :attr:`actor_user_id` stays ``NULL`` for it.
     """
 
     __tablename__ = "audit_logs"
@@ -33,6 +36,7 @@ class AuditLog(Base):
         Index("ix_audit_actor", "actor_user_id"),
         Index("ix_audit_target", "target_type", "target_id"),
         Index("ix_audit_action", "action"),
+        Index("ix_audit_patient_account", "patient_account_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -43,7 +47,12 @@ class AuditLog(Base):
         UUID(as_uuid=True), nullable=True, comment="Acting user; NULL for system actions."
     )
     actor_type: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="user", comment="user / system / ai."
+        String(20), nullable=False, default="user", comment="user / system / ai / patient."
+    )
+    patient_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment="Acting patient account, for actor_type 'patient'; NULL otherwise.",
     )
     action: Mapped[str] = mapped_column(
         String(100), nullable=False, comment="Dotted action name, e.g. patient.created."

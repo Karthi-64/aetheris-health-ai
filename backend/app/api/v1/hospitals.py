@@ -4,6 +4,8 @@ Implements the caller-hospital endpoints of
 ``docs/modules/14-hospital-settings.md`` §9:
 
 - ``GET  /hospitals/current``       — public/branding fields, any authenticated user
+- ``GET  /hospitals/current/feature-flags`` — which gated features are usable,
+  any authenticated user
 - ``GET  /hospitals/current/full``  — all fields, ``settings.read``
 - ``PATCH /hospitals/current``      — editable fields, ``settings.update``
 
@@ -27,6 +29,7 @@ from app.core.exceptions import BusinessRuleError
 from app.models.user import User
 from app.schemas.common import SuccessResponse
 from app.schemas.hospital import (
+    FeatureFlagsResponse,
     HospitalPublicResponse,
     HospitalSettingsResponse,
     UpdateHospitalSettingsRequest,
@@ -77,6 +80,30 @@ async def get_current_hospital(
     hospital = await service.get_current(_tenant_of(current_user))
     data = HospitalPublicResponse.model_validate(hospital)
     return SuccessResponse[HospitalPublicResponse](message="Hospital retrieved.", data=data)
+
+
+@router.get(
+    "/current/feature-flags",
+    response_model=SuccessResponse[FeatureFlagsResponse],
+    summary="Get my hospital's feature availability",
+    description=(
+        "Report which gated features the caller's hospital can use right now, as "
+        "one boolean per feature. Available to any authenticated user — the "
+        "interface needs it to decide whether to show a control.\n\n"
+        "`available` is true only when the feature is enabled for the hospital "
+        "and the server is configured to serve it. The response does not say "
+        "which of the two is missing, and it never contacts an AI provider: "
+        "configured is not the same as reachable."
+    ),
+    responses={200: {"description": "Feature availability returned."}, **_COMMON_RESPONSES},
+)
+async def get_current_feature_flags(
+    current_user: User = Depends(get_current_user),
+    service: HospitalService = Depends(get_hospital_service),
+) -> SuccessResponse[FeatureFlagsResponse]:
+    """Return the caller's hospital feature availability (module spec §9)."""
+    data = await service.get_feature_flags(_tenant_of(current_user))
+    return SuccessResponse[FeatureFlagsResponse](message="Feature flags retrieved.", data=data)
 
 
 @router.get(

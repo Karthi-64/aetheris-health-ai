@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Loader2, Plus, X } from 'lucide-react'
 import {
@@ -11,15 +11,32 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { ApiError } from '@/api/types'
 import {
   useAssignRole,
   useRemoveRole,
   useRoles,
   useUser,
   type ManagedUser,
+  type RoleSummary,
 } from '@/api/users'
+import { apiErrorMessage } from '@/lib/apiErrors'
+import { MOCK_PERMISSIONS_BY_ROLE, ROLE_KEY_BY_NAME } from '@/lib/rbac'
+import { useAuthStore } from '@/store/auth-store'
 import { userFullName } from './usersShared'
+
+/**
+ * Whether the signed-in user may grant `role`. The API refuses a role that
+ * includes a permission the actor does not hold
+ * (`backend/app/services/user_service.py` `_assert_grantable`). `GET /roles`
+ * does not list a role's permissions, so this is known only for the seeded
+ * system roles; any other role stays on offer and the API decides.
+ */
+function canGrant(role: RoleSummary, held: string[]): boolean {
+  const key = role.is_system ? ROLE_KEY_BY_NAME[role.name] : undefined
+  if (!key) return true
+  // `dashboard.view` is a client-only code the API never issues or checks.
+  return MOCK_PERMISSIONS_BY_ROLE[key].every((p) => p === 'dashboard.view' || held.includes(p))
+}
 
 interface ManageRolesDialogProps {
   user: ManagedUser | null
@@ -32,6 +49,10 @@ export function ManageRolesDialog({ user: staleUser, onClose }: ManageRolesDialo
   const { data: rolesData, isLoading: rolesLoading } = useRoles()
   const assignRole = useAssignRole()
   const removeRole = useRemoveRole()
+  const held = useAuthStore((s) => s.user?.permissions)
+  // `isPending` only disables the buttons after a re-render; this also stops a
+  // second assign or remove fired before that happens.
+  const busy = useRef(false)
 
   // The `user` prop is a snapshot from the table row; after an assign/remove
   // the query cache holds fresher data (mutations invalidate `users.all`).
@@ -40,11 +61,12 @@ export function ManageRolesDialog({ user: staleUser, onClose }: ManageRolesDialo
   const user = freshUser ?? staleUser
 
   const availableRoles = (rolesData?.items ?? []).filter(
-    (r) => !user?.roles.some((assigned) => assigned.id === r.id),
+    (r) => !user?.roles.some((assigned) => assigned.id === r.id) && canGrant(r, held ?? []),
   )
 
   async function handleAssign() {
-    if (!user || !selectedRole) return
+    if (!user || !selectedRole || busy.current) return
+    busy.current = true
     try {
       await assignRole.mutateAsync({ userId: user.id, roleId: selectedRole })
       const roleName = availableRoles.find((r) => r.id === selectedRole)?.name
@@ -52,22 +74,25 @@ export function ManageRolesDialog({ user: staleUser, onClose }: ManageRolesDialo
         description: 'Their sessions were revoked so the new permissions take effect.',
       })
       setSelectedRole('')
-    } catch {
-      toast.error('Could not assign the role. You may lack the role.assign permission.')
+    } catch (err) {
+      // A refusal (403 escalation, 404 role gone) in the API's own words.
+      toast.error(apiErrorMessage(err, "Couldn't assign the role. Please try again."))
+    } finally {
+      busy.current = false
     }
   }
 
   async function handleRemove(roleId: string, roleName: string) {
-    if (!user) return
+    if (!user || busy.current) return
+    busy.current = true
     try {
       await removeRole.mutateAsync({ userId: user.id, roleId })
       toast.success(`Removed ${roleName} from ${userFullName(user)}`)
     } catch (err) {
-      const message =
-        err instanceof ApiError && err.status === 400
-          ? 'This role cannot be removed — the user must keep at least one admin role.'
-          : 'Could not remove the role. Please try again.'
-      toast.error(message)
+      // The API explains a refusal, e.g. removing the last administrator (400).
+      toast.error(apiErrorMessage(err, "Couldn't remove the role. Please try again."))
+    } finally {
+      busy.current = false
     }
   }
 
@@ -119,7 +144,7 @@ export function ManageRolesDialog({ user: staleUser, onClose }: ManageRolesDialo
             <p className="font-label text-label-caps text-on-surface-variant">Assign a role</p>
             <div className="flex gap-2">
               <Select value={selectedRole} onValueChange={setSelectedRole}>
-                <SelectTrigger className="flex-1">
+                <SelectTrigger className="flex-1" aria-label="Assign a role">
                   <SelectValue placeholder={rolesLoading ? 'Loading roles…' : 'Select a role'} />
                 </SelectTrigger>
                 <SelectContent>

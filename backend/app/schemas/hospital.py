@@ -19,6 +19,8 @@ from uuid import UUID  # noqa: TC003
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
+    "FeatureFlagState",
+    "FeatureFlagsResponse",
     "HospitalPublicResponse",
     "HospitalSettingsResponse",
     "UpdateHospitalSettingsRequest",
@@ -161,3 +163,28 @@ class UpdateHospitalSettingsRequest(BaseModel):
             msg = f"These fields cannot be set to null: {', '.join(offenders)}."
             raise ValueError(msg)
         return self
+
+
+class FeatureFlagState(BaseModel):
+    """Whether one gated feature can be used right now.
+
+    One boolean, on purpose. Any signed-in user of the hospital can read it,
+    including roles that cannot use the feature, so it does not say *why* a
+    feature is unavailable: a separate "flag is on" value would let them infer
+    from "on but unavailable" that the server has no AI key.
+    """
+
+    available: bool = Field(
+        description=(
+            "The hospital's flag is on AND the server is configured to serve the "
+            "feature. Configured is not the same as reachable."
+        )
+    )
+
+
+class FeatureFlagsResponse(BaseModel):
+    """The gated features of the caller's hospital (module spec §9)."""
+
+    flags: dict[str, FeatureFlagState] = Field(
+        description="Only the well-known flag keys; never other hospital settings."
+    )

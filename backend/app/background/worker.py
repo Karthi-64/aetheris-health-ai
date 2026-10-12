@@ -19,6 +19,10 @@ from typing import TYPE_CHECKING, Any
 from arq import cron
 from arq.connections import RedisSettings
 
+from app.background.jobs.send_notifications import (
+    EMAIL_QUEUE_POLL_SECONDS,
+    deliver_notification_emails,
+)
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 
@@ -46,7 +50,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     from app.database import initialize_database
 
     initialize_database(database_url=settings.DATABASE_URL)
-    logger.info("worker_started", jobs=["sweep_no_shows"])
+    logger.info("worker_started", jobs=["sweep_no_shows", "deliver_notification_emails"])
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
@@ -105,7 +109,10 @@ class WorkerSettings:
     is the whole wiring.
     """
 
-    functions: list[Callable[..., Coroutine[Any, Any, Any]]] = [sweep_no_shows]
+    functions: list[Callable[..., Coroutine[Any, Any, Any]]] = [
+        sweep_no_shows,
+        deliver_notification_emails,
+    ]
 
     cron_jobs = [
         # Every five minutes, on the minute.
@@ -113,7 +120,15 @@ class WorkerSettings:
             sweep_no_shows,
             minute=set(range(0, 60, NO_SHOW_SWEEP_MINUTES)),
             run_at_startup=False,
-        )
+        ),
+        # The notification email queue (module spec 11 §5). Polled several
+        # times a minute so an email leaves within AC-2's 30 seconds, and run
+        # at startup so whatever queued up during an outage drains at once.
+        cron(
+            deliver_notification_emails,
+            second=set(range(0, 60, EMAIL_QUEUE_POLL_SECONDS)),
+            run_at_startup=True,
+        ),
     ]
 
     on_startup = startup

@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 from app.core.audit import AuditEvent, AuditSink
 from app.core.exceptions import NotFoundError
+from app.core.feature_flags import AI_SLOT_RECOMMENDATION, KNOWN_FLAGS, flag_is_on
+from app.schemas.hospital import FeatureFlagsResponse, FeatureFlagState
 
 if TYPE_CHECKING:
     from app.database.unit_of_work import UnitOfWork
@@ -29,6 +31,9 @@ class HospitalService:
     :param uow: Transaction coordinator — settings writes commit atomically
         with their audit entry.
     :param audit: Sink every mutation is recorded against.
+    :param ai_configured: Whether this server is configured to serve AI
+        features. Decides, with the hospital's flag, what the capability read
+        reports.
     """
 
     def __init__(
@@ -36,10 +41,13 @@ class HospitalService:
         hospitals: HospitalRepository,
         uow: UnitOfWork,
         audit: AuditSink,
+        *,
+        ai_configured: bool = False,
     ) -> None:
         self._hospitals = hospitals
         self._uow = uow
         self._audit = audit
+        self._ai_configured = ai_configured
 
     async def get_current(self, hospital_id: uuid.UUID) -> Hospital:
         """Return the caller's hospital.
@@ -53,6 +61,30 @@ class HospitalService:
             msg = "Hospital not found."
             raise NotFoundError(msg)
         return hospital
+
+    async def get_feature_flags(self, hospital_id: uuid.UUID) -> FeatureFlagsResponse:
+        """Report which gated features the caller's hospital can use right now.
+
+        Returns only the well-known flags, one boolean each. A feature is
+        available when the hospital's stored flag is exactly ``True`` and the
+        server can serve it; the two reasons for "not available" are not told
+        apart. Reads one row and calls no provider.
+
+        :param hospital_id: Tenant to report on.
+        :returns: The availability of each known flag.
+        :raises NotFoundError: If the hospital does not exist or is inactive.
+        """
+        hospital = await self.get_current(hospital_id)
+        # Flags that need something from the server as well as the hospital.
+        server_ready = {AI_SLOT_RECOMMENDATION: self._ai_configured}
+        return FeatureFlagsResponse(
+            flags={
+                key: FeatureFlagState(
+                    available=flag_is_on(hospital.settings, key) and server_ready.get(key, True)
+                )
+                for key in KNOWN_FLAGS
+            }
+        )
 
     async def update_current(
         self,

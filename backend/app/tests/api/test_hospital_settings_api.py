@@ -17,9 +17,18 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from app.ai.runtime import set_ai_runtime
 from app.api.dependencies.db import get_db_session
 from app.core.security import create_access_token
 from app.main import create_app
+from app.tests.ai_fakes import (
+    FAKE_GROQ_KEY,
+    FAST_MODEL,
+    RecordingHandler,
+    contains_any,
+    groq_reply,
+    make_runtime,
+)
 from app.tests.conftest import grant_permissions
 
 if TYPE_CHECKING:
@@ -407,3 +416,224 @@ class TestSettingsObjectIsShared:
         assert "platform administrator" in response.text
         # Nothing in the request was applied, including the legitimate key.
         assert await self._settings(api, admin) == {"feature.ai.slot_recommendation": False}
+
+
+FLAGS_URL = "/api/v1/hospitals/current/feature-flags"
+SLOT_FLAG = "feature.ai.slot_recommendation"
+
+
+async def _store_settings(
+    session: AsyncSession, hospital_id: uuid.UUID, settings: dict[str, Any]
+) -> None:
+    """Write ``hospitals.settings`` with a Core statement and read it back.
+
+    Not an ORM assignment: Python treats ``1 == True``, so swapping one for the
+    other through the ORM would look like no change and never reach the row.
+    """
+    from sqlalchemy import update
+
+    from app.models.hospital import Hospital
+
+    hospital = await session.get(Hospital, hospital_id)
+    assert hospital is not None
+    await session.execute(
+        update(Hospital.__table__)  # type: ignore[arg-type]
+        .where(Hospital.__table__.c.id == hospital_id)
+        .values(settings=settings)
+    )
+    await session.refresh(hospital)
+
+
+@pytest_asyncio.fixture
+async def fake_groq() -> AsyncGenerator[RecordingHandler]:
+    """Turn AI on over a fake transport, and report anything that reaches it."""
+    handler = RecordingHandler(lambda _request: groq_reply("{}"))
+    runtime = make_runtime(handler)
+    set_ai_runtime(runtime)
+    yield handler
+    if runtime.provider is not None:
+        await runtime.provider.aclose()
+
+
+class TestFeatureFlags:
+    """GET /hospitals/current/feature-flags — what the interface may offer.
+
+    One boolean per known flag: the hospital has the feature *and* the server
+    can serve it. It never says which is missing, and never calls a provider.
+    """
+
+    async def _flags(self, api: AsyncClient, headers: dict[str, str]) -> dict[str, Any]:
+        response = await api.get(FLAGS_URL, headers=headers)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["success"] is True
+        assert body["message"] == "Feature flags retrieved."
+        assert set(body["data"]) == {"flags"}
+        return dict(body["data"]["flags"])
+
+    async def test_requires_authentication(self, api: AsyncClient) -> None:
+        response = await api.get(FLAGS_URL)
+
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "AUTHENTICATION_REQUIRED"
+
+    async def test_garbage_token_is_rejected(self, api: AsyncClient) -> None:
+        response = await api.get(FLAGS_URL, headers={"Authorization": "Bearer garbage"})
+
+        assert response.status_code == 401
+
+    async def test_a_user_with_no_permissions_can_read_it(
+        self, api: AsyncClient, no_settings: dict[str, str]
+    ) -> None:
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": False}}
+
+    async def test_flag_absent_is_unavailable(
+        self, api: AsyncClient, no_settings: dict[str, str], fake_groq: RecordingHandler
+    ) -> None:
+        """AI is configured on the server, but the hospital was not given the feature."""
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": False}}
+        assert fake_groq.requests == []
+
+    async def test_flag_on_without_server_ai_is_unavailable(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+    ) -> None:
+        await _store_settings(db_session, hospital_id, {SLOT_FLAG: True})
+
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": False}}
+
+    async def test_flag_on_with_the_kill_switch_off_is_unavailable(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+    ) -> None:
+        await _store_settings(db_session, hospital_id, {SLOT_FLAG: True})
+        set_ai_runtime(make_runtime(lambda _request: groq_reply("{}"), AI_ENABLED=False))
+
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": False}}
+
+    async def test_flag_on_with_server_ai_is_available(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+        fake_groq: RecordingHandler,
+    ) -> None:
+        await _store_settings(db_session, hospital_id, {SLOT_FLAG: True})
+
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": True}}
+        # Configured is not reachable: reading the capability calls no provider.
+        assert fake_groq.requests == []
+
+    @pytest.mark.parametrize("stored", ["true", 1, "on", False, None, [True]])
+    async def test_only_an_exact_true_counts(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+        fake_groq: RecordingHandler,
+        stored: Any,
+    ) -> None:
+        await _store_settings(db_session, hospital_id, {SLOT_FLAG: stored})
+
+        assert await self._flags(api, no_settings) == {SLOT_FLAG: {"available": False}}
+
+    async def test_the_two_unavailable_cases_are_indistinguishable(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+    ) -> None:
+        """A caller cannot tell "not enabled for us" from "server has no AI key"."""
+        # Hospital flag on, server AI off.
+        await _store_settings(db_session, hospital_id, {SLOT_FLAG: True})
+        flag_on_ai_off = await api.get(FLAGS_URL, headers=no_settings)
+
+        # Hospital flag off, server AI on.
+        await _store_settings(db_session, hospital_id, {})
+        runtime = make_runtime(lambda _request: groq_reply("{}"))
+        set_ai_runtime(runtime)
+        flag_off_ai_on = await api.get(FLAGS_URL, headers=no_settings)
+
+        assert flag_on_ai_off.json()["data"] == flag_off_ai_on.json()["data"]
+        assert set(flag_on_ai_off.json()["data"]["flags"][SLOT_FLAG]) == {"available"}
+        assert "enabled" not in flag_on_ai_off.text
+
+    async def test_only_known_flags_are_returned_never_other_settings(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+        fake_groq: RecordingHandler,
+    ) -> None:
+        await _store_settings(
+            db_session,
+            hospital_id,
+            {
+                SLOT_FLAG: True,
+                "billing.tax_rate": "18.00",
+                "appointment.no_show_grace_minutes": 45,
+                "feature.future.thing": True,
+            },
+        )
+
+        response = await api.get(FLAGS_URL, headers=no_settings)
+
+        assert response.json()["data"] == {"flags": {SLOT_FLAG: {"available": True}}}
+        leaked = contains_any(
+            [response.text],
+            ["billing", "18.00", "no_show", "future", "groq", FAST_MODEL, FAKE_GROQ_KEY, "api."],
+        )
+        assert leaked is False
+
+    async def test_another_hospitals_flag_does_not_change_this_ones_answer(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        other_hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+        fake_groq: RecordingHandler,
+    ) -> None:
+        await _store_settings(db_session, other_hospital_id, {SLOT_FLAG: True})
+        other_user = await _make_user(db_session, other_hospital_id, [])
+
+        mine = await self._flags(api, no_settings)
+        theirs = await self._flags(api, _auth_header(other_user, other_hospital_id))
+
+        assert mine == {SLOT_FLAG: {"available": False}}
+        assert theirs == {SLOT_FLAG: {"available": True}}
+
+    async def test_inactive_hospital_is_refused_at_authentication(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        no_settings: dict[str, str],
+    ) -> None:
+        """Staff of a deactivated hospital no longer authenticate at all.
+
+        This used to reach the endpoint and get its 404. The request is now
+        stopped earlier, in ``get_current_user``, exactly as for a deactivated
+        account — so a switched-off hospital cannot use any endpoint.
+        """
+        from app.models.hospital import Hospital
+
+        hospital = await db_session.get(Hospital, hospital_id)
+        assert hospital is not None
+        hospital.is_active = False
+        await db_session.flush()
+
+        response = await api.get(FLAGS_URL, headers=no_settings)
+
+        assert response.status_code == 403
+        assert response.json()["message"] == "Account is not active."

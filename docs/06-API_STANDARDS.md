@@ -115,8 +115,35 @@ Documented in `app/core/error_codes.py`. A few examples:
 | `RESOURCE_CONFLICT` | 409 | e.g. duplicate MRN |
 | `BUSINESS_RULE_VIOLATION` | 400 | e.g. cannot book past appointment |
 | `RATE_LIMITED` | 429 | Too many requests |
-| `AI_PROVIDER_UNAVAILABLE` | 503 | All AI providers failing |
+| `FEATURE_DISABLED` | 403 | The hospital has not been given this feature (its feature flag is not on) |
+| `AI_NOT_CONFIGURED` | 503 | AI is not configured on this server: no provider key, or the AI kill switch is off |
+| `AI_PROVIDER_UNAVAILABLE` | 503 | The AI provider could not be used: unreachable, or it answered with an error |
+| `AI_PROVIDER_TIMEOUT` | 503 | The AI provider did not answer within the deadline |
+| `AI_RESPONSE_INVALID` | 503 | The AI provider answered, but the server rejected the answer |
 | `INTERNAL_ERROR` | 500 | Unhandled |
+
+**AI failure codes.** All four `AI_*` codes are HTTP 503, so a client must branch on
+`error_code`, not on the status. Today they are returned by one endpoint,
+`POST /api/v1/appointments/recommend-slot`; `FEATURE_DISABLED` is returned there too. The
+`message` of each is fixed text and `errors` is `null` — nothing from the provider, the
+prompt or the model's answer is put in a response:
+
+| Code | `message` |
+|---|---|
+| `AI_NOT_CONFIGURED` | `AI suggestions are not configured on this server.` |
+| `AI_PROVIDER_UNAVAILABLE` | `The AI service is unavailable right now. Choose a slot manually.` |
+| `AI_PROVIDER_TIMEOUT` | `The AI service took too long to respond. Choose a slot manually.` |
+| `AI_RESPONSE_INVALID` | `The AI suggestion could not be used. Choose a slot manually or try again.` |
+
+There is one provider and one attempt per request — no retry and no fallback provider —
+so `AI_PROVIDER_UNAVAILABLE` means that single call failed, not that several providers
+were tried. It also covers a provider-side error such as a rejected key, the provider's
+own rate limit or a model it no longer serves, and this server's cap on concurrent AI
+calls. `AI_RESPONSE_INVALID` covers an answer that was truncated, not valid JSON, the
+wrong shape or outside the options the server offered, and a suggestion that failed the
+server's re-check against the database. An AI failure never blocks the non-AI path: the
+user completes the task by hand. The full contract is in
+[18-API_CONTRACTS.md](18-API_CONTRACTS.md) §5.6.
 
 ## 6. HTTP Status Codes
 
@@ -160,7 +187,7 @@ Query params:
 
 Response `metadata.pagination` shown in section 5.2.
 
-For very large datasets (audit logs, AI interactions), use cursor pagination:
+For very large datasets (audit logs; AI interactions once they are stored — planned, there is no such list today), use cursor pagination:
 - Query params: `cursor`, `page_size`
 - Response: `metadata.pagination.next_cursor`
 
@@ -198,7 +225,7 @@ Required for: `POST /invoices/{id}/payments`, `POST /appointments`, `POST /presc
 - Requests: `Content-Type: application/json`
 - Responses: `Content-Type: application/json` unless the endpoint explicitly returns a file (PDF, CSV)
 - File uploads: `multipart/form-data`
-- Streaming AI responses: `text/event-stream` (SSE) or `application/x-ndjson`
+- Streaming AI responses: `text/event-stream` (SSE) or `application/x-ndjson` — **planned**; no endpoint streams today (§20)
 
 ## 14. CORS
 
@@ -212,7 +239,7 @@ Applied at the middleware level, tracked in Redis:
 
 - Anonymous: 60 requests/minute per IP
 - Authenticated: 300 requests/minute per user, 1000/minute per hospital
-- AI endpoints: separate lower limits (cost control)
+- AI endpoints: a separate lower limit (cost control) — 30 requests/minute per user by default. Today that is `POST /appointments/recommend-slot`; the hospital limit applies to it as well
 
 Response headers:
 ```
@@ -252,6 +279,11 @@ Makes debugging trivial.
 - Response includes a short-lived signed URL for download
 
 ## 20. Streaming Endpoints
+
+> **Planned — not built.** No endpoint streams today and `POST /ai/summarize` does not
+> exist. The one AI endpoint, `POST /appointments/recommend-slot`, returns an ordinary
+> JSON envelope. The convention below is what a streaming endpoint must follow when one
+> is added.
 
 AI endpoints that produce large or long responses stream:
 
@@ -330,7 +362,7 @@ GET    /api/v1/patients
 POST   /api/v1/patients
 GET    /api/v1/patients/{id}
 PATCH  /api/v1/patients/{id}
-GET    /api/v1/patients/{id}/summary       # AI-generated
+GET    /api/v1/patients/{id}/summary       # AI-generated — planned, not built
 GET    /api/v1/patients/{id}/consultations
 POST   /api/v1/patients/{id}/documents
 
@@ -350,6 +382,9 @@ POST   /api/v1/appointments/{id}/start
 POST   /api/v1/appointments/{id}/complete
 POST   /api/v1/appointments/{id}/cancel
 POST   /api/v1/appointments/{id}/no-show
+POST   /api/v1/appointments/recommend-slot  # optional AI suggestion of one free slot; advisory, books nothing
+
+GET    /api/v1/hospitals/current/feature-flags  # which gated features the caller's hospital can use
 
 GET    /api/v1/services
 POST   /api/v1/services
@@ -370,9 +405,11 @@ POST   /api/v1/notifications/read-all
 GET    /api/v1/audit-logs
 GET    /api/v1/reports/dashboard
 
-POST   /api/v1/ai/summarize
-POST   /api/v1/ai/chat
-GET    /api/v1/ai/usage
+POST   /api/v1/ai/summarize                # planned, not built
+POST   /api/v1/ai/chat                     # planned, not built
+GET    /api/v1/ai/usage                    # planned, not built
 ```
+
+The only AI endpoint that exists today is `POST /api/v1/appointments/recommend-slot`.
 
 Every one of these has (or will have) a full request/response schema defined in the corresponding module spec.

@@ -14,12 +14,16 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.api.dependencies.db import get_db_session
+from app.core.config import settings
 from app.core.security import create_access_token, hash_password
 from app.main import create_app
-from app.models.user import User, UserRole
+from app.models.audit_log import AuditLog
+from app.models.password_reset_token import PasswordResetToken
+from app.models.user import User, UserRole, UserStatus
+from app.repositories.notification_repository import NotificationRepository
 from app.tests.conftest import grant_permissions
 
 if TYPE_CHECKING:
@@ -146,6 +150,254 @@ class TestInviteUserPersistence:
         assert response.status_code == 401
 
 
+class TestInvitationContract:
+    """``POST /api/v1/users`` and ``POST /api/v1/users/{id}/invitation``.
+
+    The activation link is a credential for the invited person's account. The
+    API tells the administrator what became of the email and nothing else.
+    The attacks on this are in ``integration/test_invitation_delivery.py``;
+    these pin the response shape the frontend is written against.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mail_transport(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "SMTP_HOST", "smtp.hospital.example")
+
+    async def _invite(self, api: AsyncClient, admin: dict[str, Any]) -> dict[str, Any]:
+        response = await api.post(
+            "/api/v1/users",
+            json={
+                "email": f"invitee-{uuid.uuid4().hex[:12]}@hospital.example",
+                "first_name": "New",
+                "last_name": "Nurse",
+            },
+            headers=admin["headers"],
+        )
+        assert response.status_code == 201, response.text
+        data: dict[str, Any] = response.json()["data"]
+        return data
+
+    async def test_the_invite_response_has_a_delivery_state_and_no_token(
+        self, api: AsyncClient, admin: dict[str, Any]
+    ) -> None:
+        data = await self._invite(api, admin)
+
+        assert "invite_token" not in data, "the activation token is back in the response"
+        assert not [key for key in data if "token" in key.lower()]
+        assert data["invitation"] == {"delivery": "queued"}
+        assert data["status"] == "invited"
+
+    async def test_without_a_mail_transport_the_invite_says_unavailable(
+        self, api: AsyncClient, admin: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "SMTP_HOST", None)
+
+        data = await self._invite(api, admin)
+
+        assert data["invitation"] == {"delivery": "unavailable"}
+        assert "invite_token" not in data
+        assert data["status"] == "invited"
+
+    async def test_resending_returns_only_the_delivery_state(
+        self, api: AsyncClient, admin: dict[str, Any]
+    ) -> None:
+        invited = await self._invite(api, admin)
+
+        response = await api.post(
+            f"/api/v1/users/{invited['id']}/invitation", headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"] == {"delivery": "queued"}
+        assert response.json()["message"] == "Invitation queued."
+
+    async def test_resending_is_audited_with_the_actor_and_without_the_link(
+        self, api: AsyncClient, db_session: AsyncSession, admin: dict[str, Any]
+    ) -> None:
+        invited = await self._invite(api, admin)
+
+        await api.post(f"/api/v1/users/{invited['id']}/invitation", headers=admin["headers"])
+
+        rows = await db_session.execute(
+            select(AuditLog).where(
+                AuditLog.target_id == uuid.UUID(invited["id"]),
+                AuditLog.action == "user.invitation_resent",
+            )
+        )
+        [entry] = rows.scalars().all()
+        assert entry.actor_user_id == admin["id"]
+        assert entry.target_type == "user"
+        assert not entry.before
+        assert not entry.after
+        assert not entry.context
+
+    @staticmethod
+    def _break_the_email_queue(patch: pytest.MonkeyPatch) -> None:
+        """Make the insert into the email queue fail, as an outage would."""
+
+        async def _insert_fails(self: NotificationRepository, **values: Any) -> None:
+            msg = "the queue is unavailable"
+            raise RuntimeError(msg)
+
+        patch.setattr(NotificationRepository, "create_email_delivery", _insert_fails)
+
+    @staticmethod
+    async def _live_tokens(db_session: AsyncSession, user_id: str) -> int:
+        result = await db_session.execute(
+            select(func.count())
+            .select_from(PasswordResetToken)
+            .where(
+                PasswordResetToken.user_id == uuid.UUID(user_id),
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > func.now(),
+            )
+        )
+        return int(result.scalar_one())
+
+    async def test_an_invite_whose_email_could_not_be_queued_says_unavailable(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        admin: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Attack: the administrator is told "queued" for an email that does not exist.
+
+        Email is configured but the queue refused the message. The account is
+        created, the answer is ``unavailable``, and no link is left alive.
+        """
+        self._break_the_email_queue(monkeypatch)
+
+        data = await self._invite(api, admin)
+
+        assert data["invitation"] == {"delivery": "unavailable"}
+        assert data["status"] == "invited"
+        assert not [key for key in data if "token" in key.lower()]
+        assert await self._live_tokens(db_session, data["id"]) == 0
+
+    async def test_a_resend_whose_email_could_not_be_queued_says_unavailable(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        admin: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same honesty on a resend: 200, ``unavailable``, and nothing audited as sent."""
+        invited = await self._invite(api, admin)
+        self._break_the_email_queue(monkeypatch)
+
+        response = await api.post(
+            f"/api/v1/users/{invited['id']}/invitation", headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"] == {"delivery": "unavailable"}
+        assert response.json()["message"] != "Invitation queued."
+        assert response.json()["message"].startswith("No invitation was sent")
+        # The link already in the invited person's mailbox is the one left alive.
+        assert await self._live_tokens(db_session, invited["id"]) == 1
+        resent = await db_session.execute(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(
+                AuditLog.target_id == uuid.UUID(invited["id"]),
+                AuditLog.action == "user.invitation_resent",
+            )
+        )
+        assert resent.scalar_one() == 0
+
+    async def test_resending_without_user_create_is_403(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        admin: dict[str, Any],
+    ) -> None:
+        invited = await self._invite(api, admin)
+        reader = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"reader-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash="test-placeholder-not-a-hash",
+            first_name="Read",
+            last_name="Only",
+        )
+        db_session.add(reader)
+        await db_session.flush()
+        await grant_permissions(
+            db_session, hospital_id=hospital_id, user_id=reader.id, codes=["user.read"]
+        )
+        token = create_access_token(user_id=reader.id, hospital_id=hospital_id)
+
+        response = await api.post(
+            f"/api/v1/users/{invited['id']}/invitation",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+
+    async def test_resending_to_a_user_who_is_not_invited_is_409(
+        self, api: AsyncClient, admin: dict[str, Any]
+    ) -> None:
+        # The admin is an active account: there is no invitation to send again.
+        response = await api.post(
+            f"/api/v1/users/{admin['id']}/invitation", headers=admin["headers"]
+        )
+
+        assert response.status_code == 409, response.text
+
+    async def test_reactivating_a_never_activated_user_reports_invited(
+        self, api: AsyncClient, admin: dict[str, Any]
+    ) -> None:
+        # Not "active": nobody has set a password on this account yet.
+        invited = await self._invite(api, admin)
+        await api.post(f"/api/v1/users/{invited['id']}/deactivate", headers=admin["headers"])
+
+        response = await api.post(
+            f"/api/v1/users/{invited['id']}/reactivate", headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["status"] == "invited"
+
+    @pytest.mark.parametrize(
+        ("endpoint", "action"),
+        [("deactivate", "user.deactivated"), ("reactivate", "user.reactivated")],
+    )
+    async def test_suspending_and_reactivating_each_leave_no_live_link_and_one_audit_entry(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        admin: dict[str, Any],
+        endpoint: str,
+        action: str,
+    ) -> None:
+        """Attack: a link issued before the change still works after it.
+
+        Both operations kill every outstanding link themselves, and record
+        who did it, in the same transaction as the status change.
+        """
+        invited = await self._invite(api, admin)
+        user_id = uuid.UUID(invited["id"])
+        if endpoint == "reactivate":
+            await db_session.execute(
+                update(User).where(User.id == user_id).values(status=UserStatus.SUSPENDED)
+            )
+        assert await self._live_tokens(db_session, invited["id"]) == 1, "premise: a live link"
+
+        response = await api.post(
+            f"/api/v1/users/{invited['id']}/{endpoint}", headers=admin["headers"]
+        )
+
+        assert response.status_code == 200, response.text
+        assert await self._live_tokens(db_session, invited["id"]) == 0
+        rows = await db_session.execute(
+            select(AuditLog).where(AuditLog.target_id == user_id, AuditLog.action == action)
+        )
+        [entry] = rows.scalars().all()
+        assert entry.actor_user_id == admin["id"]
+
+
 class TestListUsersEnvelope:
     """``GET /api/v1/users`` — ``docs/06-API_STANDARDS.md`` §5.2."""
 
@@ -268,6 +520,32 @@ class TestCrossTenantIsolation:
             f"/api/v1/users/{foreign_user}/reactivate", headers=admin["headers"]
         )
         assert response.status_code == 404
+
+    async def test_resend_invitation_foreign_uuid_is_404(
+        self,
+        api: AsyncClient,
+        db_session: AsyncSession,
+        admin: dict[str, Any],
+        foreign_user: uuid.UUID,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "SMTP_HOST", "smtp.hospital.example")
+        foreign = await db_session.get(User, foreign_user)
+        assert foreign is not None
+        foreign.status = UserStatus.INVITED
+        await db_session.flush()
+
+        response = await api.post(
+            f"/api/v1/users/{foreign_user}/invitation", headers=admin["headers"]
+        )
+
+        assert response.status_code == 404
+        minted = await db_session.execute(
+            select(func.count())
+            .select_from(PasswordResetToken)
+            .where(PasswordResetToken.user_id == foreign_user)
+        )
+        assert minted.scalar_one() == 0
 
     async def test_admin_reset_foreign_uuid_is_404(
         self, api: AsyncClient, admin: dict[str, Any], foreign_user: uuid.UUID
@@ -643,7 +921,13 @@ class TestPrivilegeEscalationOverHttp:
         assigner: dict[str, Any],
         privileged_role: uuid.UUID,
     ) -> None:
-        """The invite path grants permissions too — and returns the token."""
+        """The invite path grants permissions too.
+
+        (It used to return the new account's activation token as well, which
+        made this the quickest route to a privileged account. It no longer
+        does — see ``TestInvitationContract`` — but the grant check stands on
+        its own.)
+        """
         email = f"escalate-{uuid.uuid4().hex[:12]}@hospital.example"
         response = await api.post(
             "/api/v1/users",

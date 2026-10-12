@@ -43,6 +43,20 @@ export interface InviteUserInput {
   role_ids: string[]
 }
 
+/**
+ * What happened to the invitation email. `queued` means an email was queued
+ * for the address — delivery is not confirmed. `unavailable` means none was
+ * sent because email delivery is not set up; the user stays Invited.
+ */
+export type InvitationDelivery = 'queued' | 'unavailable'
+
+export interface InvitationResult {
+  delivery: InvitationDelivery
+}
+
+/** The user created by POST /users, with what happened to their invitation. */
+export type InvitedUser = ManagedUser & { invitation: InvitationResult }
+
 export interface UpdateUserInput {
   first_name?: string
   last_name?: string
@@ -107,12 +121,54 @@ function useInvalidateUsers() {
   }
 }
 
+/**
+ * Reads an invitation result off the wire. Anything other than an explicit
+ * `queued` — a missing field, a value this build does not know — is reported
+ * as `unavailable`, so an unknown outcome is never shown as a sent email.
+ */
+function toInvitationResult(wire: unknown): InvitationResult {
+  const delivery =
+    typeof wire === 'object' && wire !== null ? (wire as { delivery?: unknown }).delivery : undefined
+  return { delivery: delivery === 'queued' ? 'queued' : 'unavailable' }
+}
+
 export function useInviteUser() {
   const invalidate = useInvalidateUsers()
   return useMutation({
-    mutationFn: (input: InviteUserInput) =>
-      http.post<ManagedUser & { invite_token?: string }>('/users', input),
+    mutationFn: async (input: InviteUserInput): Promise<InvitedUser> => {
+      const wire = await http.post<ManagedUser & { invitation?: unknown }>('/users', input)
+      // Only the fields named here are kept. The activation credential is
+      // delivered by email and must never be held by this app, so anything
+      // else a response carries is dropped before it reaches the query cache.
+      return {
+        id: wire.id,
+        email: wire.email,
+        first_name: wire.first_name,
+        last_name: wire.last_name,
+        phone: wire.phone,
+        status: wire.status,
+        hospital_id: wire.hospital_id,
+        roles: wire.roles,
+        mfa_enabled: wire.mfa_enabled,
+        last_login_at: wire.last_login_at,
+        password_changed_at: wire.password_changed_at,
+        created_at: wire.created_at,
+        updated_at: wire.updated_at,
+        invitation: toInvitationResult(wire.invitation),
+      }
+    },
     onSuccess: invalidate,
+  })
+}
+
+/** Sends the invitation again to a user who is still Invited. */
+export function useResendInvitation() {
+  const invalidate = useInvalidateUsers()
+  return useMutation({
+    mutationFn: async (id: string): Promise<InvitationResult> =>
+      toInvitationResult(await http.post<unknown>(`/users/${id}/invitation`)),
+    // Also after a refusal: a 409 means the row is no longer Invited.
+    onSettled: invalidate,
   })
 }
 

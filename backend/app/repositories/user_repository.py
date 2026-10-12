@@ -6,18 +6,26 @@ automatically filter out soft-deleted records.
 
 from __future__ import annotations
 
+import hashlib
 import uuid  # noqa: TC003 — needed at runtime for type hints
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+import structlog
+from sqlalchemy import func, or_, select
 
+from app.models.permission import Permission
+from app.models.role import RolePermission
 from app.models.user import User, UserRole, UserStatus
 from app.repositories.base import BaseRepository
+from app.utils.validators import normalize_email
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.sql import ColumnElement
+
+
+logger = structlog.get_logger(__name__)
 
 
 class UserRepository(BaseRepository[User]):
@@ -78,26 +86,180 @@ class UserRepository(BaseRepository[User]):
             **kwargs,
         )
 
+    @staticmethod
+    def _email_hash(normalized_email: str) -> str:
+        """A short, non-reversible tag for an address, for log lines (never the address)."""
+        return hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()[:16]
+
     async def get_by_email(self, hospital_id: uuid.UUID, email: str) -> User | None:
-        """Retrieve a user by email within a specific hospital.
+        """Retrieve the one live user with this email in a specific hospital.
+
+        Compared in canonical (lower-cased) form. Fails closed like
+        :meth:`get_by_email_cross_tenant`: if more than one live row matches,
+        none is returned — never the first, never the newest.
+
+        Not for "is this address free?" checks; use :meth:`email_is_taken`.
 
         :param hospital_id: The hospital's UUID.
-        :param email: The user's email address.
-        :returns: The user instance, or ``None``.
+        :param email: The user's email address, in any case.
+        :returns: The single matching live user, or ``None``.
         """
-        stmt = self._query().where(User.hospital_id == hospital_id, User.email == email)
+        normalized = normalize_email(email)
+        stmt = (
+            self._query()
+            .where(User.hospital_id == hospital_id, func.lower(User.email) == normalized)
+            .limit(2)
+        )
+        result = await self._session.execute(stmt)
+        matches = list(result.unique().scalars().all())
+        if len(matches) > 1:
+            logger.error("staff_identity_ambiguous", email_hash=self._email_hash(normalized))
+            return None
+        return matches[0] if matches else None
+
+    async def get_by_email_cross_tenant(
+        self, email: str, *, for_update: bool = False
+    ) -> User | None:
+        """Resolve the one live staff account an email names (login, password reset).
+
+        Not hospital-scoped: a login request carries an email and nothing else,
+        so the hospital is not known until the account is found.
+
+        Fails closed. Soft-deleted users are never returned. If the address
+        unexpectedly names more than one live account — which the unique index
+        from migration 0019 forbids, but which must not be trusted blindly —
+        nobody is returned and the anomaly is logged. Authentication must
+        never pick one of several candidates, and must never raise.
+
+        :param email: The email address, in any case.
+        :param for_update: Lock the matched row until the transaction ends.
+        :returns: The single matching live user, or ``None`` if there is none
+            or the identity is ambiguous.
+        """
+        normalized = normalize_email(email)
+        stmt = self._query().where(func.lower(User.email) == normalized).limit(2)
+        if for_update:
+            # `of=User`: the hospital is outer-joined for eager loading and
+            # must not be locked. `populate_existing`: read the row as it is
+            # now that the lock is held, not a copy cached earlier.
+            stmt = stmt.with_for_update(of=User).execution_options(populate_existing=True)
+        result = await self._session.execute(stmt)
+        matches = list(result.unique().scalars().all())
+        if len(matches) > 1:
+            # A hash, never the address (PII), and never to the caller.
+            logger.error("staff_identity_ambiguous", email_hash=self._email_hash(normalized))
+            return None
+        return matches[0] if matches else None
+
+    @staticmethod
+    def authentication_claim_key(email: str) -> int:
+        """Return the advisory-lock key for one email address.
+
+        Derived from the canonical address alone — never from whether an
+        account exists — so the claim behaves identically for a real address
+        and an unknown one. The prefix keeps it clear of any other use of
+        advisory locks in this database.
+
+        :param email: The email address, in any case.
+        :returns: A signed 64-bit integer.
+        """
+        digest = hashlib.sha256(b"aetheris:staff-auth:" + normalize_email(email).encode("utf-8"))
+        return int.from_bytes(digest.digest()[:8], "big", signed=True)
+
+    async def claim_authentication_attempt(self, email: str) -> bool:
+        """Claim the right to handle a password-reset request for an email.
+
+        At most one reset request per address is handled at a time. The claim
+        is a transaction-scoped advisory lock taken with *try* semantics: it
+        never waits. If another request for the same address holds it, this
+        returns ``False`` at once and the caller answers as it always does.
+
+        It exists so that a burst of requests for a real account — each of
+        which would write a token, an audit entry and an email — does no more
+        work, and so takes no longer, than a burst for an unknown address.
+        Sign-in does not use it: there, exclusivity would itself be a way to
+        keep an account's owner out.
+
+        It reads and writes no row, and is released when the transaction ends.
+
+        :param email: The email address, in any case.
+        :returns: ``True`` if this request may proceed.
+        """
+        result = await self._session.execute(
+            select(func.pg_try_advisory_xact_lock(self.authentication_claim_key(email)))
+        )
+        return result.scalar_one() is True
+
+    async def lock_for_authentication(self, user_id: uuid.UUID) -> User | None:
+        """Load a live user by id and lock the row until the transaction ends.
+
+        Taken only once a credential has been verified — before a session is
+        issued, and when an emailed token is redeemed — so that a concurrent
+        password change, suspension or re-sent invitation is seen either
+        wholly before or wholly after. The id always comes from a server-side
+        record. Soft-deleted users are never returned.
+
+        Not hospital-scoped: the hospital is read from the row.
+
+        :param user_id: The user's UUID.
+        :returns: The locked, freshly-read user, or ``None``.
+        """
+        stmt = (
+            self._query()
+            .where(User.id == user_id)
+            .with_for_update(of=User)
+            .execution_options(populate_existing=True)
+        )
         result = await self._session.execute(stmt)
         return result.unique().scalar_one_or_none()
 
-    async def get_by_email_cross_tenant(self, email: str) -> User | None:
-        """Retrieve a user by email across all hospitals (login use case).
+    async def email_is_taken(self, email: str, *, hospital_id: uuid.UUID) -> bool:
+        """Whether a new staff account may **not** use this email.
 
-        :param email: The user's email address.
-        :returns: The user instance, or ``None``.
+        An address is unavailable when:
+
+        * any live user on the platform — in any hospital — already has it
+          (the platform-wide identity rule, migration 0019); or
+        * any user of ``hospital_id``, including a soft-deleted one, has it —
+          the older per-hospital constraint still covers deleted rows.
+
+        The caller must run this under an explicit ``TenantScope.system(...)``:
+        inside a staff request the session is confined to that staff member's
+        hospital, and the whole point here is to see the others. It returns a
+        boolean and nothing about *where* the address is in use.
+
+        :param email: The email address, in any case.
+        :param hospital_id: The hospital the new account would belong to.
+        :returns: ``True`` if the address cannot be used.
         """
-        stmt = select(User).where(User.email == email)
+        normalized = normalize_email(email)
+        stmt = (
+            select(func.count())
+            .select_from(User)
+            .where(
+                func.lower(User.email) == normalized,
+                or_(User.deleted_at.is_(None), User.hospital_id == hospital_id),
+            )
+        )
         result = await self._session.execute(stmt)
-        return result.unique().scalar_one_or_none()
+        return bool(result.scalar_one())
+
+    async def list_with_mfa_secret_cross_tenant(self) -> list[User]:
+        """List every user that has a stored MFA secret, in every hospital.
+
+        For MFA key rotation only (``app/services/mfa_key_rotation.py``): a
+        retired key can be dropped from configuration only once no row is
+        still encrypted under it, wherever that row is. Soft-deleted users are
+        included for the same reason — their secret is still on disk.
+
+        Must be run under an explicit ``TenantScope.system(...)``; it is never
+        called from a request.
+
+        :returns: Users whose ``mfa_secret`` is not ``NULL``.
+        """
+        stmt = select(User).where(User.mfa_secret.is_not(None)).order_by(User.id)
+        result = await self._session.execute(stmt)
+        return list(result.unique().scalars().all())
 
     async def list_by_hospital(
         self,
@@ -159,34 +321,6 @@ class UserRepository(BaseRepository[User]):
         :returns: The updated user instance.
         """
         return await self.update(user, last_login_at=datetime.now(UTC))
-
-    async def increment_failed_logins(self, user: User) -> User:
-        """Increment the failed login attempt counter.
-
-        :param user: The user instance to update.
-        :returns: The updated user instance.
-        """
-        return await self.update(
-            user,
-            failed_login_attempts=user.failed_login_attempts + 1,
-        )
-
-    async def reset_failed_logins(self, user: User) -> User:
-        """Reset the failed login attempt counter to zero.
-
-        :param user: The user instance to update.
-        :returns: The updated user instance.
-        """
-        return await self.update(user, failed_login_attempts=0, locked_until=None)
-
-    async def lock_account(self, user: User, until: datetime) -> User:
-        """Lock a user's account until the specified time.
-
-        :param user: The user instance to lock.
-        :param until: Timestamp until which the account is locked.
-        :returns: The updated user instance.
-        """
-        return await self.update(user, locked_until=until)
 
     # ── UserRole Management ────────────────────────────────────────────────
 
@@ -286,3 +420,41 @@ class UserRepository(BaseRepository[User]):
             )
         )
         return await self.count(stmt)
+
+    async def list_active_recipients(
+        self,
+        hospital_id: uuid.UUID,
+        *,
+        permission_code: str | None = None,
+        role_id: uuid.UUID | None = None,
+    ) -> list[User]:
+        """List a hospital's active users, optionally narrowed by role or permission.
+
+        Backs the Notifications module's "who should hear about this" question
+        (``docs/modules/11-notifications.md`` §5, FR-6): everyone, everyone
+        holding a role, or everyone holding a permission through any role.
+        Only ``active`` users are returned — an invited or suspended account
+        cannot act on a notification.
+
+        :param hospital_id: The hospital to scope to.
+        :param permission_code: Only users holding this permission code.
+        :param role_id: Only users holding this role.
+        :returns: Matching users, ordered by id for a stable result.
+        """
+        stmt = self._query().where(
+            User.hospital_id == hospital_id, User.status == UserStatus.ACTIVE
+        )
+        if role_id is not None:
+            stmt = stmt.where(
+                User.id.in_(select(UserRole.user_id).where(UserRole.role_id == role_id))
+            )
+        if permission_code is not None:
+            holders = (
+                select(UserRole.user_id)
+                .join(RolePermission, RolePermission.role_id == UserRole.role_id)
+                .join(Permission, Permission.id == RolePermission.permission_id)
+                .where(Permission.code == permission_code)
+            )
+            stmt = stmt.where(User.id.in_(holders))
+        result = await self._session.execute(stmt.order_by(User.id.asc()))
+        return list(result.unique().scalars().all())

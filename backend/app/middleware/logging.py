@@ -16,6 +16,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.core.client_ip import client_ip
+
 logger = structlog.get_logger(__name__)
 
 
@@ -45,12 +47,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             request_id=request_id,
             method=request.method,
             path=request.url.path,
-            query_string=str(request.url.query),
+            # Parameter names only. Values can be search terms about a
+            # patient, or a one-time token on a link someone pasted here.
+            query_params=sorted(set(request.query_params.keys())),
             status_code=response.status_code,
             duration_ms=round(duration_ms, 2),
             content_length=response.headers.get("content-length"),
             user_agent=request.headers.get("user-agent"),
-            ip=request.client.host if request.client else None,
+            ip=client_ip(request),
         )
 
         return response

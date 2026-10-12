@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from fastapi import APIRouter, Depends, Header, Path, Query, Response, status
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response, status
 
 from app.api.dependencies.auth import require_permission
 from app.api.dependencies.services import get_appointment_service
@@ -248,32 +248,68 @@ async def walk_in_queue(
 @router.post(
     "/recommend-slot",
     response_model=SuccessResponse[SlotRecommendationResponse],
-    summary="AI-recommend appointment slots",
+    summary="Ask the AI to suggest one appointment slot",
     description=(
-        "Return ranked slot suggestions for a patient (module spec §5.9).\n\n"
-        "The model only recommends — nothing is reserved and reception still "
-        "books normally, so a suggestion going stale is caught by the usual "
-        "overlap check.\n\n"
-        "Gated on the `feature.ai.slot_recommendation` flag in the hospital's "
-        "settings; returns an empty list when disabled or when the AI provider "
-        "is unavailable, so booking is never blocked by an AI outage."
+        "Suggest one free slot in a doctor's day (module spec §5.9).\n\n"
+        "The server computes the day's free slots itself — the same ones the "
+        "slot picker shows — and asks an AI model to choose one. The model is "
+        "shown clock times only: no patient, doctor or hospital data. Its "
+        "choice is checked against the server's own list and against the "
+        "database before it is returned.\n\n"
+        "**Advisory only.** Nothing is booked or reserved; a member of staff "
+        "books through `POST /appointments`, which validates everything again. "
+        "There is no score or confidence.\n\n"
+        "Requires `appointment.recommend_slot` and `doctor.availability.read`, "
+        "and the `feature.ai.slot_recommendation` flag on the hospital. Every "
+        "failure is explicit — there is no silent empty answer:\n\n"
+        "- `200` with `status: recommended` or `status: no_free_slots` (no model call)\n"
+        "- `403 FEATURE_DISABLED` — not enabled for this hospital\n"
+        "- `503 AI_NOT_CONFIGURED` — no AI configured on this server\n"
+        "- `503 AI_PROVIDER_UNAVAILABLE` — the AI service could not be used\n"
+        "- `503 AI_PROVIDER_TIMEOUT` — the AI service took too long\n"
+        "- `503 AI_RESPONSE_INVALID` — the answer was rejected, or the slot was "
+        "taken meanwhile"
     ),
     responses={
-        200: {"description": "Ranked suggestions returned."},
-        **_COMMON_RESPONSES,
+        200: {"description": "One suggestion, or `no_free_slots` when the day has none."},
+        400: {"description": "The account is not scoped to a hospital."},
+        401: {"description": "Missing or invalid access token."},
+        403: {
+            "description": (
+                "Lacking a required permission (`PERMISSION_DENIED`), or the feature "
+                "is not enabled for this hospital (`FEATURE_DISABLED`)."
+            )
+        },
+        422: {
+            "description": (
+                "Request failed validation, or the patient or doctor is not in this hospital."
+            )
+        },
+        429: {"description": "Too many AI requests."},
+        503: {
+            "description": (
+                "`AI_NOT_CONFIGURED`, `AI_PROVIDER_UNAVAILABLE`, `AI_PROVIDER_TIMEOUT` "
+                "or `AI_RESPONSE_INVALID`. Choose a slot manually."
+            )
+        },
     },
 )
 async def recommend_slot(
     payload: SlotRecommendationRequest,
+    request: Request,
     current_user: User = Depends(require_permission("appointment.recommend_slot")),
+    _availability_reader: User = Depends(require_permission("doctor.availability.read")),
     service: AppointmentService = Depends(get_appointment_service),
 ) -> SuccessResponse[SlotRecommendationResponse]:
-    """Ask the AI service to rank candidate slots."""
+    """Ask the AI service for one suggested slot."""
     result = await service.recommend_slots(
-        _tenant_of(current_user), payload, actor_id=current_user.id
+        _tenant_of(current_user),
+        payload,
+        actor_id=current_user.id,
+        request_id=getattr(request.state, "request_id", None),
     )
     return SuccessResponse[SlotRecommendationResponse](
-        message="Slot recommendations generated.", data=result
+        message="Slot recommendation completed.", data=result
     )
 
 

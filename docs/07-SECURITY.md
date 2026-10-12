@@ -159,6 +159,8 @@ Prompt injection is a real threat when clinical data flows through LLMs. Our def
 - Budget exceeded → 429 with clear message; admin can raise limits
 - Prevents "AI cost bomb" abuse
 
+> **Status, 2026-10-06:** not built. What limits AI use today is the per-user request rate limit (`RATE_LIMIT_AI_PER_MIN`), a cap on concurrent model calls per process (`AI_MAX_CONCURRENT_CALLS`) and a deadline per call. There is no per-hospital budget or cost ceiling yet.
+
 ## 8. Session Security
 
 - Session TTL: 12 hours idle, absolute 7 days (matches refresh)
@@ -182,7 +184,7 @@ Every event that touches sensitive data is logged. Non-negotiable events:
 - Prescription dispensed
 - Data exported
 - Permission changed
-- AI interaction (in `ai_interactions`)
+- AI interaction — today one structured `ai_interaction` log line per model call; the `ai_interactions` table is planned and not built
 - Impersonation used (admin acting as user, future)
 
 Audit logs are:

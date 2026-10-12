@@ -63,3 +63,10 @@ frontend/.stitch-reference/
 
 # Freebuff Desktop — local runtime database, not part of the project
 .freebuff/
+
+# claude-flow — local agent runtime state, written wherever a tool runs
+.claude-flow/
+
+# Claude Code — per-machine plugin configuration
+/.claude/proven-config.json
+/.claude/.proven-config-version

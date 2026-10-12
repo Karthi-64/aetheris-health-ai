@@ -13,7 +13,14 @@ export default function App() {
         <SessionRestorer>
           <RouterProvider router={router} />
         </SessionRestorer>
-        <Toaster richColors position="top-right" />
+        {/* Offset to sit below the top bar: a toast in the corner itself covers
+            the notification bell, which then can't be clicked until it clears. */}
+        <Toaster
+          richColors
+          position="top-right"
+          offset={{ top: 92, right: 24 }}
+          mobileOffset={{ top: 84 }}
+        />
       </QueryClientProvider>
     </ThemeProvider>
   )

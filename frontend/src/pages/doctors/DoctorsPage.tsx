@@ -5,9 +5,11 @@ import { DataTable } from '@/components/ui/data-table'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Button } from '@/components/ui/button'
 import { Alert } from '@/components/ui/alert'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useDoctors } from '@/api/doctors'
 import { useDepartments } from '@/api/departments'
+import { usePermissions } from '@/hooks/usePermissions'
 import { doctorColumns } from './columns'
 
 const PAGE_SIZE = 25
@@ -17,7 +19,12 @@ export default function DoctorsPage() {
   const [searchInput, setSearchInput] = useState('')
   const [q, setQ] = useState('')
   const [department, setDepartment] = useState<string>(ALL)
+  const [includeInactive, setIncludeInactive] = useState(false)
   const [page, setPage] = useState(1)
+  const { can } = usePermissions()
+  // A deactivated doctor is left out of the directory. Only someone who can
+  // reactivate or otherwise manage doctors has a reason to look for one.
+  const canManage = can('doctor.update') || can('doctor.delete')
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -32,6 +39,7 @@ export default function DoctorsPage() {
   const { data, isPending, isError, refetch } = useDoctors({
     q: q || undefined,
     department: department === ALL ? undefined : department,
+    include_inactive: (canManage && includeInactive) || undefined,
     page,
     page_size: PAGE_SIZE,
   })
@@ -44,7 +52,7 @@ export default function DoctorsPage() {
     <div className="w-full">
       <PageHeader
         title="Doctors"
-        subtitle="Clinical directory — specialties, departments and availability."
+        subtitle="Clinical directory — specialties, departments and consultation fees."
         actions={
           <>
             <div className="relative">
@@ -76,6 +84,18 @@ export default function DoctorsPage() {
                 ))}
               </SelectContent>
             </Select>
+            {canManage && (
+              <label className="font-body text-body-sm text-on-surface flex items-center gap-2">
+                <Checkbox
+                  checked={includeInactive}
+                  onCheckedChange={(v) => {
+                    setIncludeInactive(v === true)
+                    setPage(1)
+                  }}
+                />
+                Include inactive
+              </label>
+            )}
           </>
         }
       />

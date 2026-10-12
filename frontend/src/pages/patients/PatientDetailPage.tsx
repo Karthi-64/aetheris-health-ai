@@ -6,14 +6,14 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Detail, InfoCard } from '@/components/ui/detail-card'
 import { formatDate } from '@/lib/format'
-import { usePatient, type Patient } from '@/api/patients'
-
-const GENDER_LABEL: Record<Patient['gender'], string> = {
-  male: 'Male',
-  female: 'Female',
-  other: 'Other',
-  unspecified: 'Unspecified',
-}
+import { ApiError } from '@/api/types'
+import { GENDER_LABELS, usePatient } from '@/api/patients'
+import { usePermissions } from '@/hooks/usePermissions'
+import { PatientAppointments } from '@/components/appointments/PatientAppointments'
+import { PatientInvoices } from '@/components/billing/PatientInvoices'
+import { PatientLabOrders } from '@/components/laboratory/PatientLabOrders'
+import { PatientPrescriptions } from '@/components/pharmacy/PatientPrescriptions'
+import { EditPatientDialog } from './EditPatientDialog'
 
 function formatAddress(address: Record<string, unknown> | null): string | null {
   if (!address) return null
@@ -28,9 +28,34 @@ function names(items: Array<Record<string, unknown>>): string {
   return list.length ? list.join(', ') : ''
 }
 
+/** Allergy names, each with its severity when one was recorded. */
+function allergyNames(items: Array<Record<string, unknown>>): string {
+  return names(
+    items.map((i) =>
+      typeof i.name === 'string' && typeof i.severity === 'string'
+        ? { name: `${i.name} (${i.severity})` }
+        : i,
+    ),
+  )
+}
+
+const text = (value: unknown): string | null => (typeof value === 'string' ? value : null)
+
+/**
+ * True when the API answered a read and turned it down: the record is gone
+ * (404), or this user may no longer see it (403). A request that failed for
+ * any other reason — the network, a 5xx, a rate limit — says nothing about
+ * the record.
+ */
+function isRefusal(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status === undefined) return false
+  return error.status >= 400 && error.status < 500 && error.status !== 429
+}
+
 export default function PatientDetailPage() {
   const { patientId } = useParams<{ patientId: string }>()
-  const { data: patient, isError, refetch } = usePatient(patientId ?? '')
+  const { data: patient, error, isError, refetch } = usePatient(patientId ?? '')
+  const { can } = usePermissions()
 
   const backLink = (
     <Link
@@ -41,7 +66,9 @@ export default function PatientDetailPage() {
     </Link>
   )
 
-  if (isError) {
+  // A refresh that merely failed must not take the record off the screen: the
+  // edit form is mounted under it, and would go with whatever had been typed.
+  if (isError && (!patient || isRefusal(error))) {
     return (
       <div className="w-full space-y-4">
         {backLink}
@@ -59,7 +86,7 @@ export default function PatientDetailPage() {
 
   if (!patient) {
     return (
-      <div className="w-full space-y-6">
+      <div className="w-full space-y-6" role="status" aria-busy="true" aria-label="Loading patient">
         {backLink}
         <Skeleton className="h-20 w-full max-w-md rounded-2xl" />
         <Skeleton className="h-40 w-full rounded-2xl" />
@@ -68,14 +95,28 @@ export default function PatientDetailPage() {
     )
   }
 
-  const allergies = names(patient.allergies)
+  const allergies = allergyNames(patient.allergies)
   const conditions = names(patient.chronic_conditions)
   const medications = names(patient.current_medications)
   const hasHistory = allergies || conditions || medications
+  const contact = patient.emergency_contact
+  // The API refuses an update to an inactive record (404), and nothing can reactivate one.
+  const canEdit = can('patient.update') && patient.status === 'active'
 
   return (
     <div className="w-full space-y-6">
       {backLink}
+
+      {isError && (
+        <Alert variant="warning" title="Couldn't refresh this record">
+          <div className="flex flex-col items-start gap-3">
+            <p>This is the copy loaded earlier. It may be out of date.</p>
+            <Button variant="outline" size="sm" onClick={() => refetch()}>
+              <RotateCw className="size-4" /> Retry
+            </Button>
+          </div>
+        </Alert>
+      )}
 
       <header className="glassmorphism shadow-glass-panel flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6">
         <div className="flex items-center gap-4">
@@ -90,15 +131,18 @@ export default function PatientDetailPage() {
             <p className="font-mono text-outline text-sm">{patient.mrn}</p>
           </div>
         </div>
-        <Badge variant={patient.status === 'active' ? 'success' : 'neutral'} className="capitalize">
-          {patient.status}
-        </Badge>
+        <div className="flex flex-wrap items-center gap-3">
+          <Badge variant={patient.status === 'active' ? 'success' : 'neutral'} className="capitalize">
+            {patient.status}
+          </Badge>
+          {canEdit && <EditPatientDialog patient={patient} />}
+        </div>
       </header>
 
       <InfoCard title="Demographics">
         <Detail label="Date of birth" value={formatDate(patient.date_of_birth)} />
         <Detail label="Age" value={`${patient.age} years`} />
-        <Detail label="Gender" value={GENDER_LABEL[patient.gender]} />
+        <Detail label="Gender" value={GENDER_LABELS[patient.gender]} />
         <Detail label="Blood group" value={patient.blood_group} />
         <Detail label="Marital status" value={patient.marital_status} />
         <Detail label="Occupation" value={patient.occupation} />
@@ -110,6 +154,12 @@ export default function PatientDetailPage() {
         <Detail label="Address" value={formatAddress(patient.address)} />
       </InfoCard>
 
+      <InfoCard title="Emergency contact">
+        <Detail label="Name" value={text(contact?.name)} />
+        <Detail label="Relationship" value={text(contact?.relation)} />
+        <Detail label="Phone" value={text(contact?.phone)} />
+      </InfoCard>
+
       {hasHistory && (
         <InfoCard title="Medical history">
           <Detail label="Allergies" value={allergies || null} />
@@ -117,6 +167,23 @@ export default function PatientDetailPage() {
           <Detail label="Current medications" value={medications || null} />
         </InfoCard>
       )}
+
+      <InfoCard title="Notes">
+        <div className="col-span-full">
+          <Detail
+            label="Administrative notes"
+            value={patient.notes && <p className="whitespace-pre-wrap">{patient.notes}</p>}
+          />
+        </div>
+      </InfoCard>
+
+      <PatientAppointments patient={patient} />
+
+      <PatientLabOrders patientId={patient.id} />
+
+      <PatientPrescriptions patientId={patient.id} />
+
+      <PatientInvoices patientId={patient.id} />
     </div>
   )
 }

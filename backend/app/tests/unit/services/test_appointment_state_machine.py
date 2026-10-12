@@ -130,6 +130,7 @@ class TestTransitionEnforcement:
     async def test_check_in_from_booked_succeeds(self, repo: AsyncMock) -> None:
         appointment = _attach(build_appointment_model(hospital_id=HOSPITAL_ID))
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         repo.update_appointment.return_value = appointment
         service, session, audit = _make_service(repo)
 
@@ -142,6 +143,7 @@ class TestTransitionEnforcement:
         """Business rule 7 and AC-6."""
         appointment = _attach(build_appointment_model(hospital_id=HOSPITAL_ID))
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         repo.update_appointment.return_value = appointment
         service, _, _ = _make_service(repo)
 
@@ -158,6 +160,7 @@ class TestTransitionEnforcement:
             build_appointment_model(hospital_id=HOSPITAL_ID, status=AppointmentStatus.COMPLETED)
         )
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         service, session, audit = _make_service(repo)
 
         with pytest.raises(InvalidTransitionError) as exc:
@@ -177,6 +180,7 @@ class TestTransitionEnforcement:
             build_appointment_model(hospital_id=HOSPITAL_ID, status=AppointmentStatus.CANCELLED)
         )
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         service, session, _ = _make_service(repo)
 
         for attempt in (service.check_in, service.start, service.complete):
@@ -195,6 +199,7 @@ class TestTransitionEnforcement:
             build_appointment_model(hospital_id=HOSPITAL_ID, status=AppointmentStatus.CHECKED_IN)
         )
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         repo.update_appointment.return_value = appointment
         service, session, _ = _make_service(repo)
 
@@ -208,6 +213,7 @@ class TestTransitionEnforcement:
     async def test_cancel_records_the_reason(self, repo: AsyncMock) -> None:
         appointment = _attach(build_appointment_model(hospital_id=HOSPITAL_ID))
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         repo.update_appointment.return_value = appointment
         service, _, _ = _make_service(repo)
 
@@ -222,6 +228,7 @@ class TestTransitionEnforcement:
     async def test_no_show_from_booked_is_allowed(self, repo: AsyncMock) -> None:
         appointment = _attach(build_appointment_model(hospital_id=HOSPITAL_ID))
         repo.get_appointment_by_id.return_value = appointment
+        repo.lock_appointment_by_id.return_value = appointment
         repo.update_appointment.return_value = appointment
         service, session, _ = _make_service(repo)
 

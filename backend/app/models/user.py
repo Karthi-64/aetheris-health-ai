@@ -11,12 +11,24 @@ from datetime import datetime  # noqa: TC003 — needed at runtime for Mapped[da
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy import Enum as SQLEnum
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base, CommonColumnsMixin, TimestampMixin, UUIDPrimaryKeyMixin
+from app.utils.validators import normalize_email
 
 if TYPE_CHECKING:
     from app.models.hospital import Hospital
@@ -43,6 +55,15 @@ class User(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("hospital_id", "email", name="uq_users_hospital_email"),
+        # The effective identity rule (migration 0019): one live staff account
+        # per lower-cased email across the whole platform. Login takes an email
+        # and no hospital, so an address must name exactly one account.
+        Index(
+            "uq_users_email_normalized_active",
+            func.lower(text("email")),
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_users_phone", "phone"),
         Index("ix_users_hospital_status", "hospital_id", "status"),
     )
@@ -54,7 +75,9 @@ class User(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         comment="UUID of the hospital this user belongs to. NULL only for Super Admin.",
     )
     email: Mapped[str] = mapped_column(
-        String(200), nullable=False, comment="Login email address. Unique per hospital."
+        String(200),
+        nullable=False,
+        comment="Login email address, lower-cased. Unique across the platform among live users.",
     )
     phone: Mapped[str | None] = mapped_column(
         String(20), nullable=True, comment="Phone number for contact and SMS notifications."
@@ -94,6 +117,11 @@ class User(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         nullable=True,
         comment="Timestamp of last password change.",
     )
+    # LEGACY, UNUSED. The next two columns belonged to the account lockout that
+    # the authentication throttle replaced (app/services/auth_throttle.py,
+    # migration 0020). Nothing reads or writes them; an account cannot be
+    # "locked". They stay only so that the schema does not change under a
+    # rollback, and are to be dropped in a later migration.
     failed_login_attempts: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -141,6 +169,31 @@ class User(UUIDPrimaryKeyMixin, CommonColumnsMixin, Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+
+    @validates("email")
+    def _normalize_email(self, _key: str, value: str) -> str:
+        """Store every staff email in its canonical, lower-cased form."""
+        return normalize_email(value)
+
+    @property
+    def hospital_is_active(self) -> bool:
+        """Whether this user's hospital is allowed to authenticate. Fails closed.
+
+        ``True`` only when the hospital row is present and its ``is_active``
+        is exactly ``True``. A user whose hospital cannot be seen — not
+        loaded, filtered out, missing — is treated as belonging to an
+        inactive hospital: doubt about hospital state denies.
+
+        A principal with no ``hospital_id`` at all has no hospital to
+        deactivate. No such row can exist today (the column is ``NOT NULL``).
+
+        ``hospital`` is loaded with the user (``lazy="joined"``), so reading
+        this issues no query.
+        """
+        if self.hospital_id is None:
+            return True
+        hospital = self.hospital
+        return hospital is not None and hospital.is_active is True
 
     @property
     def full_name(self) -> str:

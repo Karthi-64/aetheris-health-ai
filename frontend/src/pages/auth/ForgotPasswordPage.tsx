@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -19,10 +19,14 @@ type ForgotValues = z.infer<typeof forgotSchema>
  *
  * The backend always returns a generic success message regardless of whether
  * the email exists (enumeration prevention — security rule 10). The UI shows
- * the same "check your email" state in both cases.
+ * the same state in both cases. It does not claim an email was delivered: the
+ * backend only sends one when SMTP is configured (`backend/app/core/email.py`).
  */
 export default function ForgotPasswordPage() {
   const [sent, setSent] = useState(false)
+  // `isSubmitting` only disables the button after a re-render; this stops a
+  // second request (and a second reset token) fired before that happens.
+  const submitting = useRef(false)
 
   const {
     register,
@@ -34,16 +38,20 @@ export default function ForgotPasswordPage() {
   })
 
   async function onSubmit(values: ForgotValues) {
+    if (submitting.current) return
+    submitting.current = true
     try {
       await api.post('/auth/password/forgot', { email: values.email })
       setSent(true)
     } catch {
       // Even on error, show the same success state to prevent enumeration.
       setSent(true)
+    } finally {
+      submitting.current = false
     }
   }
 
-  // Success state — "check your email"
+  // Success state — the same whether or not the account exists
   if (sent) {
     return (
       <div className="relative flex min-h-[100dvh] items-center justify-center overflow-hidden px-4 py-12">
@@ -61,10 +69,11 @@ export default function ForgotPasswordPage() {
             <div className="bg-success/10 mb-4 flex size-16 items-center justify-center rounded-full">
               <CheckCircle className="text-success size-8" />
             </div>
-            <h1 className="font-display text-headline-lg text-primary mb-2">Check your email</h1>
+            <h1 className="font-display text-headline-lg text-primary mb-2">Request received</h1>
             <p className="font-body text-body-sm text-on-surface-variant mb-8 max-w-xs">
-              If an account with that email exists, we&apos;ve sent a password reset link. Check your
-              inbox and spam folder.
+              If an account exists for that address, a reset link is sent to it. Email delivery has
+              to be configured for this hospital — if nothing arrives, contact your hospital
+              administrator.
             </p>
             <Link
               to="/login"
@@ -98,11 +107,11 @@ export default function ForgotPasswordPage() {
           </div>
           <h1 className="font-display text-headline-lg text-primary">Forgot password?</h1>
           <p className="font-body text-body-sm text-on-surface-variant mt-2">
-            Enter your email and we&apos;ll send you a reset link.
+            Enter your email to request a password reset link.
           </p>
         </div>
 
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-5" noValidate>
+        <form onSubmit={(e) => handleSubmit(onSubmit)(e)} className="space-y-5" noValidate>
           <div className="space-y-2">
             <label htmlFor="email" className="font-label text-label-caps text-on-surface-variant">
               Email

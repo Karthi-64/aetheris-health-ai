@@ -17,7 +17,7 @@ Every technology choice, with rationale. If it's not on this list, it's not appr
 | Validation | Pydantic | v2 | Native to FastAPI, fast, typed |
 | Auth tokens | PyJWT | latest | Standard JWT |
 | Password hashing | Argon2 (via passlib) | latest | Modern, resistant, tunable |
-| HTTP client | httpx | latest | Async, used by AI providers |
+| HTTP client | httpx | latest | Async; the Groq AI provider calls its HTTP API directly with it (no vendor SDK) |
 | Background jobs | Celery or RQ | TBD (Phase 1: RQ; revisit for scale) | Simple to start, upgradable |
 | Task scheduling | APScheduler + Redis lock | latest | For nightly reports, cleanups |
 | Testing | pytest, pytest-asyncio | latest | Standard |
@@ -52,19 +52,29 @@ Every technology choice, with rationale. If it's not on this list, it's not appr
 
 ## AI Layer
 
-| Concern | Choice | Why |
-|---|---|---|
-| Provider abstraction | In-house adapter interface | Vendor independence |
-| Providers (day 1) | Anthropic (Claude), Groq, OpenAI | Redundancy across vendors |
-| Provider (day 2) | Google Gemini, self-hosted (Ollama/vLLM) | Cost control, data residency |
-| SDKs | anthropic, openai, groq (official) | Maintained |
-| Prompt storage | Version-controlled YAML/Markdown in `app/ai/prompts/` | Reviewable, diffable |
-| Function calling | Native provider tool APIs, unified in AI Service | Reuse existing tooling |
-| MCP | Anthropic MCP SDK (Python) | Future agent surface |
-| Vector store (RAG) | pgvector on the same PostgreSQL | One DB to operate |
-| Embeddings | Provider default (e.g. Voyage, OpenAI, or open-source via sentence-transformers) | Swappable |
-| AI observability | Custom logging + optional Langfuse/Helicone | Portable |
-| Evaluation harness | pytest-based golden set + `deepeval` (optional) | CI-integrable |
+> **Status (2026-10-06).** One provider is connected (Groq) and one AI capability is built (appointment slot recommendation, confirmed by a member of staff). Rows marked *Planned* are approved choices that are not built yet. Details: [`08-AI_ARCHITECTURE.md`](08-AI_ARCHITECTURE.md) §0.
+
+| Concern | Choice | Status | Why |
+|---|---|---|---|
+| Provider abstraction | In-house adapter interface (`app/ai/providers/base.py`) | Implemented | Vendor independence |
+| Provider connected | Groq, via its OpenAI-compatible chat-completions API | **Implemented — the only connected provider** | Low latency for a small, constrained task |
+| Current model | `openai/gpt-oss-20b` on Groq (a reasoning model) for the `fast` hint; override with `AI_FAST_MODEL` | Implemented | Replaced `llama-3.1-70b-versatile`, which Groq decommissioned |
+| Provider client | `httpx` directly — **no vendor SDK is installed** (`groq`, `openai`, `anthropic` are not dependencies) | Implemented | One HTTP call with explicit timeouts; full control over what is sent, read and logged |
+| Providers (next) | Anthropic (Claude), OpenAI | Planned — adapter stubs only, not connected | Redundancy across vendors |
+| Providers (later) | Google Gemini, self-hosted (Ollama/vLLM) | Planned — Ollama is a stub; no Gemini adapter exists | Cost control, data residency |
+| Provider fallback / retry | Secondary provider on failure | Planned — today a call is made once and a failure is returned as a typed error | Availability |
+| Prompt storage | Version-controlled YAML in `app/ai/prompts/templates/` | Implemented | Reviewable, diffable |
+| Structured output | JSON Schema `response_format` sent to the provider, plus server-side validation of every reply | Implemented | The schema narrows the answer; the server check is what is trusted |
+| Function calling | Native provider tool APIs, unified in AI Service | Planned — no tools are registered or used | Reuse existing tooling |
+| Streaming | SSE | Planned | Perceived performance for long answers |
+| MCP | Anthropic MCP SDK (Python) | Planned | Future agent surface |
+| Vector store (RAG) | pgvector on the same PostgreSQL | Planned | One DB to operate |
+| Embeddings | Provider default (e.g. Voyage, OpenAI, or open-source via sentence-transformers) | Planned | Swappable |
+| AI observability | Structured log line per call (structlog): provider, model, tokens, latency, outcome | Implemented (logs only) | Portable |
+| AI observability (later) | `ai_interactions` table, dashboards, optional Langfuse/Helicone | Planned | Cost and quality tracking |
+| Cost controls | Per-user rate limit on AI endpoints and a process-wide concurrency cap | Implemented | Bounded spend without a budget system |
+| Budgets | Per-hospital / per-user AI budgets | Planned | Cost control per tenant |
+| Evaluation harness | pytest-based golden set + `deepeval` (optional) | Planned — no golden set exists | CI-integrable |
 
 ## Infrastructure
 
@@ -123,6 +133,12 @@ Every non-obvious technology choice should have an entry here so we don't reliti
 - Vendor risk is unacceptable for healthcare
 - Cost optimization requires switching
 - Latency profiles differ per model — different tasks want different models
+- **Status (2026-10-06):** this is the target. Today only Groq is connected; the adapter interface is what keeps the others a contained addition. There is no fallback provider yet
+
+### Direct HTTP (httpx) over vendor SDKs for the first provider
+- Groq exposes an OpenAI-compatible API, so one small adapter covers it without a new dependency
+- Explicit control of timeouts, redirects and proxy behaviour, and of exactly which response fields are read and logged
+- Revisit per provider: an SDK is still a reasonable choice where it earns its place (each new dependency is a review decision)
 
 ### pgvector over a dedicated vector DB (Pinecone/Weaviate)
 - One database to operate

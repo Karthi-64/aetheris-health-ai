@@ -17,7 +17,15 @@ State               Invoice
 ``partially_paid``  The re-issue of that same visit, part-paid by card
 ``issued``          Ishaan Kulkarni's visit, nothing paid yet
 ``draft``           Counter items for Meera Nair, not tied to an appointment
+``draft`` (held)    Fatima Sheikh's bill, with a discount awaiting approval
+``refunded``        Kabir Malhotra's cancelled X-ray, paid then refunded in full
+``paid`` (part      Devi Lakshmi's tests, paid, with one test refunded
+refunded)
 ==================  ========================================================
+
+The demo hospital is given a 10% discount approval threshold, so both sides of
+that rule can be shown: a discount within it goes straight through, and the
+seeded one above it sits in the admin's approval queue.
 
 The void-then-reissue pair is deliberate: it is business rule 3 ("corrections
 require a void + re-issue") as data, and it shows a void invoice keeping its
@@ -38,6 +46,9 @@ Invoice     its appointment: if the appointment has *any* invoice, void or
             patient having any invoice with no appointment.
 Payment     created only together with its invoice, and carries a fixed
             ``idempotency_key`` under the tenant-scoped unique index
+Refund      the same, under its own tenant-scoped unique index
+Settings    the discount threshold is written only if the hospital has none,
+            so a value an admin has since changed is never overwritten
 ==========  ================================================================
 
 So a second run creates nothing and allocates no further invoice numbers.
@@ -52,7 +63,7 @@ commits, and a seed section must leave the transaction to its caller.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +72,7 @@ from sqlalchemy import select
 
 from app.models.appointment import Appointment
 from app.models.billing import InvoiceStatus, PaymentMethod
+from app.models.doctor import Doctor
 from app.repositories.invoice_number_sequence_repository import InvoiceNumberSequenceRepository
 from app.repositories.invoice_repository import InvoiceRepository
 from app.repositories.service_catalog_repository import ServiceCatalogRepository
@@ -69,7 +81,6 @@ from app.utils.mrn import format_mrn
 
 if TYPE_CHECKING:
     import uuid
-    from datetime import datetime
     from zoneinfo import ZoneInfo
 
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,7 +91,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-__all__ = ["SERVICES", "seed_demo_billing"]
+__all__ = ["DEMO_DISCOUNT_THRESHOLD_PERCENT", "SERVICES", "seed_demo_billing"]
 
 #: (code, name, category, price, taxable, is_active)
 #:
@@ -99,6 +110,11 @@ SERVICES: list[tuple[str, str, str, str, bool, bool]] = [
     ("ADMIN-CERT", "Medical certificate", "Administrative", "200.00", True, True),
     ("LAB-ESR", "ESR (retired panel)", "Laboratory", "150.00", False, False),
 ]
+
+#: Share of the subtotal a discount may reach before an admin must approve it,
+#: for the demo hospital. The platform default is 0 (every discount needs
+#: approval); the demo sets 10 so that both outcomes can be shown.
+DEMO_DISCOUNT_THRESHOLD_PERCENT = "10"
 
 #: An invoice line as the seed describes it: a catalog code, or an ad-hoc
 #: ``(description, unit_price)`` pair, each with a quantity.
@@ -275,6 +291,54 @@ class _InvoiceSeeder:
             ),
         )
 
+    async def discount(
+        self, invoice: Invoice, amount: str, reason: str, *, pending_approval: bool
+    ) -> Invoice:
+        """Apply an invoice-level discount to a draft."""
+        discount = Decimal(amount)
+        return await self._invoices.update_invoice(
+            invoice,
+            updated_by=self._actor_id,
+            discount_amount=discount,
+            discount_reason=reason,
+            discount_pending_approval=pending_approval,
+            total=invoice.subtotal + invoice.tax_amount - discount,
+        )
+
+    async def refund(
+        self,
+        invoice: Invoice,
+        amount: str,
+        method: PaymentMethod,
+        *,
+        key: str,
+        at: datetime,
+        refunded_by: uuid.UUID,
+        reason: str,
+        reference: str | None = None,
+    ) -> Invoice:
+        """Issue a refund and move the invoice's refunded total and status with it."""
+        refunded = Decimal(amount)
+        await self._invoices.create_refund(
+            invoice=invoice,
+            amount=refunded,
+            method=method,
+            reason=reason,
+            reference=reference,
+            refunded_by=refunded_by,
+            refunded_at=at,
+            idempotency_key=key,
+        )
+        amount_refunded = invoice.amount_refunded + refunded
+        return await self._invoices.update_invoice(
+            invoice,
+            updated_by=self._actor_id,
+            amount_refunded=amount_refunded,
+            status=(
+                InvoiceStatus.REFUNDED if amount_refunded == invoice.amount_paid else invoice.status
+            ),
+        )
+
     async def has_invoice_for(self, appointment: Appointment) -> bool:
         """Whether an appointment already has any invoice, void or not."""
         return (
@@ -319,6 +383,15 @@ async def seed_demo_billing(
     :param zone: The clinic's timezone.
     :param actor_id: User recorded as the author of seeded invoices.
     """
+    # A discount threshold, only if the hospital has not set one. Reassigned
+    # rather than mutated in place so SQLAlchemy sees the JSONB change.
+    settings = dict(hospital.settings or {})
+    billing_settings = dict(settings.get("billing") or {})
+    if "discount_approval_threshold_percent" not in billing_settings:
+        billing_settings["discount_approval_threshold_percent"] = DEMO_DISCOUNT_THRESHOLD_PERCENT
+        hospital.settings = {**settings, "billing": billing_settings}
+        await session.flush()
+
     services = await _seed_services(session, hospital)
     seeder = _InvoiceSeeder(session, hospital, services, zone, actor_id)
     created = 0
@@ -404,4 +477,84 @@ async def seed_demo_billing(
         )
         created += 1
 
+    # The remaining scenarios are counter sales with no appointment. They are
+    # issued "now": there is no visit to date them from.
+    now = datetime.now(UTC)
+    # See the comment on `cashier` above: payments and refunds need a recorder.
+    recorder = actor_id or await _any_doctor_user_id(session, hospital)
+
+    # ── draft held for approval: a discount above the 10% threshold ──────────
+    held = patients["Fatima Sheikh"]
+    if not await seeder.has_ad_hoc_invoice(held):
+        invoice = await seeder.draft(
+            held, [("COSM-CONS", "1")], notes="Discount requested — awaiting admin approval."
+        )
+        # 300.00 off 1500.00 is 20%.
+        await seeder.discount(invoice, "300.00", "Financial hardship", pending_approval=True)
+        created += 1
+
+    # ── refunded: paid in full, then the whole amount given back ─────────────
+    cancelled = patients["Kabir Malhotra"]
+    if recorder is not None and not await seeder.has_ad_hoc_invoice(cancelled):
+        invoice = await seeder.draft(cancelled, [("XRAY-CHEST", "1")])
+        invoice = await seeder.issue(invoice, at=now - timedelta(hours=3))
+        invoice = await seeder.pay(
+            invoice,
+            "600.00",
+            PaymentMethod.UPI,
+            key="seed-payment-0005-upi",
+            at=now - timedelta(hours=3) + timedelta(minutes=5),
+            received_by=recorder,
+            reference="UPI-DEMO-000005",
+        )
+        await seeder.refund(
+            invoice,
+            "600.00",
+            PaymentMethod.UPI,
+            key="seed-refund-0005-full",
+            at=now - timedelta(hours=2),
+            refunded_by=recorder,
+            reason="X-ray cancelled: equipment unavailable.",
+            reference="UPI-DEMO-REFUND-000005",
+        )
+        created += 1
+
+    # ── paid, with one of two tests refunded ─────────────────────────────────
+    partial = patients["Devi Lakshmi"]
+    if recorder is not None and not await seeder.has_ad_hoc_invoice(partial):
+        invoice = await seeder.draft(partial, [("LAB-CBC", "1"), ("ECG", "1")])
+        invoice = await seeder.issue(invoice, at=now - timedelta(hours=1))
+        invoice = await seeder.pay(
+            invoice,
+            "800.00",
+            PaymentMethod.CARD,
+            key="seed-payment-0006-card",
+            at=now - timedelta(hours=1) + timedelta(minutes=5),
+            received_by=recorder,
+            reference="CARD-DEMO-000006",
+        )
+        await seeder.refund(
+            invoice,
+            "350.00",
+            PaymentMethod.CARD,
+            key="seed-refund-0006-partial",
+            at=now - timedelta(minutes=30),
+            refunded_by=recorder,
+            reason="Blood sample could not be processed.",
+            reference="CARD-DEMO-REFUND-000006",
+        )
+        created += 1
+
     logger.info("demo_invoices_seeded", created=created)
+
+
+async def _any_doctor_user_id(session: AsyncSession, hospital: Hospital) -> uuid.UUID | None:
+    """Return a seeded doctor's user id, to stand in as a recorder.
+
+    Only used when the seed runs with no acting user, which is how the
+    integration tests call it.
+    """
+    result = await session.execute(
+        select(Doctor.user_id).where(Doctor.hospital_id == hospital.id).order_by(Doctor.created_at)
+    )
+    return result.scalars().first()

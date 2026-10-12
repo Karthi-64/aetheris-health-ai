@@ -9,13 +9,10 @@ Covers the Week 1 handoff's eight-step flow end-to-end (A3): invite → activate
 revocation, plus the audit trail every mutating step must produce (CLAUDE.md
 rule 9).
 
-.. note::
-
-   The invited-user activation step is a stand-in for the invitation-token
-   seam the handoff flags as missing (defect B6 — the invite flow has no way
-   for the invited user to activate yet). The flow flips ``INVITED → ACTIVE``
-   directly to represent what that seam will do; B6 itself is tracked
-   separately and out of scope for the feature build.
+The invited user activates the account the way a real one does: with the
+single-use link from the invitation email, read here from what the notifier
+was asked to deliver. :class:`TestAnInvitationNobodyReceived` covers the case
+where that email could not be queued.
 """
 
 from __future__ import annotations
@@ -27,6 +24,8 @@ import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.api.dependencies.auth import get_current_user, require_permission
+from app.core.config import settings
+from app.core.exceptions import AuthenticationError
 from app.core.security import hash_password, verify_access_token
 from app.models.user import User, UserStatus
 from app.repositories.password_reset_token_repository import PasswordResetTokenRepository
@@ -35,18 +34,53 @@ from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.role_repository import RoleRepository
 from app.repositories.user_repository import UserRepository
 from app.services.auth_service import AuthService
-from app.services.user_service import UserService
-from app.tests.conftest import grant_permissions
+from app.services.user_service import InvitationDelivery, UserService
+from app.tests.conftest import grant_permissions, real_throttle
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from app.core.notifications import NotificationRequest
     from app.database.unit_of_work import UnitOfWork
     from app.tests.conftest import RecordingAuditSink
 
 pytestmark = pytest.mark.database
 
 PASSWORD = "Str0ng!Passw0rd123"
+
+
+class _Mailbox:
+    """A notifier that keeps what would have been emailed.
+
+    The activation link leaves the service only inside the email, so the email
+    is where this test — like the invited person — has to read it from.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[NotificationRequest] = []
+        #: Whether the email queue is accepting mail.
+        self.accepting = True
+
+    async def notify(self, request: NotificationRequest) -> None:
+        """Keep the request."""
+        self.requests.append(request)
+
+    async def deliver_credential(self, request: NotificationRequest) -> bool:
+        """Keep the request, and report whether it was queued."""
+        self.requests.append(request)
+        return self.accepting
+
+    def activation_token(self) -> str:
+        """The token in the most recent emailed link."""
+        url = self.requests[-1].secret_variables["action_url"]
+        return url.rsplit("token=", 1)[1]
+
+
+@pytest.fixture
+def mailbox(monkeypatch: pytest.MonkeyPatch) -> _Mailbox:
+    """Switch email on (a host that is never contacted) and capture what is queued."""
+    monkeypatch.setattr(settings, "SMTP_HOST", "mail.invalid")
+    return _Mailbox()
 
 
 @pytest.fixture
@@ -62,6 +96,7 @@ def auth_service(
         password_reset_repo=PasswordResetTokenRepository(db_session),
         uow=uow,
         audit=audit_sink,
+        **real_throttle(db_session, uow),
     )
 
 
@@ -71,6 +106,7 @@ def user_service(
     audit_sink: RecordingAuditSink,
     uow: UnitOfWork,
     auth_service: AuthService,
+    mailbox: _Mailbox,
 ) -> UserService:
     """A fully wired :class:`UserService` on the transactional test session."""
     return UserService(
@@ -81,6 +117,7 @@ def user_service(
         uow=uow,
         audit=audit_sink,
         password_reset_repo=PasswordResetTokenRepository(db_session),
+        notifier=mailbox,
     )
 
 
@@ -122,6 +159,18 @@ async def _create_role_granting(
     return role.id
 
 
+async def _trusted_devices(db_session: AsyncSession, user_id: uuid.UUID) -> int:
+    """How many browsers are recognised for an account."""
+    from sqlalchemy import func, select
+
+    from app.models.auth_throttle import TrustedDevice
+
+    result = await db_session.execute(
+        select(func.count()).select_from(TrustedDevice).where(TrustedDevice.user_id == user_id)
+    )
+    return int(result.scalar_one())
+
+
 class TestFullLifecycle:
     """invite → activate → login → refresh → protected → update → role → logout."""
 
@@ -133,6 +182,7 @@ class TestFullLifecycle:
         auth_service: AuthService,
         user_service: UserService,
         audit_sink: RecordingAuditSink,
+        mailbox: _Mailbox,
     ) -> None:
         # ── Step 1: invite ───────────────────────────────────────────────────
         # The admin carries user.create, user.update, role.assign.
@@ -144,7 +194,7 @@ class TestFullLifecycle:
         )
         email = f"invitee-{uuid.uuid4().hex[:12]}@hospital.example"
 
-        invited, invite_token = await user_service.invite_user(
+        invited, delivery = await user_service.invite_user(
             hospital_id=hospital_id,
             email=email,
             first_name="New",
@@ -153,15 +203,17 @@ class TestFullLifecycle:
             actor_id=actor_id,
         )
         assert invited.status == UserStatus.INVITED
-        assert invite_token
+        assert delivery is InvitationDelivery.QUEUED
         assert audit_sink.last().action == "user.invited"
         assert audit_sink.last().actor_id == actor_id
 
         # ── Step 2: activate via the real invite-token seam (B6) ───────────
         # The invite token is a single-use password-reset token; consuming it
         # transitions the account INVITED → ACTIVE.
+        # The token reaches the invited person by email and by no other route.
+        invite_token = mailbox.activation_token()
         await auth_service.reset_password(raw_token=invite_token, new_password=PASSWORD)
-        activated = await UserRepository(db_session).get_by_id(invited.id)
+        activated = await UserRepository(db_session).get_by_id(invited.id, hospital_id)
         assert activated is not None
         assert activated.status == UserStatus.ACTIVE
 
@@ -169,8 +221,10 @@ class TestFullLifecycle:
         login_result = await auth_service.login(email=email, password=PASSWORD)
         assert login_result["access_token"]
         assert login_result["refresh_token"]
-        assert audit_sink.last().action == "auth.login.success"
-        assert audit_sink.last().target_id == invited.id
+        # The sign-in is audited, and so is this browser becoming a trusted
+        # device of the account, in that order and both about this user.
+        assert audit_sink.actions()[-2:] == ["auth.login.success", "auth.device.trusted"]
+        assert {event.target_id for event in audit_sink.events[-2:]} == {invited.id}
 
         # The JWT carries the user's identity.
         payload = verify_access_token(login_result["access_token"])
@@ -180,6 +234,9 @@ class TestFullLifecycle:
         # ── Step 4: refresh (rotation) ───────────────────────────────────────
         rotated = await auth_service.refresh_token(login_result["refresh_token"])
         assert rotated["refresh_token"] != login_result["refresh_token"]
+        # A refresh proves only that a session exists, so it never makes a
+        # browser a trusted device.
+        assert rotated["device_cookie"] is None
 
         # The old token is revoked: replaying it triggers reuse detection,
         # which invalidates every session and is audited.
@@ -274,6 +331,119 @@ class TestFullLifecycle:
             assert action in audit_sink.actions(), f"missing audit event {action}"
 
 
+async def _status_now(db_session: AsyncSession, user: User) -> UserStatus:
+    """The account's status as the database has it now."""
+    await db_session.refresh(user)
+    return user.status
+
+
+class TestAnInvitationNobodyReceived:
+    """Attack: a link whose email was never queued is left alive.
+
+    Real repositories and a real database; only the notifier is a double,
+    which here stands for an email queue that refuses the message. The token
+    it was handed is exactly the one an attacker would hope still works.
+    """
+
+    async def _invite(
+        self, user_service: UserService, hospital_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> tuple[User, InvitationDelivery]:
+        return await user_service.invite_user(
+            hospital_id=hospital_id,
+            email=f"invitee-{uuid.uuid4().hex[:12]}@hospital.example",
+            first_name="New",
+            last_name="Nurse",
+            actor_permissions=["user.create"],
+            actor_id=actor_id,
+        )
+
+    async def test_a_first_invitation_that_was_not_queued_cannot_activate_the_account(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        auth_service: AuthService,
+        user_service: UserService,
+        audit_sink: RecordingAuditSink,
+        mailbox: _Mailbox,
+    ) -> None:
+        mailbox.accepting = False
+
+        invited, delivery = await self._invite(user_service, hospital_id, actor_id)
+
+        assert delivery is InvitationDelivery.UNAVAILABLE
+        assert invited.status == UserStatus.INVITED
+        assert audit_sink.actions() == ["user.invited"]
+        with pytest.raises(AuthenticationError):
+            await auth_service.reset_password(
+                raw_token=mailbox.activation_token(), new_password=PASSWORD
+            )
+        assert await _status_now(db_session, invited) is UserStatus.INVITED
+        assert invited.password_changed_at is None
+
+    async def test_a_resend_that_was_not_queued_leaves_the_earlier_link_and_only_that_one(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        auth_service: AuthService,
+        user_service: UserService,
+        audit_sink: RecordingAuditSink,
+        mailbox: _Mailbox,
+    ) -> None:
+        invited, _ = await self._invite(user_service, hospital_id, actor_id)
+        earlier = mailbox.activation_token()
+        mailbox.accepting = False
+
+        delivery = await user_service.resend_invitation(
+            invited.id,
+            actor_id=actor_id,
+            actor_hospital_id=hospital_id,
+            actor_permissions=["user.create"],
+        )
+
+        assert delivery is InvitationDelivery.UNAVAILABLE
+        orphan = mailbox.activation_token()
+        assert orphan != earlier
+        assert "user.invitation_resent" not in audit_sink.actions()
+        # The link that was never sent is dead...
+        with pytest.raises(AuthenticationError):
+            await auth_service.reset_password(raw_token=orphan, new_password=PASSWORD)
+        assert await _status_now(db_session, invited) is UserStatus.INVITED
+        # ...and the one already in the invited person's mailbox still works.
+        await auth_service.reset_password(raw_token=earlier, new_password=PASSWORD)
+        assert await _status_now(db_session, invited) is UserStatus.ACTIVE
+
+    async def test_a_resend_that_was_queued_spares_only_the_link_it_just_sent(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        auth_service: AuthService,
+        user_service: UserService,
+        mailbox: _Mailbox,
+    ) -> None:
+        """The other half: once queued, every earlier link dies and the new one lives."""
+        invited, _ = await self._invite(user_service, hospital_id, actor_id)
+        earlier = mailbox.activation_token()
+
+        delivery = await user_service.resend_invitation(
+            invited.id,
+            actor_id=actor_id,
+            actor_hospital_id=hospital_id,
+            actor_permissions=["user.create"],
+        )
+
+        assert delivery is InvitationDelivery.QUEUED
+        with pytest.raises(AuthenticationError):
+            await auth_service.reset_password(raw_token=earlier, new_password=PASSWORD)
+        assert await _status_now(db_session, invited) is UserStatus.INVITED
+        await auth_service.reset_password(
+            raw_token=mailbox.activation_token(), new_password=PASSWORD
+        )
+        assert await _status_now(db_session, invited) is UserStatus.ACTIVE
+
+
 class TestLoginRejectsSuspendedAccounts:
     """A suspended account cannot log in even with valid credentials."""
 
@@ -361,6 +531,7 @@ class TestTokenRevocationOnRoleChange:
         await db_session.flush()
 
         tokens = await auth_service.login(email=user.email, password=PASSWORD)
+        assert await _trusted_devices(db_session, user.id) == 1, "premise: a trusted browser"
 
         role_id = await _create_role_granting(db_session, hospital_id, code="user.read")
         await user_service.assign_role(
@@ -373,5 +544,45 @@ class TestTokenRevocationOnRoleChange:
         )
 
         # The pre-change session is dead.
+        with pytest.raises(AuthenticationError):
+            await auth_service.refresh_token(tokens["refresh_token"])
+        # The browser is still recognised: a role change puts nothing about
+        # the account's credentials in doubt.
+        assert await _trusted_devices(db_session, user.id) == 1
+
+    async def test_suspending_a_user_forgets_their_trusted_browsers(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        auth_service: AuthService,
+        user_service: UserService,
+    ) -> None:
+        """Attack: a suspended user's browser keeps its standing for when they return.
+
+        Unlike a role change, suspension ends the sessions and forgets every
+        trusted device, in the same transaction as the status change.
+        """
+        user = User(
+            id=uuid.uuid4(),
+            hospital_id=hospital_id,
+            email=f"suspend-{uuid.uuid4().hex[:12]}@hospital.example",
+            password_hash=hash_password(PASSWORD),
+            first_name="Token",
+            last_name="Holder",
+        )
+        db_session.add(user)
+        await db_session.flush()
+        tokens = await auth_service.login(email=user.email, password=PASSWORD)
+        assert await _trusted_devices(db_session, user.id) == 1, "premise: a trusted browser"
+
+        await user_service.deactivate_user(
+            user_id=user.id,
+            actor_user_id=actor_id,
+            actor_hospital_id=hospital_id,
+            actor_permissions=["user.deactivate"],
+        )
+
+        assert await _trusted_devices(db_session, user.id) == 0
         with pytest.raises(AuthenticationError):
             await auth_service.refresh_token(tokens["refresh_token"])

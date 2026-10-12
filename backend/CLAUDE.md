@@ -147,8 +147,8 @@ class PatientService:
     async def summarize_history(self, patient_id):
         # AI usage always:
         # 1. Goes through AIService (not raw provider SDK)
-        # 2. Respects hospital budget
-        # 3. Records to ai_interactions
+        # 2. Respects hospital budget (planned — no budget is enforced yet)
+        # 3. Is logged as one `ai_interaction` line (the ai_interactions table is planned)
         # 4. Uses a versioned prompt from the registry
         return await self.ai.run(
             prompt_key="patient.summarize_history",
@@ -157,7 +157,7 @@ class PatientService:
         )
 ```
 
-**Never** call OpenAI/Anthropic/Groq SDKs directly outside `app/ai/providers/`.
+**Never** call a model provider directly outside `app/ai/providers/`. Today only Groq is connected, over `httpx` (no vendor SDK is installed); the one real caller is `app/services/slot_ranker.py` — read it before following the sketch above, whose `ai.run(...)` API is illustrative.
 
 ---
 

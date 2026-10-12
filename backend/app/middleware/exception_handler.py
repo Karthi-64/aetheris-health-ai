@@ -11,6 +11,7 @@ are the primary mechanism. This middleware is the last-resort layer.
 from __future__ import annotations
 
 import structlog
+from sqlalchemy.exc import DBAPIError
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -54,13 +55,24 @@ class ExceptionHandlerMiddleware(BaseHTTPMiddleware):
                     errors=exc.detail,
                     request_id=getattr(request.state, "request_id", None),
                 ),
+                headers=getattr(exc, "headers", None),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "middleware_caught_unhandled_exception",
-                path=str(request.url.path),
-                exc_info=exc,
-            )
+            if isinstance(exc, DBAPIError):
+                # A database error's own text quotes row values ("Key
+                # (email)=(…) already exists"). Only what kind it was is logged.
+                logger.error(
+                    "middleware_caught_unhandled_exception",
+                    path=str(request.url.path),
+                    error_type=type(exc.orig).__name__ if exc.orig else type(exc).__name__,
+                    sqlstate=getattr(exc.orig, "sqlstate", None),
+                )
+            else:
+                logger.exception(
+                    "middleware_caught_unhandled_exception",
+                    path=str(request.url.path),
+                    exc_info=exc,
+                )
             return JSONResponse(
                 status_code=500,
                 content=error_envelope(

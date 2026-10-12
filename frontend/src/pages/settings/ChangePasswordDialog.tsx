@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { ApiError } from '@/api/types'
 import { useChangePassword } from '@/api/profile'
+import { useAuthStore } from '@/store/auth-store'
 
 // 12 characters is the backend's floor (`ChangePasswordRequest.new_password`);
 // rejecting a short password here saves a round trip, but the server is still
@@ -43,6 +44,7 @@ type FormValues = z.input<typeof schema>
 export function ChangePasswordDialog({ trigger }: { trigger: ReactNode }) {
   const [open, setOpen] = useState(false)
   const changePassword = useChangePassword()
+  const logout = useAuthStore((s) => s.logout)
 
   const {
     register,
@@ -66,10 +68,12 @@ export function ChangePasswordDialog({ trigger }: { trigger: ReactNode }) {
         current_password: values.current_password,
         new_password: values.new_password,
       })
-      toast.success('Password changed', {
-        description: 'Your other sessions have been signed out.',
-      })
-      close()
+      // The backend revokes every refresh token for the user on a password
+      // change, this session's included (auth_service.change_password), and
+      // returns no new ones. Staying "signed in" would only last until the
+      // access token expires, so end the session now: the route guard sends
+      // the user to /login, which explains why.
+      logout('password_changed')
     } catch (err) {
       // 401 is specifically "current password is wrong" on this endpoint, so it
       // belongs on that field rather than in a toast.
@@ -94,7 +98,8 @@ export function ChangePasswordDialog({ trigger }: { trigger: ReactNode }) {
         <DialogHeader>
           <DialogTitle>Change password</DialogTitle>
           <DialogDescription>
-            You will stay signed in here; other devices will need to sign in again.
+            Changing your password signs you out on every device, including this one. You will
+            sign in again with the new password.
           </DialogDescription>
         </DialogHeader>
 

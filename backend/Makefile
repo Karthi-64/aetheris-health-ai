@@ -4,7 +4,7 @@
 # Common development commands. Run from the backend/ directory.
 # ──────────────────────────────────────────────────────────────────────────────
 
-.PHONY: install dev lint format test test-cov migrate migration seed db-shell shell \
+.PHONY: install dev lint format test test-cov migrate migration seed rotate-mfa-keys db-shell shell \
         clean docker-build docker-run help
 
 # ── Variables ────────────────────────────────────────────────────────────────
@@ -93,6 +93,9 @@ current: ## Show current migration version
 # ── Seeding ──────────────────────────────────────────────────────────────────
 seed: ## Seed permissions, roles, and realistic demo data (idempotent)
 	$(UV) run python -m app.seeds.seed
+
+rotate-mfa-keys: ## Re-encrypt stored MFA secrets under the current MFA_ENCRYPTION_KEY
+	$(UV) run python -m app.services.mfa_key_rotation
 
 # ── Database Shell ───────────────────────────────────────────────────────────
 db-shell: ## Open a PostgreSQL shell (requires psql)

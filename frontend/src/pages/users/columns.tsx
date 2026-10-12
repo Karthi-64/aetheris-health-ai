@@ -9,6 +9,8 @@ export interface UsersTableActions {
   onEdit: (user: ManagedUser) => void
   onDeactivate: (user: ManagedUser) => void
   onReactivate: (user: ManagedUser) => void
+  /** Omitted when the signed-in user may not send invitations. */
+  onResendInvitation?: (user: ManagedUser) => void
 }
 
 function fullName(u: ManagedUser) {
@@ -75,6 +77,7 @@ export function usersColumns(actions: UsersTableActions): ColumnDef<ManagedUser>
       cell: ({ row }) => {
         const user = row.original
         const canReactivate = user.status === 'suspended'
+        const onResendInvitation = user.status === 'invited' ? actions.onResendInvitation : undefined
         return (
           <div className="flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => actions.onEdit(user)}>
@@ -83,6 +86,11 @@ export function usersColumns(actions: UsersTableActions): ColumnDef<ManagedUser>
             <Button variant="ghost" size="sm" onClick={() => actions.onManageRoles(user)}>
               Roles
             </Button>
+            {onResendInvitation && (
+              <Button variant="ghost" size="sm" onClick={() => onResendInvitation(user)}>
+                Resend invitation
+              </Button>
+            )}
             {canReactivate ? (
               <Button variant="ghost" size="sm" onClick={() => actions.onReactivate(user)}>
                 Reactivate

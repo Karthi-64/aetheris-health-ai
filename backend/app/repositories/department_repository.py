@@ -7,12 +7,11 @@ never assumed from the caller (CLAUDE.md rule 5).
 
 .. note::
 
-   ``backend/CLAUDE.md`` describes a base repository that injects
-   ``hospital_id`` automatically from ``app/core/tenancy.py``. Neither exists
-   yet, so scoping is passed explicitly here — the same pattern
-   :class:`~app.repositories.patient_repository.PatientRepository` already
-   uses. When ``tenancy.py`` lands, these signatures collapse to implicit
-   scoping.
+   Scoping is passed explicitly, as an argument, on every method here. That is
+   one of two layers: ``app/core/tenancy.py`` also confines the session itself
+   to the authenticated principal's hospital, so a query that passed the wrong
+   ``hospital_id`` — or forgot the filter — still cannot reach another
+   hospital's rows.
 """
 
 from __future__ import annotations

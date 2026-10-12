@@ -1,10 +1,10 @@
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { toast } from 'sonner'
-import { Mail, Headset, ShieldCheck, Loader2 } from 'lucide-react'
+import { Mail, Headset, ShieldCheck } from 'lucide-react'
 import MarketingNav from '@/components/layout/MarketingNav'
 import MarketingFooter from '@/components/layout/MarketingFooter'
+import { mailtoUrl, openEmailApp } from '@/lib/mailto'
 import { cn } from '@/lib/utils'
 
 const contactSchema = z.object({
@@ -16,30 +16,33 @@ const contactSchema = z.object({
 
 type ContactValues = z.infer<typeof contactSchema>
 
+const SALES_EMAIL = 'sales@aetheris.health'
+
 const CHANNELS = [
-  { icon: Mail, label: 'Sales', value: 'sales@aetheris.health' },
+  { icon: Mail, label: 'Sales', value: SALES_EMAIL },
   { icon: Headset, label: 'Support', value: 'support@aetheris.health' },
-  { icon: ShieldCheck, label: 'Privacy & compliance', value: 'privacy@aetheris.health' },
+  { icon: ShieldCheck, label: 'Privacy', value: 'privacy@aetheris.health' },
 ]
 
 export default function ContactPage() {
   const {
     register,
     handleSubmit,
-    reset,
-    formState: { errors, isSubmitting },
+    formState: { errors },
   } = useForm<ContactValues>({
     resolver: zodResolver(contactSchema),
     defaultValues: { name: '', email: '', organization: '', message: '' },
   })
 
-  async function onSubmit(_values: ContactValues) {
-    // ── Backend seam ─────────────────────────────────────────────
-    // TODO(backend): POST to a real endpoint / CRM, e.g.
-    //   await api.post('/contact', _values)
-    await new Promise((r) => setTimeout(r, 700))
-    toast.success("Thanks — we'll be in touch shortly.")
-    reset()
+  /**
+   * There is no contact endpoint, so nothing is sent from this page. The form
+   * hands a ready-written message to the visitor's own email app, and they
+   * send it — no success is reported for something that did not happen.
+   */
+  function onSubmit(values: ContactValues) {
+    const subject = `Aetheris enquiry from ${values.organization}`
+    const body = `${values.message}\n\n${values.name}\n${values.organization}\n${values.email}`
+    openEmailApp(mailtoUrl({ to: SALES_EMAIL, subject, body }))
   }
 
   const fieldClass = (invalid: boolean) =>
@@ -65,8 +68,7 @@ export default function ContactPage() {
           </p>
           <h1 className="font-display text-headline-xl text-primary">Talk to our team.</h1>
           <p className="font-body text-body-md text-on-surface-variant mt-4 max-w-md">
-            Whether you are scoping a rollout or have a compliance question, we will route you to the
-            right person.
+            Tell us about your hospital and what you are looking to solve.
           </p>
 
           <div className="mt-10 space-y-4">
@@ -77,7 +79,12 @@ export default function ContactPage() {
                 </span>
                 <div>
                   <p className="font-label text-label-caps text-outline">{c.label}</p>
-                  <p className="font-body text-body-md text-primary font-bold">{c.value}</p>
+                  <a
+                    href={`mailto:${c.value}`}
+                    className="font-body text-body-md text-primary font-bold hover:underline"
+                  >
+                    {c.value}
+                  </a>
                 </div>
               </div>
             ))}
@@ -162,18 +169,14 @@ export default function ContactPage() {
 
             <button
               type="submit"
-              disabled={isSubmitting}
-              className="shadow-neo-base bg-primary text-on-primary font-label text-label-caps flex w-full items-center justify-center gap-2 rounded-xl py-3.5 font-bold transition-all duration-300 hover:-translate-y-0.5 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-70"
+              className="shadow-neo-base bg-primary text-on-primary font-label text-label-caps flex w-full items-center justify-center gap-2 rounded-xl py-3.5 font-bold transition-all duration-300 hover:-translate-y-0.5 active:translate-y-0"
             >
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="size-5 animate-spin" />
-                  Sending...
-                </>
-              ) : (
-                'Send message'
-              )}
+              <Mail className="size-5" />
+              Compose email
             </button>
+            <p className="font-body text-outline text-center text-xs">
+              This opens your email app with the message written. Nothing is sent until you send it.
+            </p>
           </form>
         </div>
       </main>

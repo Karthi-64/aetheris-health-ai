@@ -1053,7 +1053,7 @@ class DoctorService:
         :raises ValidationError: If the user is absent or in another tenant.
         :raises DuplicateDoctorProfileError: If they already have a profile.
         """
-        user = await self._users.get_by_id(user_id)
+        user = await self._users.get_by_id(user_id, hospital_id)
         if user is None or user.hospital_id != hospital_id:
             # Same message either way: confirming that a user exists in another
             # hospital would leak across the tenant boundary.

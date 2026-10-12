@@ -9,20 +9,26 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from app.core.audit import AuditEvent
 from app.core.config import settings
+from app.core.email import email_delivery_configured
 from app.core.exceptions import (
     BusinessRuleError,
     ConflictError,
     NotFoundError,
     PermissionDeniedError,
+    RateLimitError,
 )
+from app.core.notifications import NotificationRequest, Notifier, NullNotifier
 from app.core.security import generate_opaque_token, hash_password
+from app.core.tenancy import TenantScope, cross_tenant, tenant_or_platform, tenant_scope
 from app.models.user import User, UserStatus
+from app.utils.validators import normalize_email
 
 if TYPE_CHECKING:
     from app.core.audit import AuditSink
@@ -34,6 +40,26 @@ if TYPE_CHECKING:
     from app.services.auth_service import AuthService
 
 logger = structlog.get_logger(__name__)
+
+#: The one refusal for an email that cannot be used for a new staff account —
+#: whether it belongs to a user of this hospital or of another.
+_EMAIL_UNAVAILABLE = "This email address cannot be used for a new user."
+
+
+class InvitationDelivery(StrEnum):
+    """What became of an invitation's one-time activation link.
+
+    This is everything an administrator is told about it. The link itself is a
+    credential for the invited person's account: it goes to their mailbox and
+    nowhere else.
+    """
+
+    #: An email carrying the link was queued for the invited address. Queued,
+    #: not delivered: nothing here confirms it arrived.
+    QUEUED = "queued"
+    #: No email was sent, because this deployment has no mail transport. No
+    #: link exists. The account stays invited until an invitation is sent.
+    UNAVAILABLE = "unavailable"
 
 
 class UserService:
@@ -55,6 +81,7 @@ class UserService:
         uow: UnitOfWork,
         audit: AuditSink,
         password_reset_repo: PasswordResetTokenRepository,
+        notifier: Notifier | None = None,
     ) -> None:
         self._user_repo = user_repo
         self._role_repo = role_repo
@@ -63,6 +90,7 @@ class UserService:
         self._uow = uow
         self._audit = audit
         self._password_reset_repo = password_reset_repo
+        self._notifier: Notifier = notifier or NullNotifier()
 
     # ── Read ─────────────────────────────────────────────────────────────────
 
@@ -77,7 +105,13 @@ class UserService:
         :raises NotFoundError: If the user doesn't exist or is soft-deleted.
         :raises PermissionDeniedError: If cross-hospital access is attempted.
         """
-        user = await self._user_repo.get_by_id(user_id)
+        user = await self._user_repo.get_by_id(
+            user_id,
+            tenant_or_platform(
+                actor_hospital_id,
+                reason="platform-level actor, or a user reading their own account",
+            ),
+        )
         if user is None:
             raise NotFoundError("User not found.")
 
@@ -164,7 +198,9 @@ class UserService:
         :returns: The user instance.
         :raises NotFoundError: If the user doesn't exist.
         """
-        user = await self._user_repo.get_by_id(user_id)
+        user = await self._user_repo.get_by_id(
+            user_id, cross_tenant("own account: id of the authenticated principal")
+        )
         if user is None:
             raise NotFoundError("User not found.")
         return user
@@ -181,14 +217,17 @@ class UserService:
         role_ids: list[uuid.UUID] | None = None,
         actor_permissions: list[str] | None = None,
         actor_id: uuid.UUID | None = None,
-    ) -> tuple[User, str]:
+    ) -> tuple[User, InvitationDelivery]:
         """Invite a new user to the system.
 
-        Creates the user with ``status=invited`` and mints a single-use
-        invitation token (Week 1 handoff B6) that ``reset_password`` accepts
-        to transition the account ``INVITED -> ACTIVE``. The raw token is
-        returned so the Notifications module can deliver it; email delivery
-        itself is out of scope.
+        Creates the user with ``status=invited`` and emails them a single-use
+        activation link, which ``reset_password`` accepts to transition the
+        account ``INVITED -> ACTIVE``.
+
+        The link is never returned. It used to be handed back to the caller
+        "so an admin can pass it on by hand", which gave every administrator a
+        working credential for each account they created. See
+        :meth:`_send_invitation`.
 
         :param hospital_id: The hospital UUID.
         :param email: The user's email address.
@@ -198,8 +237,8 @@ class UserService:
         :param role_ids: Optional list of initial role UUIDs.
         :param actor_permissions: Permissions of the actor performing the invite.
         :param actor_id: UUID of the acting user, for the audit trail.
-        :returns: A ``(user, invite_token)`` pair. The token is single-use and
-            expires after ``INVITE_TOKEN_TTL_HOURS``.
+        :returns: The user, and what became of the invitation email. Never
+            the activation link or its token.
         :raises BusinessRuleError: If the email already exists in the hospital.
         :raises PermissionDeniedError: If the actor doesn't have ``user.create``.
         :raises NotFoundError: If any requested role id does not exist or
@@ -212,9 +251,19 @@ class UserService:
         # Check for duplicate email — a 409, not a 400: the request is well-formed
         # but conflicts with current state (docs/06-API_STANDARDS.md §14; the
         # endpoint contract documents 409 for this case).
-        existing = await self._user_repo.get_by_email(hospital_id, email)
-        if existing is not None:
-            raise ConflictError("A user with this email already exists in this hospital.")
+        #
+        # A staff email names one account across the whole platform (login
+        # takes an email and no hospital), so the address must be free in
+        # every hospital, not just this one. That one question is asked under
+        # an explicit system scope — inside this request the session is
+        # otherwise confined to the actor's hospital — and its answer is a bare
+        # yes/no. The refusal is worded identically whether the address is in
+        # use here or elsewhere, so it says nothing about other hospitals.
+        email = normalize_email(email)
+        with tenant_scope(TenantScope.system("staff email is unique across the platform")):
+            taken = await self._user_repo.email_is_taken(email, hospital_id=hospital_id)
+        if taken:
+            raise ConflictError(_EMAIL_UNAVAILABLE)
 
         # B5: validate every requested role BEFORE creating the user — the
         # invite is all-or-nothing. Unknown ids and another hospital's roles
@@ -223,7 +272,7 @@ class UserService:
         if role_ids:
             unknown_ids: list[str] = []
             for role_id in role_ids:
-                role = await self._role_repo.get_by_id(role_id)
+                role = await self._role_repo.get_by_id(role_id, hospital_id)
                 if role is None:
                     unknown_ids.append(str(role_id))
                     continue
@@ -239,9 +288,8 @@ class UserService:
                     detail={"role_ids": unknown_ids},
                 )
 
-            # BR-8: an invite grants permissions just as an assignment does, and
-            # the caller receives the invite token — so the same escalation
-            # guard applies before the user row is written.
+            # BR-8: an invite grants permissions just as an assignment does, so
+            # the same escalation guard applies before the user row is written.
             for role_id in validated_roles:
                 await self._assert_grantable(role_id, actor_permissions, hospital_id)
 
@@ -269,16 +317,6 @@ class UserService:
         if validated_roles:
             await self._user_repo.refresh(user)
 
-        # B6: mint the single-use invitation token (stored hashed) and hand
-        # the raw token to the caller for the Notifications module to deliver.
-        raw_token, token_hash = generate_opaque_token()
-        expires_at = datetime.now(UTC) + timedelta(hours=settings.INVITE_TOKEN_TTL_HOURS)
-        await self._password_reset_repo.create(
-            user_id=user.id,
-            token_hash=token_hash,
-            expires_at=expires_at,
-        )
-
         await self._audit.record(
             AuditEvent(
                 action="user.invited",
@@ -288,9 +326,145 @@ class UserService:
                 actor_id=actor_id,
             )
         )
+        # AC-2: "the invited user receives an email".
+        delivery = await self._send_invitation(user, actor_id=actor_id)
         await self._uow.commit()
-        logger.info("user_invited", user_id=str(user.id), hospital_id=str(hospital_id))
-        return user, raw_token
+        logger.info(
+            "user_invited",
+            user_id=str(user.id),
+            hospital_id=str(hospital_id),
+            delivery=delivery.value,
+        )
+        return user, delivery
+
+    async def resend_invitation(
+        self,
+        user_id: uuid.UUID,
+        *,
+        actor_id: uuid.UUID | None = None,
+        actor_hospital_id: uuid.UUID | None = None,
+        actor_permissions: list[str] | None = None,
+    ) -> InvitationDelivery:
+        """Send an invited user a fresh activation link.
+
+        For an invitation that never arrived, has expired, or was created
+        while email was not set up. Every link sent before stops working, so
+        at most one is ever live for an account.
+
+        :param user_id: The invited user's UUID.
+        :param actor_id: UUID of the acting user, for the audit trail.
+        :param actor_hospital_id: The acting user's hospital for tenant isolation.
+        :param actor_permissions: Permissions of the actor.
+        :returns: What became of the invitation email. Never the link.
+        :raises PermissionDeniedError: If the actor doesn't have ``user.create``.
+        :raises NotFoundError: If the user doesn't exist or is outside the
+            actor's hospital.
+        :raises ConflictError: If the account is not waiting to be activated.
+        """
+        if not actor_permissions or "user.create" not in actor_permissions:
+            raise PermissionDeniedError("You do not have permission to invite users.")
+
+        user = await self.get_user(user_id, actor_hospital_id)
+
+        if user.status != UserStatus.INVITED:
+            raise ConflictError("This user is not waiting to activate an invitation.")
+
+        if not email_delivery_configured():
+            return await self._send_invitation(user, actor_id=actor_id)
+
+        # A few per account, then a wait: this sends mail to an address the
+        # caller chose, and each one kills the link before it.
+        if not await self._auth_service.admit_invitation_resend(user.id):
+            raise RateLimitError("Too many invitations were sent to this user. Try again later.")
+
+        # Under lock, and checked again: if the invitation is being redeemed
+        # at this very moment, either that finishes first and this refuses, or
+        # this finishes first and the old link is dead before it is redeemed.
+        # Never both, which would leave a live link to an active account.
+        locked = await self._user_repo.lock_for_authentication(user.id)
+        if locked is None or locked.status != UserStatus.INVITED:
+            raise ConflictError("This user is not waiting to activate an invitation.")
+        user = locked
+
+        delivery = await self._send_invitation(user, actor_id=actor_id)
+        if delivery is InvitationDelivery.QUEUED:
+            await self._audit.record(
+                AuditEvent(
+                    action="user.invitation_resent",
+                    hospital_id=user.hospital_id,
+                    target_type="user",
+                    target_id=user.id,
+                    actor_id=actor_id,
+                )
+            )
+        await self._uow.commit()
+        logger.info("user_invitation_resent", user_id=str(user.id), delivery=delivery.value)
+        return delivery
+
+    async def _send_invitation(
+        self, user: User, *, actor_id: uuid.UUID | None
+    ) -> InvitationDelivery:
+        """Mint a fresh activation link for an invited user and queue it by email.
+
+        The link is a credential for the invited person's account. It has
+        exactly one way out of this process: the body of the email queued
+        here. It is not returned, not logged and not audited, so the
+        administrator who created the account never holds it and cannot
+        activate the account in the invited person's place.
+
+        With no mail transport there is nowhere to send a link, so none is
+        minted. The account stays invited, and a link can be sent later with
+        :meth:`resend_invitation`. There is no other way to get one.
+
+        The caller commits.
+
+        :param user: The invited user.
+        :param actor_id: Who asked, named in the email.
+        :returns: ``QUEUED`` or ``UNAVAILABLE``.
+        """
+        if not email_delivery_configured():
+            logger.warning(
+                "user_invitation_not_sent",
+                reason="email_not_configured",
+                user_id=str(user.id),
+            )
+            return InvitationDelivery.UNAVAILABLE
+
+        raw_token, token_hash = generate_opaque_token()
+        expires_at = datetime.now(UTC) + timedelta(hours=settings.INVITE_TOKEN_TTL_HOURS)
+        token = await self._password_reset_repo.create(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+        )
+        queued = await self._notifier.deliver_credential(
+            NotificationRequest(
+                kind="auth.user_invited",
+                hospital_id=user.hospital_id,
+                recipient_user_ids=(user.id,),
+                variables={"expires_in": f"{settings.INVITE_TOKEN_TTL_HOURS} hours"},
+                secret_variables={
+                    "action_url": (
+                        f"{settings.FRONTEND_BASE_URL.rstrip('/')}/reset-password#token={raw_token}"
+                    ),
+                },
+                actor_id=actor_id,
+            )
+        )
+        if queued is not True:
+            # The email was not queued, so the link has nowhere to go. It is
+            # killed rather than left alive with nobody holding it, and any
+            # link sent earlier is left working: nothing has replaced it.
+            await self._password_reset_repo.mark_as_used(token)
+            logger.warning(
+                "user_invitation_not_sent", reason="email_not_queued", user_id=str(user.id)
+            )
+            return InvitationDelivery.UNAVAILABLE
+
+        # Whatever was sent before stops working now that its replacement is
+        # on its way.
+        await self._password_reset_repo.invalidate_all_for_user(user.id, keep=token.id)
+        return InvitationDelivery.QUEUED
 
     # ── Update ───────────────────────────────────────────────────────────────
 
@@ -418,8 +592,9 @@ class UserService:
 
         await self._user_repo.update(user, status=UserStatus.SUSPENDED)
 
-        # Revoke all sessions
-        await self._auth_service.logout_all(user_id)
+        # Any invitation or reset link still out dies with the account's
+        # access: suspending must not leave a working way in.
+        await self._password_reset_repo.invalidate_all_for_user(user_id)
 
         await self._audit.record(
             AuditEvent(
@@ -430,6 +605,11 @@ class UserService:
                 actor_id=actor_user_id,
             )
         )
+        # Last, because it commits: revoking the sessions, the status change,
+        # the dead links and the audit entry all land together or not at all.
+        # A suspension that stopped half-way used to leave the account
+        # suspended with a live link and no record of who suspended it.
+        await self._auth_service.logout_all(user_id)
         await self._uow.commit()
         logger.info("user_deactivated", user_id=str(user_id), actor_id=str(actor_user_id))
         return user
@@ -457,9 +637,22 @@ class UserService:
 
         user = await self.get_user(user_id, actor_hospital_id)
 
+        if user.status != UserStatus.SUSPENDED:
+            # Reactivating is the undoing of a suspension and nothing else. On
+            # an account that is not suspended it would end its sessions and
+            # kill its pending invitation for no reason.
+            raise ConflictError("This user is not suspended.")
+
+        # An account that was never activated goes back to waiting for its
+        # invitation. Making it ACTIVE would hand out an account whose owner
+        # has never set a password or proved they hold the mailbox.
+        never_activated = user.password_changed_at is None and user.last_login_at is None
         await self._user_repo.update(
-            user, status=UserStatus.ACTIVE, failed_login_attempts=0, locked_until=None
+            user, status=UserStatus.INVITED if never_activated else UserStatus.ACTIVE
         )
+        # No link issued before the suspension works after it. An invited
+        # account gets a new one when an administrator sends it.
+        await self._password_reset_repo.invalidate_all_for_user(user_id)
 
         await self._audit.record(
             AuditEvent(
@@ -470,6 +663,10 @@ class UserService:
                 actor_id=actor_id,
             )
         )
+        # Last, because it commits everything above with it. Sessions were
+        # revoked at suspension; this also forgets every browser the account
+        # was once recognised on.
+        await self._auth_service.logout_all(user_id)
         await self._uow.commit()
         logger.info("user_reactivated", user_id=str(user_id))
         return user
@@ -501,7 +698,12 @@ class UserService:
         :raises NotFoundError: If the role is not visible to the actor's tenant.
         :raises PermissionDeniedError: If the role grants anything the actor lacks.
         """
-        role = await self._role_repo.get_with_permissions(role_id, hospital_id=actor_hospital_id)
+        role = await self._role_repo.get_with_permissions(
+            role_id,
+            hospital_id=tenant_or_platform(
+                actor_hospital_id, reason="grant check for a platform-level administrator"
+            ),
+        )
         if role is None:
             raise NotFoundError("Role not found.")
 
@@ -543,7 +745,12 @@ class UserService:
 
         user = await self.get_user(user_id, actor_hospital_id)
 
-        role = await self._role_repo.get_by_id(role_id)
+        role = await self._role_repo.get_by_id(
+            role_id,
+            tenant_or_platform(
+                actor_hospital_id, reason="role assignment by a platform-level administrator"
+            ),
+        )
         if role is None:
             raise NotFoundError("Role not found.")
 
@@ -571,7 +778,7 @@ class UserService:
         await self._user_repo.add_role(user_id, role_id, assigned_by=actor_id)
 
         # Revoke refresh tokens to force re-login with new claims
-        await self._auth_service.logout_all(user_id)
+        await self._auth_service.logout_all(user_id, forget_devices=False)
 
         await self._audit.record(
             AuditEvent(
@@ -658,7 +865,7 @@ class UserService:
 
         removed = await self._user_repo.remove_role(user_id, role_id)
         if removed:
-            await self._auth_service.logout_all(user_id)
+            await self._auth_service.logout_all(user_id, forget_devices=False)
             await self._audit.record(
                 AuditEvent(
                     action="role.removed",

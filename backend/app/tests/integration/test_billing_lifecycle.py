@@ -33,6 +33,7 @@ from app.models.billing import (
     InvoiceNumberSequence,
     InvoiceStatus,
     Payment,
+    Refund,
     Service,
 )
 from app.models.hospital import Hospital
@@ -51,7 +52,9 @@ from app.services.billing_service import (
     BillingService,
     DuplicateAppointmentInvoiceError,
     InvalidInvoiceStateError,
+    NoDiscountToApproveError,
     OverpaymentError,
+    RefundExceedsPaidError,
 )
 from app.tests.billing_helpers import (
     insert_appointment,
@@ -63,6 +66,7 @@ from app.tests.conftest import RecordingAuditSink
 from app.tests.factories import (
     build_create_invoice_request,
     build_record_payment_request,
+    build_record_refund_request,
     build_update_invoice_request,
     build_void_request,
 )
@@ -422,7 +426,7 @@ async def world(db_engine: AsyncEngine) -> AsyncGenerator[_World]:
     yield _World(hospital_id, patient.id, cashier.id)
 
     async with AsyncSession(db_engine) as cleanup:
-        for model in (Payment, Invoice, InvoiceNumberSequence, Patient, User):
+        for model in (Refund, Payment, Invoice, InvoiceNumberSequence, Patient, User):
             await cleanup.execute(delete(model).where(model.hospital_id == hospital_id))
         await cleanup.execute(delete(Hospital).where(Hospital.id == hospital_id))
         await cleanup.commit()
@@ -573,3 +577,163 @@ class TestConcurrentIssue:
             assert sequence is not None
             # The refused tab did not consume a number.
             assert sequence.current_value == 1
+
+
+class TestDiscountAndRefundLifecycle:
+    async def test_discount_approve_issue_pay_refund(
+        self,
+        db_session: AsyncSession,
+        hospital_id: uuid.UUID,
+        actor_id: uuid.UUID,
+        billing: BillingService,
+        audit_sink: RecordingAuditSink,
+    ) -> None:
+        hospital = await db_session.get(Hospital, hospital_id)
+        assert hospital is not None
+        hospital.settings = {"billing": {"discount_approval_threshold_percent": "10"}}
+        patient = await insert_patient(db_session, hospital_id)
+
+        draft = await billing.create_invoice(
+            hospital_id,
+            build_create_invoice_request(
+                patient_id=str(patient.id),
+                items=[{"description": "Procedure", "unit_price": "1000.00"}],
+            ),
+            actor_id=actor_id,
+        )
+
+        # A 25% discount is above the 10% threshold: it waits for an admin.
+        discounted = await billing.update_invoice(
+            hospital_id,
+            draft.id,
+            build_update_invoice_request(discount_amount="250.00", discount_reason="Hardship"),
+            actor_id=actor_id,
+        )
+        assert discounted.discount_pending_approval is True
+        assert discounted.total == Decimal("750.00")
+
+        queue = await billing.list_invoices(hospital_id, discount_pending=True)
+        assert [invoice.id for invoice in queue.items] == [draft.id]
+
+        approved = await billing.approve_discount(hospital_id, draft.id, actor_id=actor_id)
+        assert approved.discount_approved_by == actor_id
+
+        issued = await billing.issue_invoice(hospital_id, draft.id, actor_id=actor_id)
+        assert issued.total == Decimal("750.00")
+
+        paid, _ = await billing.record_payment(
+            hospital_id,
+            draft.id,
+            build_record_payment_request(amount="750.00", method="card"),
+            idempotency_key=_key(),
+            actor_id=actor_id,
+        )
+        assert paid.invoice.status is InvoiceStatus.PAID
+
+        part, _ = await billing.record_refund(
+            hospital_id,
+            draft.id,
+            build_record_refund_request(amount="250.00", method="card"),
+            idempotency_key=_key(),
+            actor_id=actor_id,
+        )
+        assert part.invoice.status is InvoiceStatus.PAID
+        assert part.invoice.amount_refunded == Decimal("250.00")
+
+        rest, _ = await billing.record_refund(
+            hospital_id,
+            draft.id,
+            build_record_refund_request(amount="500.00", method="card"),
+            idempotency_key=_key(),
+            actor_id=actor_id,
+        )
+        assert rest.invoice.status is InvoiceStatus.REFUNDED
+
+        final = await billing.get_invoice(hospital_id, draft.id)
+        assert final.amount_paid == Decimal("750.00")
+        assert final.amount_refunded == Decimal("750.00")
+        assert [r.amount for r in await billing.list_refunds(hospital_id, draft.id)] == [
+            Decimal("250.00"),
+            Decimal("500.00"),
+        ]
+        assert audit_sink.actions() == [
+            "invoice.drafted",
+            "invoice.updated",
+            "invoice.discount_approved",
+            "invoice.issued",
+            "invoice.payment_recorded",
+            "invoice.refunded",
+            "invoice.refunded",
+        ]
+
+
+class TestConcurrentDiscountAndRefund:
+    async def test_two_admins_approving_at_once_one_gets_a_409(
+        self, db_engine: AsyncEngine, world: _World
+    ) -> None:
+        # Spec §14: "first commit wins; second gets 409".
+        invoice_id = await _committed_draft(db_engine, world)
+        async with AsyncSession(db_engine, expire_on_commit=False) as session:
+            # No threshold is configured, so any discount awaits approval.
+            await _billing(session, RecordingAuditSink()).update_invoice(
+                world.hospital_id,
+                invoice_id,
+                build_update_invoice_request(discount_amount="100.00", discount_reason="Hardship"),
+                actor_id=world.cashier_id,
+            )
+
+        async def approve() -> str:
+            async with AsyncSession(db_engine, expire_on_commit=False) as session:
+                try:
+                    await _billing(session, RecordingAuditSink(), contended=True).approve_discount(
+                        world.hospital_id, invoice_id, actor_id=world.cashier_id
+                    )
+                except NoDiscountToApproveError:
+                    return "conflict"
+                return "approved"
+
+        outcomes = await asyncio.gather(approve(), approve())
+
+        assert sorted(outcomes) == ["approved", "conflict"]
+
+    async def test_two_refunds_cannot_together_exceed_what_was_paid(
+        self, db_engine: AsyncEngine, world: _World
+    ) -> None:
+        # Business rule 10 under contention. Each refund alone fits the 500.00
+        # paid; together they do not.
+        invoice_id = await _committed_issued(db_engine, world, price="500.00")
+        async with AsyncSession(db_engine, expire_on_commit=False) as session:
+            await _billing(session, RecordingAuditSink()).record_payment(
+                world.hospital_id,
+                invoice_id,
+                build_record_payment_request(amount="500.00", method="cash"),
+                idempotency_key=_key(),
+                actor_id=world.cashier_id,
+            )
+
+        async def refund() -> str:
+            async with AsyncSession(db_engine, expire_on_commit=False) as session:
+                try:
+                    await _billing(session, RecordingAuditSink(), contended=True).record_refund(
+                        world.hospital_id,
+                        invoice_id,
+                        build_record_refund_request(amount="300.00", method="cash"),
+                        idempotency_key=_key(),
+                        actor_id=world.cashier_id,
+                    )
+                except RefundExceedsPaidError:
+                    return "refused"
+                return "refunded"
+
+        outcomes = await asyncio.gather(refund(), refund())
+
+        assert sorted(outcomes) == ["refunded", "refused"]
+        async with AsyncSession(db_engine) as check:
+            invoice = await check.get(Invoice, invoice_id)
+            assert invoice is not None
+            assert invoice.amount_refunded == Decimal("300.00")
+            assert invoice.status is InvoiceStatus.PAID
+            issued = await check.scalar(
+                select(func.count()).select_from(Refund).where(Refund.invoice_id == invoice_id)
+            )
+            assert issued == 1

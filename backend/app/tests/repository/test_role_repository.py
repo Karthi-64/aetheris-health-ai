@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from app.core.tenancy import TenantScopeRequiredError, cross_tenant
 from app.models.permission import Permission
 from app.models.role import RolePermission
 from app.repositories.role_repository import RoleRepository
@@ -191,16 +192,32 @@ class TestGetWithPermissions:
 
         assert await repository.get_with_permissions(role.id, hospital_id=other_hospital_id) is None
 
-    async def test_get_without_tenant_scoping_reads_any_role(
+    async def test_get_without_a_tenant_is_refused(
+        self,
+        repository: RoleRepository,
+        hospital_id: uuid.UUID,
+    ) -> None:
+        """Omitting ``hospital_id`` is an error, not an unrestricted read.
+
+        It used to skip the filter and return any hospital's role.
+        """
+        role = await _create_role(repository, hospital_id=hospital_id, name="Receptionist")
+
+        with pytest.raises(TenantScopeRequiredError):
+            await repository.get_with_permissions(role.id)
+
+    async def test_an_explicit_cross_tenant_read_reaches_any_role(
         self,
         repository: RoleRepository,
         hospital_id: uuid.UUID,
         other_hospital_id: uuid.UUID,
     ) -> None:
-        """Omitting ``hospital_id`` skips the filter (Super Admin path)."""
+        """The Super Admin path still works, but only when asked for by name."""
         role = await _create_role(repository, hospital_id=hospital_id, name="Receptionist")
 
-        found = await repository.get_with_permissions(role.id)
+        found = await repository.get_with_permissions(
+            role.id, hospital_id=cross_tenant("platform-level administrator")
+        )
 
         assert found is not None
         assert found.id == role.id

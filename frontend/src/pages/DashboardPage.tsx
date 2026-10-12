@@ -1,7 +1,6 @@
 import { Link } from 'react-router-dom'
 import { ArrowRight, CalendarClock, CalendarPlus, Stethoscope, UserPlus, Users } from 'lucide-react'
-import { KpiCard } from '@/components/ui/kpi-card'
-import { Skeleton } from '@/components/ui/skeleton'
+import { StatTile } from '@/components/ui/stat-tile'
 import { DataTable } from '@/components/ui/data-table'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Button } from '@/components/ui/button'
@@ -11,34 +10,32 @@ import { usePermissions } from '@/hooks/usePermissions'
 import { usePatients } from '@/api/patients'
 import { useDoctors } from '@/api/doctors'
 import { useAppointments } from '@/api/appointments'
-import { todayISODate } from '@/lib/format'
 import { RegisterPatientDialog } from '@/pages/patients/RegisterPatientDialog'
-import { BookAppointmentDialog } from '@/pages/appointments/BookAppointmentDialog'
-import { appointmentColumns } from '@/pages/appointments/columns'
+import { BookAppointmentDialog } from '@/components/appointments/BookAppointmentDialog'
+import { InvoicesAwaitingPayment } from '@/components/billing/InvoicesAwaitingPayment'
+import { appointmentQueueColumns } from '@/pages/appointments/columns'
+import { AdminDashboardSection } from '@/pages/dashboard/AdminDashboardSection'
+import { BillingDashboardSection } from '@/pages/dashboard/BillingDashboardSection'
+import { DoctorDashboardSection } from '@/pages/dashboard/DoctorDashboardSection'
+import { ReceptionDashboardSection } from '@/pages/dashboard/ReceptionDashboardSection'
+import { dashboardSectionsFor, TILE_GRID } from '@/pages/dashboard/dashboardSections'
+import { useHospitalToday } from '@/pages/dashboard/useHospitalToday'
 
-/** A KPI backed by a real count — a skeleton while loading, "—" if it can't be read. */
-function StatTile({
-  label,
-  icon,
-  total,
-  isLoading,
-  isError,
-}: {
-  label: string
-  icon: typeof Users
-  total: number | undefined
-  isLoading: boolean
-  isError: boolean
-}) {
-  if (isLoading) return <Skeleton className="h-[104px] rounded-2xl" />
-  return <KpiCard label={label} icon={icon} value={isError || total === undefined ? '—' : total} />
+/** The greeting for the viewer's own time of day. */
+function greeting(hour = new Date().getHours()): string {
+  if (hour < 12) return 'Good morning'
+  if (hour < 17) return 'Good afternoon'
+  return 'Good evening'
 }
 
-/** Grid classes by how many KPI tiles the user may see (static, so Tailwind keeps them). */
-const TILE_GRID: Record<number, string> = {
-  1: 'grid gap-5 sm:grid-cols-1',
-  2: 'grid gap-5 sm:grid-cols-2',
-  3: 'grid gap-5 sm:grid-cols-3',
+/**
+ * What the greeting says this user can do here — only things their own
+ * dashboard offers, so a lab technician is not told to book appointments.
+ */
+function summary(tasks: string[]): string {
+  if (tasks.length === 0) return 'Your home page — open a module from the menu to start work.'
+  const list = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' }).format(tasks)
+  return `Your operations hub — ${list}.`
 }
 
 export default function DashboardPage() {
@@ -54,13 +51,24 @@ export default function DashboardPage() {
   const canSeePatients = can('patient.read')
   const canSeeDoctors = can('doctor.read')
   const canSeeAppointments = can('appointment.read')
-  const today = todayISODate()
+  // The same rule InvoicesAwaitingPayment applies before it shows anything.
+  const canTakePayments =
+    can('invoice.read') && (can('invoice.payment.record') || can('invoice.payment.record.cash'))
+  // A holder of a `report.*.read` code gets role sections with the server's
+  // own figures. Everyone else (a nurse, say) keeps the three list counts.
+  const showListTiles = !dashboardSectionsFor(can).any
+  // The hospital's day, not the browser's: the queue must show the same day
+  // the tiles above it count.
+  const { today, isResolved } = useHospitalToday()
 
-  const patients = usePatients({ page: 1, page_size: 1 }, { enabled: canSeePatients })
-  const doctors = useDoctors({ page: 1, page_size: 1 }, { enabled: canSeeDoctors })
+  const patients = usePatients(
+    { page: 1, page_size: 1 },
+    { enabled: showListTiles && canSeePatients },
+  )
+  const doctors = useDoctors({ page: 1, page_size: 1 }, { enabled: showListTiles && canSeeDoctors })
   const appts = useAppointments(
     { appointment_date: today, page: 1, page_size: 25 },
-    { enabled: canSeeAppointments },
+    { enabled: canSeeAppointments && isResolved },
   )
   const tileCount = [canSeeAppointments, canSeePatients, canSeeDoctors].filter(Boolean).length
 
@@ -72,10 +80,15 @@ export default function DashboardPage() {
       <div className="neo-extruded bg-surface flex flex-wrap items-center justify-between gap-4 rounded-2xl p-6 md:p-8">
         <div>
           <h1 className="font-display text-primary text-2xl font-bold md:text-headline-lg">
-            Good morning, {name}
+            {greeting()}, {name}
           </h1>
           <p className="font-body text-body-sm text-on-surface-variant mt-1 max-w-xl">
-            Your operations hub — register patients, book appointments, and work the day's queue.
+            {summary([
+              ...(canRegister ? ['register patients'] : []),
+              ...(canBook ? ['book appointments'] : []),
+              ...(canSeeAppointments ? ["follow the day's queue"] : []),
+              ...(canTakePayments ? ['see invoices awaiting payment'] : []),
+            ])}
           </p>
         </div>
         <div className="flex flex-wrap gap-3">
@@ -103,40 +116,50 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Real KPIs — only the ones this user may read */}
-      {tileCount > 0 && (
+      {/* Role sections: each renders only for the permission that opens it,
+          and asks only for its own dashboard. */}
+      <AdminDashboardSection />
+      <BillingDashboardSection />
+      <ReceptionDashboardSection />
+      <DoctorDashboardSection />
+
+      {/* List counts for a user with no dashboard of their own — only the ones they may read */}
+      {showListTiles && tileCount > 0 && (
         <div className={TILE_GRID[tileCount]}>
           {canSeeAppointments && (
             <StatTile
               label="Today's appointments"
               icon={CalendarClock}
-              total={appts.data?.pagination.total}
+              value={appts.data?.pagination.total}
               isLoading={appts.isPending}
               isError={appts.isError}
+              onRetry={() => void appts.refetch()}
             />
           )}
           {canSeePatients && (
             <StatTile
               label="Total patients"
               icon={Users}
-              total={patients.data?.pagination.total}
+              value={patients.data?.pagination.total}
               isLoading={patients.isPending}
               isError={patients.isError}
+              onRetry={() => void patients.refetch()}
             />
           )}
           {canSeeDoctors && (
             <StatTile
               label="Doctors"
               icon={Stethoscope}
-              total={doctors.data?.pagination.total}
+              value={doctors.data?.pagination.total}
               isLoading={doctors.isPending}
               isError={doctors.isError}
+              onRetry={() => void doctors.refetch()}
             />
           )}
         </div>
       )}
 
-      {/* Today's queue */}
+      {/* Today's queue, with the same actions as the Appointments page */}
       {canSeeAppointments && (
         <section className="space-y-4">
           <div className="flex items-center justify-between">
@@ -155,7 +178,7 @@ export default function DashboardPage() {
             </Alert>
           ) : (
             <DataTable
-              columns={appointmentColumns}
+              columns={appointmentQueueColumns}
               data={todaysAppointments}
               isLoading={appts.isPending}
               pageSize={25}
@@ -181,6 +204,9 @@ export default function DashboardPage() {
           )}
         </section>
       )}
+
+      {/* The desk that takes payments sees what is waiting for one. */}
+      <InvoicesAwaitingPayment />
     </div>
   )
 }

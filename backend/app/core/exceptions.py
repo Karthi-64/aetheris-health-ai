@@ -138,6 +138,22 @@ class PermissionDeniedError(AetherisError):
         )
 
 
+class FeatureDisabledError(AetherisError):
+    """Raised when a hospital has not been given a feature.
+
+    Maps to HTTP 403.
+    """
+
+    def __init__(
+        self,
+        message: str = "This feature is not enabled for this hospital.",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            message=message, detail=detail, status_code=403, error_code=ErrorCode.FEATURE_DISABLED
+        )
+
+
 class AuthenticationError(AetherisError):
     """Raised when authentication fails.
 
