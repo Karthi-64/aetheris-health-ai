@@ -43,6 +43,7 @@ from app.api.dependencies.repositories import (
     get_auth_throttle_repository,
     get_doctor_repository,
     get_hospital_repository,
+    get_lab_order_repository,
     get_patient_access_grant_repository,
     get_patient_account_link_repository,
     get_patient_account_repository,
@@ -51,6 +52,7 @@ from app.api.dependencies.repositories import (
     get_patient_otp_challenge_repository,
     get_patient_refresh_token_repository,
     get_patient_repository,
+    get_prescription_repository,
 )
 from app.api.dependencies.services import (
     get_appointment_service,
@@ -73,6 +75,7 @@ from app.repositories import (
     AuthThrottleRepository,
     DoctorRepository,
     HospitalRepository,
+    LabOrderRepository,
     PatientAccessGrantRepository,
     PatientAccountLinkRepository,
     PatientAccountRepository,
@@ -81,6 +84,7 @@ from app.repositories import (
     PatientOtpChallengeRepository,
     PatientRefreshTokenRepository,
     PatientRepository,
+    PrescriptionRepository,
 )
 from app.services.appointment_service import AppointmentService
 from app.services.auth_throttle import AuthThrottle
@@ -98,6 +102,7 @@ from app.services.patient_app.patient_account_service import PatientAccountServi
 from app.services.patient_app.patient_auth_service import PatientAuthService
 from app.services.patient_app.patient_authorization import PatientAuthorization, PatientContext
 from app.services.patient_app.record_link_service import RecordLinkService
+from app.services.patient_app.records_service import PatientRecordsService
 from app.services.patient_service import PatientService
 
 __all__ = [
@@ -112,10 +117,12 @@ __all__ = [
     "get_patient_account_service",
     "get_patient_appointments_service",
     "get_patient_auth_service",
-    "get_patient_booking_service",
     "get_patient_authorization",
+    "get_patient_booking_service",
     "get_patient_context",
+    "get_patient_hospital_gate",
     "get_record_link_service",
+    "get_records_service",
     "get_sms_sender",
     "require_patient_csrf",
 ]
@@ -374,8 +381,19 @@ def get_access_grant_service(
     uow: UnitOfWork = Depends(get_unit_of_work),
     audit: AuditSink = Depends(get_audit_sink),
 ) -> AccessGrantService:
-    """Provide an :class:`AccessGrantService`. No endpoint uses it yet."""
+    """Provide an :class:`AccessGrantService` (§27.5: create, list, revoke)."""
     return AccessGrantService(grants, authorization, hospitals, doctors, uow=uow, audit=audit)
+
+
+def get_records_service(
+    authorization: PatientAuthorization = Depends(get_patient_authorization),
+    gate: PatientHospitalGate = Depends(get_patient_hospital_gate),
+    prescriptions: PrescriptionRepository = Depends(get_prescription_repository),
+    lab_orders: LabOrderRepository = Depends(get_lab_order_repository),
+) -> PatientRecordsService:
+    """Provide a :class:`PatientRecordsService` (§15, §16: prescriptions and
+    released lab results)."""
+    return PatientRecordsService(authorization, gate, prescriptions, lab_orders)
 
 
 async def get_patient_context(

@@ -56,7 +56,7 @@ __all__ = ["PatientAuthorization", "PatientContext"]
 #: An account's own links are the only way to learn where it is linked.
 _OWN_LINKS = cross_tenant("patient account: its own record links, by verified account id")
 
-_NOT_FOUND = "Not found."
+_NOT_FOUND = "Not Found"
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid  # noqa: TC003 — needed at runtime for type hints
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, tuple_
 
 from app.models.lab import (
     LabOrder,
@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql import ColumnElement
+
+    from app.core.tenancy import CrossTenant
 
 
 class LabOrderRepository(BaseRepository[LabOrder]):
@@ -279,3 +282,86 @@ class LabOrderRepository(BaseRepository[LabOrder]):
         stmt = self._apply_filters(self._scoped(hospital_id), **filters)
         result = await self._session.execute(select(func.count()).select_from(stmt.subquery()))
         return result.scalar_one()
+
+    # ── A patient's own released results ──────────────────────────────────────
+
+    @staticmethod
+    def _owned_by(records: list[tuple[uuid.UUID, uuid.UUID]]) -> ColumnElement[bool]:
+        """The order is at one of the hospitals, for that hospital's record."""
+        return tuple_(LabOrder.hospital_id, LabOrder.patient_id).in_(records)
+
+    async def list_for_patient_records(
+        self,
+        records: list[tuple[uuid.UUID, uuid.UUID]],
+        scope: uuid.UUID | CrossTenant,
+        *,
+        statuses: Sequence[LabOrderStatus] = (LabOrderStatus.RELEASED,),
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[LabOrder], int]:
+        """One page of the orders of some patient records, and their total.
+
+        For a patient's own list across the hospitals they are linked at: each
+        record is named together with its hospital, so a row is returned only
+        where both match. Server-side only: no request can name a patient or
+        a hospital here.
+
+        The patient may read **released orders only** (§16), so the default is
+        exactly that and the caller has no way to widen it — a list to a
+        patient is always released, and forgetting to say so is not a bug to
+        be caught in review but a default that already refuses.
+
+        :param records: ``(hospital_id, patient_id)`` pairs. Empty means none.
+        :param scope: A hospital id, or a ``cross_tenant(...)`` marker for a
+            list that spans the caller's own hospitals.
+        :param statuses: Only orders in one of these statuses. Fixed to
+            ``released`` by the default; never widened for a patient read.
+        :param skip: Rows to skip.
+        :param limit: Maximum rows to return.
+        :returns: The page, newest first, and how many orders the list holds
+            in all.
+        """
+        if not records:
+            return [], 0
+        stmt = self._confine_to_tenant(
+            self._query().where(self._owned_by(records)), scope, "list_for_patient_records"
+        )
+        stmt = stmt.where(LabOrder.status.in_(tuple(statuses)))
+        total = await self._session.execute(select(func.count()).select_from(stmt.subquery()))
+        rows = await self._session.execute(
+            stmt.order_by(LabOrder.ordered_at.desc(), LabOrder.id.desc()).offset(skip).limit(limit)
+        )
+        return list(rows.unique().scalars().all()), total.scalar_one()
+
+    async def get_for_patient_records(
+        self,
+        records: list[tuple[uuid.UUID, uuid.UUID]],
+        scope: uuid.UUID | CrossTenant,
+        order_id: uuid.UUID,
+        *,
+        statuses: Sequence[LabOrderStatus] = (LabOrderStatus.RELEASED,),
+    ) -> LabOrder | None:
+        """Read one order if it belongs to one of some patient records.
+
+        The patient may read **released orders only** (§16): by default an
+        ordered, collected, in-progress, entered or cancelled order is exactly
+        as invisible as one that does not exist.
+
+        :param records: ``(hospital_id, patient_id)`` pairs. Empty means none.
+        :param scope: A hospital id, or a ``cross_tenant(...)`` marker.
+        :param order_id: The order.
+        :param statuses: The statuses the caller may read. Fixed to
+            ``released`` by the default; never widened for a patient read.
+        :returns: The order, or ``None`` — also when it is somebody else's,
+            not released, or cancelled: the answer never confirms existence.
+        """
+        if not records:
+            return None
+        stmt = self._confine_to_tenant(
+            self._query().where(LabOrder.id == order_id, self._owned_by(records)),
+            scope,
+            "get_for_patient_records",
+        ).execution_options(populate_existing=True)
+        stmt = stmt.where(LabOrder.status.in_(tuple(statuses)))
+        result = await self._session.execute(stmt)
+        return result.unique().scalar_one_or_none()

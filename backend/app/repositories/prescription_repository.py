@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid  # noqa: TC003 — needed at runtime for type hints
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, tuple_
 
 from app.models.pharmacy import (
     Dispense,
@@ -31,6 +31,9 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql import ColumnElement
+
+    from app.core.tenancy import CrossTenant
 
 
 class PrescriptionRepository(BaseRepository[Prescription]):
@@ -291,3 +294,74 @@ class PrescriptionRepository(BaseRepository[Prescription]):
         )
         result = await self._session.execute(stmt)
         return list(result.unique().scalars().all())
+
+    # ── A patient's own prescriptions ─────────────────────────────────────────
+
+    @staticmethod
+    def _owned_by(records: list[tuple[uuid.UUID, uuid.UUID]]) -> ColumnElement[bool]:
+        """The prescription is at one of the hospitals, for that hospital's record."""
+        return tuple_(Prescription.hospital_id, Prescription.patient_id).in_(records)
+
+    async def list_for_patient_records(
+        self,
+        records: list[tuple[uuid.UUID, uuid.UUID]],
+        scope: uuid.UUID | CrossTenant,
+        *,
+        statuses: Sequence[PrescriptionStatus] | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[Prescription], int]:
+        """One page of the prescriptions of some patient records, and their total.
+
+        For a patient's own list across the hospitals they are linked at: each
+        record is named together with its hospital, so a row is returned only
+        where both match. The server resolves both sides of the pair; a request
+        can never name a patient or a hospital here.
+
+        :param records: ``(hospital_id, patient_id)`` pairs. Empty means none.
+        :param scope: A hospital id, or a ``cross_tenant(...)`` marker for a
+            list that spans the caller's own hospitals.
+        :param statuses: Only prescriptions in one of these statuses.
+        :param skip: Rows to skip.
+        :param limit: Maximum rows to return.
+        :returns: The page, newest first, and how many prescriptions the list
+            holds in all.
+        """
+        if not records:
+            return [], 0
+        stmt = self._confine_to_tenant(
+            self._query().where(self._owned_by(records)), scope, "list_for_patient_records"
+        )
+        if statuses:
+            stmt = stmt.where(Prescription.status.in_(statuses))
+        total = await self._session.execute(select(func.count()).select_from(stmt.subquery()))
+        rows = await self._session.execute(
+            stmt.order_by(Prescription.prescribed_at.desc(), Prescription.id.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        return list(rows.unique().scalars().all()), total.scalar_one()
+
+    async def get_for_patient_records(
+        self,
+        records: list[tuple[uuid.UUID, uuid.UUID]],
+        scope: uuid.UUID | CrossTenant,
+        prescription_id: uuid.UUID,
+    ) -> Prescription | None:
+        """Read one prescription if it belongs to one of some patient records.
+
+        :param records: ``(hospital_id, patient_id)`` pairs. Empty means none.
+        :param scope: A hospital id, or a ``cross_tenant(...)`` marker.
+        :param prescription_id: The prescription.
+        :returns: The prescription, or ``None`` — also when it is somebody
+            else's, so the answer never confirms the record exists.
+        """
+        if not records:
+            return None
+        stmt = self._confine_to_tenant(
+            self._query().where(Prescription.id == prescription_id, self._owned_by(records)),
+            scope,
+            "get_for_patient_records",
+        ).execution_options(populate_existing=True)
+        result = await self._session.execute(stmt)
+        return result.unique().scalar_one_or_none()

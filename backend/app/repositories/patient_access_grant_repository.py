@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from app.core.tenancy import CrossTenant, cross_tenant
 from app.models.patient_consent import PatientAccessGrant
 from app.repositories.base import BaseRepository
 
@@ -25,6 +26,11 @@ if TYPE_CHECKING:
     from app.models.patient_consent import RecordCategory
 
 __all__ = ["PatientAccessGrantRepository"]
+
+#: Reads grants by their grantor only — the rows the read could return are
+#: always the account's own acts, so a deliberate cross-hospital lookup is
+#: safe here.
+_OF_GRANTOR = cross_tenant("access grants given by one account, keyed by the account alone")
 
 
 class PatientAccessGrantRepository(BaseRepository[PatientAccessGrant]):
@@ -82,6 +88,42 @@ class PatientAccessGrantRepository(BaseRepository[PatientAccessGrant]):
             granted_at=granted_at,
             expires_at=expires_at,
         )
+
+    async def get_grant_of_grantor(
+        self,
+        grant_id: uuid.UUID,
+        *,
+        grantor_account_id: uuid.UUID,
+        scope: uuid.UUID | CrossTenant = _OF_GRANTOR,
+    ) -> PatientAccessGrant | None:
+        """One grant, only if this account gave it, wherever it was given.
+
+        For `POST /patient/access-grants/{grant_id}/revoke`, where the path
+        names no hospital: the source hospital is on the stored grant. Keyed
+        by the grantor alone because revoking is the grantor's alone to do,
+        regardless of what has happened to their link since — and a grant
+        the account did not give is one it cannot see here, either.
+
+        :param grant_id: The grant.
+        :param grantor_account_id: The account that must have given it.
+        :param scope: The read's explicit scope. The default is the deliberate
+            cross-tenant marker on this account's own grants — the only rows
+            the key can ever name.
+        :returns: The grant, or ``None``.
+        """
+        result = await self._session.execute(
+            self._confine_to_tenant(
+                select(PatientAccessGrant)
+                .where(
+                    PatientAccessGrant.id == grant_id,
+                    PatientAccessGrant.grantor_account_id == grantor_account_id,
+                )
+                .with_for_update(),
+                _OF_GRANTOR,
+                "get_grant_of_grantor",
+            ).execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
 
     async def get_for_grantor(
         self, hospital_id: uuid.UUID, grant_id: uuid.UUID, *, grantor_account_id: uuid.UUID

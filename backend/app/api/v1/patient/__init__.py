@@ -15,10 +15,12 @@ from app.api.v1.patient.appointments import router as appointments_router
 from app.api.v1.patient.auth import router as auth_router
 from app.api.v1.patient.availability import router as availability_router
 from app.api.v1.patient.doctors import router as doctors_router
+from app.api.v1.patient.grants import router as grants_router
 from app.api.v1.patient.hospitals import router as hospitals_router
 from app.api.v1.patient.links import router as links_router
 from app.api.v1.patient.me import router as me_router
 from app.api.v1.patient.my_appointments import router as my_appointments_router
+from app.api.v1.patient.records import router as records_router
 
 router = APIRouter(prefix="/patient")
 router.include_router(auth_router)
@@ -29,5 +31,7 @@ router.include_router(availability_router)
 router.include_router(appointments_router)
 router.include_router(my_appointments_router)
 router.include_router(links_router)
+router.include_router(grants_router)
+router.include_router(records_router)
 
 __all__ = ["router"]

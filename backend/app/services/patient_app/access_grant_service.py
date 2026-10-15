@@ -29,15 +29,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.models.patient_consent import (
     GranteeType,
     GrantPurposeNote,
     GrantStatus,
     RecordCategory,
 )
+from app.schemas.common import Page
 from app.schemas.patient_app.grants import AccessGrantView
 from app.services.patient_app.common import ClientContext, patient_event
+
+#: A page of grants is small, and the list cannot be walked without end.
+DEFAULT_GRANT_PAGE_SIZE: Final = 20
 
 if TYPE_CHECKING:
     import uuid
@@ -68,7 +72,7 @@ MAX_GRANT_LIFETIME: Final = timedelta(days=365)
 #: source exists yet (§10).
 _UNAVAILABLE_CATEGORIES: Final = frozenset({RecordCategory.DOCUMENTS})
 
-_NOT_FOUND: Final = "Not found."
+_NOT_FOUND: Final = "Not Found"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,34 +217,47 @@ class AccessGrantService:
     async def revoke(
         self,
         account: PatientAccount,
-        hospital_id: uuid.UUID,
+        hospital_id: uuid.UUID | None,
         grant_id: uuid.UUID,
         *,
         reason: str | None = None,
         client: ClientContext | None = None,
+        repeat_conflict: bool = False,
     ) -> AccessGrantView:
         """Revoke a grant the account gave. Effective on the next request.
 
         Keyed by the grantor alone, with no link check: a patient can always
         take back what they gave, whatever has happened to their link since.
-        Revoking a grant that is already revoked changes nothing.
 
         :param account: The authenticated account.
-        :param hospital_id: The source hospital of the grant.
+        :param hospital_id: The source hospital of the grant when the caller
+            knows it; ``None`` to find it from the stored grant itself, as
+            ``POST /patient/access-grants/{grant_id}/revoke`` does.
         :param grant_id: The grant.
         :param reason: Why, if the patient says.
         :param client: Where the request came from.
+        :param repeat_conflict: When ``True``, revoking a grant that is
+            already revoked is a ``ConflictError`` (the HTTP answer is 409,
+            §27.5); when ``False``, the same call is safe to repeat and
+            changes nothing (a retry after a lost answer).
         :returns: The grant as it now stands.
-        :raises NotFoundError: No such grant was given by this account there.
+        :raises NotFoundError: No such grant was given by this account.
+        :raises ConflictError: If ``repeat_conflict`` and the grant is
+            already revoked.
         """
         account_id = account.id
-        grant = await self._grants.get_for_grantor(
-            hospital_id, grant_id, grantor_account_id=account_id
-        )
+        if hospital_id is not None:
+            grant = await self._grants.get_for_grantor(
+                hospital_id, grant_id, grantor_account_id=account_id
+            )
+        else:
+            grant = await self._grants.get_grant_of_grantor(grant_id, grantor_account_id=account_id)
         if grant is None:
             raise NotFoundError(_NOT_FOUND)
         now = datetime.now(UTC)
         if grant.revoked_at is not None:
+            if repeat_conflict:
+                raise ConflictError(message="The grant is already revoked.")
             return self._view(grant, now)
 
         await self._grants.revoke(
@@ -253,7 +270,7 @@ class AccessGrantService:
                 target_type="patient_access_grant",
                 target_id=grant.id,
                 account_id=account_id,
-                hospital_id=hospital_id,
+                hospital_id=grant.hospital_id,
                 client=client,
             )
         )
@@ -272,6 +289,51 @@ class AccessGrantService:
         now = datetime.now(UTC)
         grants = await self._grants.list_for_grantor(hospital_id, grantor_account_id=account.id)
         return [self._view(grant, now) for grant in grants]
+
+    async def list_grants(
+        self,
+        account: PatientAccount,
+        *,
+        status: GrantStatus | None = None,
+        page: int = 1,
+        page_size: int = DEFAULT_GRANT_PAGE_SIZE,
+    ) -> Page[AccessGrantView]:
+        """One page of the grants the account has given, newest first (§27.5).
+
+        Across the hospitals where the account's own record is honoured right
+        now — the same rule every record endpoint uses. A grant given while a
+        link was honoured stays listed here; it just cannot be used unless
+        the link comes back, which the status of a *read* shows separately.
+
+        The pages are small and a patient's grants are few, so the merge is
+        in memory: one scoped read per hospital, then a sorted slice. There
+        is no query that spans hospitals for patients.
+
+        :param account: The authenticated, active account.
+        :param status: Only grants in this derived state, or all of them.
+        :param page: 1-based page number.
+        :param page_size: Grants per page.
+        :returns: The page and the total.
+        :raises ConsentRequiredError: If a required policy is pending.
+        """
+        contexts = await self._authorization.own_contexts(account)
+        now = datetime.now(UTC)
+        views: list[AccessGrantView] = []
+        for context in contexts:
+            grants = await self._grants.list_for_grantor(
+                context.hospital_id, grantor_account_id=account.id
+            )
+            views.extend(self._view(grant, now) for grant in grants)
+        if status is not None:
+            views = [view for view in views if view.status is status]
+        views.sort(key=lambda view: (view.granted_at, view.id), reverse=True)
+        start = (page - 1) * page_size
+        return Page[AccessGrantView](
+            items=views[start : start + page_size],
+            page=page,
+            page_size=page_size,
+            total_records=len(views),
+        )
 
     # ── The gate ─────────────────────────────────────────────────────────────
 
